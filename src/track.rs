@@ -2217,7 +2217,7 @@ impl Tracker {
         }
         // Behind the ingest gate (`ImuBufferStats::non_finite`) this should be unreachable too.
         // Checked because the map admits a non-finite factor and `Map::apply_ba_update` then
-        // refuses every later BA write-back, visual included, until the map drops.
+        // refuses every BA write-back whose window holds both its endpoints, visual included.
         if !preintegration_is_finite(&preint) {
             inert.stats.refused_non_finite += 1;
             warning!(
@@ -4404,9 +4404,8 @@ mod tests {
     }
 
     /// One NaN accelerometer reading must not reach the map. A factor carrying it is admitted by
-    /// `Map::apply_insertion`, and `Map::apply_ba_update` then validates every factor in the map
-    /// and refuses every later BA write-back — visual BA included, with inertial BA off — until
-    /// the map drops.
+    /// `Map::apply_insertion`, and `Map::apply_ba_update` then refuses every BA write-back whose
+    /// capture holds both its endpoints — visual BA included, with inertial BA off.
     #[test]
     fn test_a_non_finite_imu_sample_gives_no_factor_and_leaves_visual_ba_writable() {
         let mut tracker = tracker_with_inertial_ba(false);
@@ -4427,12 +4426,13 @@ mod tests {
         );
         assert_eq!(stats.factors_added, 0);
 
-        // Later keyframes, so the interval is outside any BA window.
-        insert_bare_keyframes(&mut tracker, &[12, 13, 14, 15]);
-        let update = run_local_ba(
-            tracker.map.ba_snapshot(&local_window(&tracker.map)),
-            &tracker.camera,
-        );
+        // A whole-map capture: `local_window` holds only the newest keyframes and their IMU
+        // neighbours, so a NaN factor on 7->11 would drop out of it and pass unseen.
+        let everything = kornia_slam::mapping::map::BaWindow {
+            keyframe_slots: (0..tracker.map.keyframes().len()).collect(),
+            landmark_ids: (0..tracker.map.map_points().len()).collect(),
+        };
+        let update = run_local_ba(tracker.map.ba_snapshot(&everything), &tracker.camera);
         tracker
             .map
             .apply_ba_update(update)

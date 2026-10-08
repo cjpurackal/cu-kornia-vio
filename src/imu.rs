@@ -282,8 +282,9 @@ pub struct ImuBufferStats {
     pub evicted: u64,
     /// Samples refused at ingest for a non-finite gyro or accel component. Each one leaves a
     /// drop mark, so an interval straddling it is refused rather than integrated across the
-    /// hole: a NaN admitted into a factor would make kornia-slam refuse
-    /// every later BA write-back (`Map::apply_ba_update` validates every factor in the map).
+    /// hole: a NaN admitted into a factor would make kornia-slam refuse every BA write-back
+    /// whose window holds both its endpoints (`Map::apply_ba_update` validates the captured
+    /// factors).
     pub non_finite: u64,
     /// Times the source's cumulative drop counter increased.
     pub drop_reports: u64,
@@ -700,7 +701,8 @@ pub struct InertialStats {
     pub refused_zero_dt: u64,
     /// Intervals whose preintegration came back with a non-finite term. Should be unreachable
     /// behind [`ImuBufferStats::non_finite`]; checked because the map admits such a factor and
-    /// then refuses every later `Map::apply_ba_update`, visual BA included, until the map drops.
+    /// then refuses every `Map::apply_ba_update` whose window holds both its endpoints, visual BA
+    /// included.
     pub refused_non_finite: u64,
     /// Intervals that passed every gate here but that `Map::apply_insertion` refused (an
     /// endpoint keyframe the map does not hold, a duplicate edge, a non-increasing interval).
@@ -751,8 +753,9 @@ impl InertialStats {
 /// caller's stricter `dt > 0` gate already covers.
 ///
 /// Mirrored because `Map::apply_insertion` does not run it and `Map::apply_ba_update` runs it
-/// over EVERY factor in the map: an admitted non-finite factor would not fail its own insertion
-/// but every later BA write-back, visual included, until the map drops.
+/// over the captured factors: an admitted non-finite factor would not fail its own insertion but
+/// every BA write-back whose window holds both its endpoints (the newest three keyframes and
+/// their IMU neighbours), visual included.
 pub(crate) fn preintegration_is_finite(p: &PreintegratedImu) -> bool {
     let vec = |v: Vec3F64| v.to_array().iter().all(|c| c.is_finite());
     p.dt.is_finite()
