@@ -21,6 +21,18 @@ pub fn cam_in_world(pose_world_to_cam: &Pose3d) -> Pose<f64> {
     Pose::from_matrix([row(0), row(1), row(2), [0.0, 0.0, 0.0, 1.0]])
 }
 
+/// The inverse direction: a [`Pose`] read as the `Pose3d` mapping its child frame into its
+/// parent (`X_parent = R X_child + t`), with no inversion.
+pub fn pose3d_from(pose: &Pose<f64>) -> Pose3d {
+    let m = pose.to_matrix();
+    Pose3d::new(
+        crate::wheel::mat3_from_rows(&[
+            m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2],
+        ]),
+        kornia_algebra::Vec3F64::new(m[0][3], m[1][3], m[2][3]),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -51,5 +63,21 @@ mod tests {
                 assert!((got[c] - want[c]).abs() < eps, "[{r}][{c}]: {m:?}");
             }
         }
+    }
+
+    /// `pose3d_from` reads the matrix as it stands: it undoes `cam_in_world`'s inversion only
+    /// when inverted again, and keeps the row-major layout.
+    #[test]
+    fn test_pose3d_from_round_trips_cam_in_world() {
+        let r = Mat3F64::from_cols(
+            Vec3F64::new(0.0, -1.0, 0.0),
+            Vec3F64::new(1.0, 0.0, 0.0),
+            Vec3F64::new(0.0, 0.0, 1.0),
+        );
+        let world_to_cam = Pose3d::new(r, Vec3F64::new(1.0, 2.0, 3.0));
+        let back = pose3d_from(&cam_in_world(&world_to_cam)).inverse();
+        assert!((back.translation - world_to_cam.translation).length() < 1e-12);
+        let d = back.rotation - world_to_cam.rotation;
+        assert!(d.to_cols_array().iter().all(|v| v.abs() < 1e-12));
     }
 }

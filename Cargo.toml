@@ -94,3 +94,12 @@ cu29-export = { workspace = true }
 # cu29's logging macros intern their format strings at build time.
 [build-dependencies]
 cu29-build = { workspace = true }
+
+# LOCAL ONLY: the wheel-odometry factor (`kornia_slam::mapping::wheel_odom`) lives on the
+# unpublished kornia-slam branch `feat/wheel-odom-factor`, checked out beside this repo. Keyed on
+# the git URL, so it replaces both repo crates above at once and their spec strings stay as they
+# are. Becomes a `rev` of the published branch, and this table goes away, before anything here is
+# pushed.
+[patch."https://github.com/kornia/kornia-slam"]
+kornia-slam = { path = "../kornia-slam/crates/kornia-slam" }
+kornia-sensors = { path = "../kornia-slam/crates/kornia-sensors" }

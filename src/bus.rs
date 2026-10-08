@@ -1,18 +1,22 @@
 //! `VioBus`: the resource bundle one estimator shares with the tasks around it.
 //!
-//! Two things cross into a backgrounded `StereoVio` without riding its single input edge: the
-//! IMU samples (see [`crate::imu_channel`] for why they cannot ride it) and reset requests.
+//! Three things cross into a backgrounded `StereoVio` without riding its single input edge: the
+//! IMU samples (see [`crate::imu_channel`] for why they cannot ride it), the wheel odometry and
+//! camera mounts (see [`crate::wheel_channel`]), and reset requests.
 //! Both are shared state, and a resource bundle is copper's way of handing shared state to
-//! several tasks: each bundle instance builds its own [`ImuQueue`] and [`ResetEpoch`], and the
-//! RON binds them by name, so two estimators in one graph get two buses.
+//! several tasks: each bundle instance builds its own [`ImuQueue`], [`WheelQueue`] and
+//! [`ResetEpoch`], and the RON binds them by name, so two estimators in one graph get two buses.
+//! `StereoVio`'s `wheel` binding is optional: a graph without wheel odometry leaves it out.
 //!
 //! ```ron
 //! resources: [ ( id: "bus", provider: "cu_kornia_vio::VioBus" ) ],
 //! tasks: [
 //!     ( id: "imu_feed", type: "cu_kornia_vio::ImuFeed<32>",
 //!       resources: { "imu": "bus.imu" } ),
+//!     ( id: "wheel_feed", type: "cu_kornia_vio::WheelFeed",
+//!       resources: { "wheel": "bus.wheel" } ),
 //!     ( id: "vio", type: "cu_kornia_vio::StereoVio", background: true,
-//!       resources: { "imu": "bus.imu", "epoch": "bus.reset_epoch" } ),
+//!       resources: { "imu": "bus.imu", "epoch": "bus.reset_epoch", "wheel": "bus.wheel" } ),
 //! ],
 //! ```
 
@@ -22,8 +26,10 @@ use cu29::prelude::*;
 
 use crate::imu_channel::ImuQueue;
 use crate::reset::ResetEpoch;
+use crate::wheel_channel::WheelQueue;
 
-/// The provider of an [`ImuQueue`] (`<id>.imu`) and a [`ResetEpoch`] (`<id>.reset_epoch`).
+/// The provider of an [`ImuQueue`] (`<id>.imu`), a [`ResetEpoch`] (`<id>.reset_epoch`) and a
+/// [`WheelQueue`] (`<id>.wheel`).
 ///
 /// Takes no config; any key is refused, as with the tasks.
 pub struct VioBus;
@@ -35,7 +41,7 @@ pub mod bus_ids {
     use super::VioBus;
     use cu29::bundle_resources;
 
-    bundle_resources!(VioBus: Imu, ResetEpoch);
+    bundle_resources!(VioBus: Imu, ResetEpoch, Wheel);
 }
 
 use bus_ids::VioBusId;
@@ -52,6 +58,7 @@ impl ResourceBundle for VioBus {
             bundle.key(VioBusId::ResetEpoch),
             Arc::new(ResetEpoch::new()),
         )?;
+        manager.add_shared(bundle.key(VioBusId::Wheel), Arc::new(WheelQueue::new()))?;
         Ok(())
     }
 }
@@ -62,6 +69,6 @@ mod tests {
 
     #[test]
     fn test_bus_resource_names_match_the_documented_bindings() {
-        assert_eq!(bus_ids::VIO_BUS_ID_NAMES, ["imu", "reset_epoch"]);
+        assert_eq!(bus_ids::VIO_BUS_ID_NAMES, ["imu", "reset_epoch", "wheel"]);
     }
 }

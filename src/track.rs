@@ -95,6 +95,7 @@ use kornia_slam::mapping::map::{
     ImuFactor, Keyframe, LandmarkSeed, Map, MapInsertion, ORB_N_LEVELS, ORB_SCALE_FACTOR,
     ObservationKey,
 };
+use kornia_slam::mapping::wheel_odom::WheelOdomFactor;
 use kornia_slam::stereo::{StereoMatchConfig, compute_stereo_matches, unproject_stereo};
 use kornia_slam::tracking::local_map::landmarks_in_frustum;
 use kornia_slam::tracking::pose_estimation::map_projection::{
@@ -111,6 +112,7 @@ use crate::imu::{
     ImuBuffer, ImuWindowError, InertialConfig, InertialStats, RawImuSample, WindowExcitation,
     preintegration_is_finite, ts_sec, window_excitation,
 };
+use crate::wheel::{WheelOdomConfig, WheelSample, WheelState, WheelStats};
 use cu_stereo_payloads::ImuSample;
 
 /// Close-depth threshold in baselines: the near/far split is `35 * baseline`
@@ -264,6 +266,10 @@ pub struct TrackerConfig {
     /// noise densities, so "inertial on with a guessed extrinsic" is not a state this type can
     /// represent.
     pub inertial: Option<InertialConfig>,
+    /// Wheel odometry. `None` — what [`TrackerConfig::new`] sets — leaves every path below as it
+    /// was: no wheel factor, the constant-velocity prior, no published coast, and a map drop
+    /// that restarts the world at identity. See [`crate::wheel`] for what `Some` changes.
+    pub wheel_odom: Option<WheelOdomConfig>,
 }
 
 impl TrackerConfig {
@@ -312,6 +318,7 @@ impl TrackerConfig {
             max_keyframes: None,
             max_covisible_keyframes: DEFAULT_MAX_COVISIBLE_KEYFRAMES,
             inertial: None,
+            wheel_odom: None,
         }
     }
 }
@@ -329,6 +336,13 @@ pub enum TrackStatus {
     /// constant-velocity model, available from [`Tracker::last_pose`], but it is unverified and
     /// must not be published as a measurement.
     Untracked,
+    /// Wheel odometry only: vision did not place the frame, and the pose is the last one
+    /// propagated on the wheels (and the gyro, with the inertial path on). Also the frame a map
+    /// drop re-anchored on, whose pose is the same propagation.
+    Coasting(TrackedPose),
+    /// Wheel odometry only: vision did not place the frame and no wheel reading covered it. The
+    /// pose is the tracker's extrapolation, carried so a consumer can see the state, not use it.
+    NotLocalized(TrackedPose),
 }
 
 /// A MEASURED pose for one input frame.
@@ -718,6 +732,14 @@ pub struct Tracker {
     /// counted at; see the refresh in `process_frame`.
     live_map_points: usize,
     live_map_points_key: (usize, u64),
+    /// `None` unless [`TrackerConfig::wheel_odom`] was supplied.
+    wheel: Option<WheelState>,
+    /// Whether the current frame's prior came from the wheels. Reset at the top of every frame.
+    frame_on_wheels: bool,
+    /// Whether a world exists that a pose can stay continuous in: set by every bootstrap,
+    /// cleared by a requested [`reset`](Self::reset). With wheels it is what lets a map drop
+    /// carry the pose into the next map instead of restarting at identity.
+    world_anchored: bool,
 }
 
 impl Tracker {
@@ -768,6 +790,19 @@ impl Tracker {
             );
         }
 
+        let wheel = config.wheel_odom.clone().map(WheelState::new);
+        if let Some(w) = &wheel {
+            warning!(
+                "cu-kornia-vio WHEEL ODOMETRY enabled: local BA, the tracking prior and the \
+                 pose through a vision loss now lean on the wheels and the configured mount \
+                 (translation_noise={} rotation_noise={} z_sigma={} tilt_sigma={})",
+                w.cfg.translation_noise,
+                w.cfg.rotation_noise,
+                w.cfg.z_sigma,
+                w.cfg.tilt_sigma
+            );
+        }
+
         Self {
             camera,
             stereo_config,
@@ -793,6 +828,9 @@ impl Tracker {
             world_generation: 0,
             live_map_points: 0,
             live_map_points_key: (0, 0),
+            wheel,
+            frame_on_wheels: false,
+            world_anchored: false,
         }
     }
 
@@ -925,9 +963,21 @@ impl Tracker {
 
         // No `ImuInit` arm: see [`SystemMode`] for why this tracker never parks there.
         let frame_idx = frame.idx;
+        self.frame_on_wheels = false;
+        // Set when this frame anchors a map at a propagated pose rather than a measured one.
+        let mut coast_anchor = false;
         let status = match self.state.mode {
             SystemMode::Bootstrap => {
+                // With wheels, a world that already exists is CONTINUED: the pose a map drop
+                // carried over (or a loss left behind) keeps moving on the wheels while this
+                // waits for a frame to anchor on, and the new map is built where the robot is
+                // now, not where it was when vision went.
+                let seeded = self.wheel.is_some() && self.world_anchored;
+                if seeded {
+                    self.state.pose_world_to_cam = self.predict_pose(stamp_ns).0;
+                }
                 let status = self.bootstrap_stereo(frame, ts_sec, stamp_ns);
+                coast_anchor = seeded && status == TrackingStatus::KeyframeAccepted;
                 if status == TrackingStatus::KeyframeAccepted
                     && std::mem::take(&mut self.coast_rebootstrap_pending)
                 {
@@ -968,18 +1018,43 @@ impl Tracker {
             self.live_map_points_key = key;
         }
 
+        if let Some(w) = self.wheel.as_mut() {
+            w.prune([self.last_keyframe_stamp_ns, self.last_frame_stamp_ns]);
+        }
+
+        let pose = TrackedPose {
+            stamp,
+            pose_world_to_cam: self.state.pose_world_to_cam,
+            keyframe: status == TrackingStatus::KeyframeAccepted,
+        };
         match status {
             TrackingStatus::Skipped => {
                 self.stats.consecutive_failures = self.stats.consecutive_failures.saturating_add(1);
-                Ok(TrackStatus::Untracked)
+                // Without wheels, or before any world exists, an unplaced frame says nothing.
+                Ok(
+                    match (
+                        self.wheel.is_some() && self.world_anchored,
+                        self.frame_on_wheels,
+                    ) {
+                        (false, _) => TrackStatus::Untracked,
+                        (true, true) => TrackStatus::Coasting(TrackedPose {
+                            keyframe: false,
+                            ..pose
+                        }),
+                        (true, false) => TrackStatus::NotLocalized(TrackedPose {
+                            keyframe: false,
+                            ..pose
+                        }),
+                    },
+                )
             }
             TrackingStatus::Tracked | TrackingStatus::KeyframeAccepted => {
                 self.stats.consecutive_failures = 0;
-                Ok(TrackStatus::Tracked(TrackedPose {
-                    stamp,
-                    pose_world_to_cam: self.state.pose_world_to_cam,
-                    keyframe: status == TrackingStatus::KeyframeAccepted,
-                }))
+                Ok(if coast_anchor {
+                    TrackStatus::Coasting(pose)
+                } else {
+                    TrackStatus::Tracked(pose)
+                })
             }
         }
     }
@@ -1225,6 +1300,53 @@ impl Tracker {
         })
     }
 
+    /// Hands wheel-odometry readings to the tracker. Returns how many were accepted; readings
+    /// whose stamp does not advance or whose pose is not finite are refused and counted.
+    ///
+    /// Each reading's stamp must be on the SAME clock as the frames' `stamp`.
+    ///
+    /// # Errors
+    ///
+    /// [`VioError::WheelOdomDisabled`] when [`TrackerConfig::wheel_odom`] is `None`.
+    pub fn push_wheel(
+        &mut self,
+        samples: impl IntoIterator<Item = WheelSample>,
+    ) -> Result<usize, VioError> {
+        let w = self.wheel.as_mut().ok_or(VioError::WheelOdomDisabled)?;
+        Ok(w.push(samples))
+    }
+
+    /// Records where the camera sits on the base from `stamp`: `cam_in_base` is the camera's
+    /// pose in the base frame (`X_base = cam_in_base * X_cam`). Until the first one, the
+    /// configured mount is used. A stamp that does not advance is ignored and counted.
+    ///
+    /// # Errors
+    ///
+    /// [`VioError::WheelOdomDisabled`], or [`VioError::WheelMountNotRigid`] for a rotation that
+    /// is not one.
+    pub fn push_mount(&mut self, stamp: CuTime, cam_in_base: Pose3d) -> Result<(), VioError> {
+        let w = self.wheel.as_mut().ok_or(VioError::WheelOdomDisabled)?;
+        w.push_mount(stamp.as_nanos(), cam_in_base.inverse())
+    }
+
+    /// The bus-side half of [`Tracker::push_mount`]: already base-to-camera.
+    pub(crate) fn push_mount_t_cb(&mut self, stamp_ns: u64, t_cb: Pose3d) -> Result<(), VioError> {
+        let w = self.wheel.as_mut().ok_or(VioError::WheelOdomDisabled)?;
+        w.push_mount(stamp_ns, t_cb)
+    }
+
+    /// Records the bus queue's cumulative eviction count, for the stop line.
+    pub(crate) fn note_wheel_queue_evicted(&mut self, evicted: u64) {
+        if let Some(w) = self.wheel.as_mut() {
+            w.stats.queue_evicted = evicted;
+        }
+    }
+
+    /// Wheel counters, or `None` when the wheel path is off.
+    pub fn wheel_stats(&self) -> Option<WheelStats> {
+        self.wheel.as_ref().map(|w| w.stats)
+    }
+
     /// Drops the map and all state, returning to bootstrap at identity.
     ///
     /// Note this is *stronger* than what a tracking loss does by default: there a loss
@@ -1246,8 +1368,23 @@ impl Tracker {
     }
 
     fn reset_inner(&mut self, keep_calibration: bool) {
+        // A map DROP (the size bound, a loss with `reset_map_on_loss`) with wheels carries the
+        // pose into the next map, so the world frame stays continuous across it: the next
+        // bootstrap anchors where the robot is, propagated on the wheels from here. A requested
+        // reset still means a new world at identity.
+        let carry = keep_calibration && self.wheel.is_some() && self.world_anchored;
+        let carried_pose = self.state.pose_world_to_cam;
+        let carried_stamp = self.last_frame_stamp_ns;
+        if let Some(w) = self.wheel.as_mut() {
+            w.reset_map();
+        }
         self.map = Map::new();
         self.state = SystemState::new();
+        if carry {
+            self.state.pose_world_to_cam = carried_pose;
+        } else {
+            self.world_anchored = false;
+        }
         self.last_keyframe_timestamp_sec = None;
         self.last_keyframe_stamp_ns = None;
         // The buffered samples span the OLD map's last keyframe, and `start_kf_idx` names a
@@ -1267,7 +1404,8 @@ impl Tracker {
         // a SECOND time, for no reason a consumer could see.
         self.pending_map_reset = false;
         self.coast_rebootstrap_pending = false;
-        self.last_frame_stamp_ns = None;
+        // Kept across a carried drop: it starts the wheel interval that propagates the pose.
+        self.last_frame_stamp_ns = if carry { carried_stamp } else { None };
         self.world_generation += 1;
         // `next_frame_idx` and `epoch_ns` deliberately keep counting: frame
         // indices must stay unique for `Map::get_keyframe`, and restarting the
@@ -1339,6 +1477,7 @@ impl Tracker {
         self.state.last_keyframe_idx = Some(curr_idx);
         self.state.velocity = None;
         self.state.mode = SystemMode::Tracking;
+        self.world_anchored = true;
         self.last_keyframe_timestamp_sec = Some(timestamp_sec);
         self.last_keyframe_stamp_ns = Some(stamp_ns);
         self.arm_inertial_window(curr_idx, timestamp_sec, stamp_ns);
@@ -1479,26 +1618,40 @@ impl Tracker {
 
     // ── Tracking ─────────────────────────────────────────────────────────────
 
-    fn tracking_step(&mut self, frame: Frame, timestamp_sec: f64, stamp_ns: u64) -> TrackingStatus {
-        let image_size = frame.image_size;
-        // Bound before any path that can move `frame` into `bootstrap_stereo`.
-        let frame_idx = frame.idx;
+    /// The pose prior for a frame at `stamp_ns`, from the current pose, and the gyro rotation
+    /// it used. Sets `frame_on_wheels`.
+    ///
+    /// Translation (and, without a gyro, rotation) comes from the wheels when a reading covers
+    /// the interval, else from the constant-velocity model. The wheels measured this interval;
+    /// constant velocity guesses it from the last one, which is wrong whenever the robot
+    /// accelerates, and while vision is lost this prior IS the pose.
+    fn predict_pose(&mut self, stamp_ns: u64) -> (Pose3d, Option<Mat3F64>) {
         let pose_before = self.state.pose_world_to_cam;
+        let wheel_motion = match (self.last_frame_stamp_ns, self.wheel.as_mut()) {
+            (Some(t0), Some(w)) => w.camera_motion(t0, stamp_ns),
+            _ => None,
+        };
+        self.frame_on_wheels = wheel_motion.is_some();
 
         // Constant-velocity motion model. `velocity` is stored below as
         // `Pose3d::between(&pose_before, &estimate.pose)` and applied here as
         // `velocity.compose(&pose_before)`; the two halves are a matched pair —
-        // do not re-derive one from an assumed convention.
-        let mut candidate_pose = self
-            .state
-            .velocity
-            .map(|v| v.compose(&pose_before))
-            .unwrap_or(pose_before);
+        // do not re-derive one from an assumed convention. The wheel increment is built in the
+        // same world-to-camera form (`WheelState::camera_motion`).
+        let mut candidate_pose = match wheel_motion {
+            Some(m) => m.compose(&pose_before),
+            None => self
+                .state
+                .velocity
+                .map(|v| v.compose(&pose_before))
+                .unwrap_or(pose_before),
+        };
 
         // GYRO PRIOR on the rotation only. The constant-velocity model above predicts the next
         // ROTATION from the last one, which is wrong the moment angular rate changes — exactly
         // when the platform turns, and exactly when tracking was being lost. The gyro
-        // measured that turn at 200 Hz. Translation stays on constant velocity: predicting it
+        // measured that turn at 200 Hz, and it beats the wheels too, which slip in a turn.
+        // Translation stays on the wheels or constant velocity: predicting it from the IMU
         // needs double-integrated acceleration plus gravity, which is a different error budget.
         let gyro_delta = self
             .last_frame_stamp_ns
@@ -1507,6 +1660,15 @@ impl Tracker {
             candidate_pose =
                 rotate_about_centre(candidate_pose, d.transpose() * pose_before.rotation);
         }
+        (candidate_pose, gyro_delta)
+    }
+
+    fn tracking_step(&mut self, frame: Frame, timestamp_sec: f64, stamp_ns: u64) -> TrackingStatus {
+        let image_size = frame.image_size;
+        // Bound before any path that can move `frame` into `bootstrap_stereo`.
+        let frame_idx = frame.idx;
+        let pose_before = self.state.pose_world_to_cam;
+        let (candidate_pose, gyro_delta) = self.predict_pose(stamp_ns);
 
         // Widen the search in proportion to how long we have been failing: a
         // pose compounded over seconds of loss carries far more uncertainty
@@ -1585,7 +1747,8 @@ impl Tracker {
                 // Carry the *predicted* pose forward instead of freezing at
                 // `pose_before`: freezing desyncs position from velocity and
                 // compounds one bad frame into a full loss. `velocity` is left
-                // untouched, so this is a constant-velocity coast.
+                // untouched, so this is a constant-velocity coast, or a wheel one when
+                // `predict_pose` had readings.
                 self.state.pose_world_to_cam = candidate_pose;
                 debug!(
                     "track: rejected frame={} reason={}",
@@ -2008,6 +2171,16 @@ impl Tracker {
         // exactly that offset. Skipping BA for the first two insertions costs
         // very little; upstream's own bootstrap BA (`run_initial_ba`) pins the
         // older keyframe for the same reason.
+        // The wheel interval this keyframe closes, queued even when BA does not run: a factor
+        // is keyed by `Frame::idx` and acts in every later solve whose window holds both ends.
+        let wheel_factors: Vec<WheelOdomFactor> = match self.wheel.as_mut() {
+            Some(w) => {
+                w.on_keyframe(prev_edge, frame.idx, stamp_ns);
+                w.factors().to_vec()
+            }
+            None => Vec::new(),
+        };
+
         let ran_ba =
             self.config.enable_local_ba && self.map.keyframes().len() > BA_ACTIVE_KEYFRAMES;
         if ran_ba {
@@ -2022,8 +2195,26 @@ impl Tracker {
             let update = match inertial_ba {
                 // 15 DOF per keyframe (pose, velocity, bias) instead of 6. Mirrors
                 // kornia-slam's own local mapping, which branches on exactly this flag.
-                Some((imu_t_bc, gravity_world)) => {
-                    run_local_inertial_ba(snapshot, &self.camera, Some(imu_t_bc), gravity_world)
+                Some((imu_t_bc, gravity_world)) => run_local_inertial_ba(
+                    snapshot,
+                    &self.camera,
+                    Some(imu_t_bc),
+                    gravity_world,
+                    &wheel_factors,
+                ),
+                // A map built without the inertial path holds no IMU factor, so the 15-DOF solve
+                // is the visual one plus the wheel edges; velocity and bias ride along under the
+                // solver's damping floor and nothing reads them. With the inertial path on but
+                // not yet applied, the map DOES hold IMU factors, at an unaligned gravity this
+                // solve would trust: the wheels wait for the initialization there.
+                None if self.inertial.is_none() && !wheel_factors.is_empty() => {
+                    run_local_inertial_ba(
+                        snapshot,
+                        &self.camera,
+                        None,
+                        Vec3F64::ZERO,
+                        &wheel_factors,
+                    )
                 }
                 None => run_local_ba(snapshot, &self.camera),
             };
@@ -4669,5 +4860,258 @@ mod tests {
             let status = tracker.process_stereo(&left, &right, stamp).unwrap();
             assert!(matches!(status, TrackStatus::Tracked(_)), "{status:?}");
         }
+    }
+
+    // ── Wheel odometry ───────────────────────────────────────────────────────
+
+    const FRAME_NS: u64 = 66_666_667;
+
+    /// The scene camera looks along base +x (OpenCV x right = base -y, y down = base -z), so
+    /// the scene's camera +x motion is the base driving to its right, along odom -y.
+    fn scene_wheel_config() -> WheelOdomConfig {
+        let r_bc = crate::wheel::mat3_from_rows(&[0.0, 0.0, 1.0, -1.0, 0.0, 0.0, 0.0, -1.0, 0.0]);
+        WheelOdomConfig::new(Pose3d::new(r_bc, Vec3F64::new(0.1, 0.0, 0.9)), 0.01, 0.01)
+            .expect("valid")
+    }
+
+    fn scene_tracker_with(f: impl FnOnce(&mut TrackerConfig)) -> Tracker {
+        let mut config = TrackerConfig::new(Length::new::<meter>(0.1));
+        f(&mut config);
+        let camera = PinholeCamera {
+            fx: 300.0,
+            fy: 300.0,
+            cx: 160.0,
+            cy: 120.0,
+            ..rectified_camera()
+        };
+        let mut tracker = Tracker::new(camera, config);
+        tracker.epoch_ns = Some(EPOCH_NS);
+        tracker
+    }
+
+    /// Wheel readings that agree exactly with the scene, one per frame stamp for `seqs`.
+    fn push_scene_wheels(tracker: &mut Tracker, seqs: std::ops::Range<u32>) {
+        let n = tracker
+            .push_wheel(seqs.clone().map(|seq| WheelSample {
+                stamp_ns: EPOCH_NS + u64::from(seq) * FRAME_NS,
+                x: 0.0,
+                y: -SCENE_STEP_M * f64::from(seq),
+                theta: 0.0,
+            }))
+            .expect("the wheel path is on");
+        assert_eq!(n, seqs.len());
+    }
+
+    fn blank_frame(tracker: &mut Tracker, seq: u32) -> TrackStatus {
+        let blank = Image::from_size_val(
+            ImageSize {
+                width: 320,
+                height: 240,
+            },
+            0u8,
+        )
+        .unwrap();
+        let stamp = CuTime::from_nanos(EPOCH_NS + u64::from(seq) * FRAME_NS);
+        tracker.process_stereo(&blank, &blank, stamp).unwrap()
+    }
+
+    /// The camera-centre error of a published pose against the scene's truth at `seq`.
+    fn centre_error(pose: &TrackedPose, seq: u32) -> f64 {
+        let truth = Vec3F64::new(SCENE_STEP_M * f64::from(seq), 0.0, 0.0);
+        (pose.cam_in_world().translation - truth).length()
+    }
+
+    /// Off means off: wheel odometry configured but never fed is the stereo tracker bit for bit
+    /// (the prior falls back to constant velocity, no factor reaches BA), and without the
+    /// config the tracker refuses readings rather than ignoring them.
+    #[test]
+    fn test_wheel_odom_without_readings_is_bit_identical_to_off() {
+        let mut off = scene_tracker(None);
+        let mut idle = scene_tracker_with(|c| c.wheel_odom = Some(scene_wheel_config()));
+        for seq in 0..30 {
+            let (a, b) = (feed(&mut off, seq), feed(&mut idle, seq));
+            let (TrackStatus::Tracked(a), TrackStatus::Tracked(b)) = (a, b) else {
+                panic!("frame {seq}: both must track");
+            };
+            assert_eq!(
+                pose_bits(&a.pose_world_to_cam),
+                pose_bits(&b.pose_world_to_cam)
+            );
+        }
+        assert!(matches!(
+            off.push_wheel(std::iter::empty()),
+            Err(VioError::WheelOdomDisabled)
+        ));
+        assert_eq!(off.wheel_stats(), None);
+        // An unplaced frame: no payload without wheels, an honest "not localized" with them.
+        assert!(matches!(blank_frame(&mut off, 30), TrackStatus::Untracked));
+        assert!(matches!(
+            blank_frame(&mut idle, 30),
+            TrackStatus::NotLocalized(_)
+        ));
+    }
+
+    /// With readings, every keyframe pair gets a factor and local BA takes the wheel path on a
+    /// visual-only map, with nothing refused and the trajectory as accurate as without.
+    #[test]
+    fn test_wheel_factors_reach_local_ba_on_a_visual_only_map() {
+        let mut tracker = scene_tracker_with(|c| c.wheel_odom = Some(scene_wheel_config()));
+        push_scene_wheels(&mut tracker, 0..41);
+        let mut worst_m = 0.0f64;
+        for seq in 0..40 {
+            let TrackStatus::Tracked(pose) = feed(&mut tracker, seq) else {
+                panic!("frame {seq} was not tracked");
+            };
+            worst_m = worst_m.max(centre_error(&pose, seq));
+        }
+        let w = tracker.wheel_stats().expect("on");
+        assert!(w.edges_added >= 3, "{w:?}");
+        assert_eq!(w.edges_refused + w.edges_expired, 0, "{w:?}");
+        assert!(w.prior_frames >= 39, "{w:?}");
+        assert!(tracker.map().keyframes().len() > BA_ACTIVE_KEYFRAMES);
+        assert_eq!(tracker.ba_updates_refused(), 0);
+        assert!(worst_m < 0.005, "worst camera-centre error {worst_m} m");
+    }
+
+    /// The factors must actually reach the solve, not just be counted: wheels that over-read
+    /// by 30 % pull the BA-refined keyframes off the vision-only answer, which a tracking prior
+    /// alone (PnP converges onto vision from any nearby seed) cannot do.
+    #[test]
+    fn test_biased_wheels_pull_the_ba_keyframes() {
+        let keyframe_error = |scale: f64| {
+            let mut tracker = scene_tracker_with(|c| c.wheel_odom = Some(scene_wheel_config()));
+            tracker
+                .push_wheel((0..41u32).map(|seq| WheelSample {
+                    stamp_ns: EPOCH_NS + u64::from(seq) * FRAME_NS,
+                    x: 0.0,
+                    y: -scale * SCENE_STEP_M * f64::from(seq),
+                    theta: 0.0,
+                }))
+                .unwrap();
+            for seq in 0..40 {
+                feed(&mut tracker, seq);
+            }
+            // Keyframe `idx` is frame `idx`, so its truth is `idx` steps along +x.
+            tracker
+                .map()
+                .keyframes()
+                .iter()
+                .map(|kf| {
+                    let truth = Vec3F64::new(SCENE_STEP_M * kf.frame.idx as f64, 0.0, 0.0);
+                    (kf.frame.pose_world_to_cam.inverse().translation - truth).length()
+                })
+                .fold(0.0f64, f64::max)
+        };
+        let (exact, biased) = (keyframe_error(1.0), keyframe_error(1.3));
+        assert!(exact < 0.002, "exact wheels: {exact} m");
+        assert!(
+            biased > 0.002,
+            "biased wheels moved no keyframe ({biased} m): BA never saw them"
+        );
+    }
+
+    /// Vision goes dark for six frames while the robot keeps driving. The published pose must
+    /// keep moving with the wheels (coasting) and come back onto the truth, not freeze and not
+    /// jump, whichever way the loss path re-anchors.
+    #[test]
+    fn test_coasting_keeps_a_continuous_pose_over_a_vision_gap() {
+        for reset_map_on_loss in [false, true] {
+            let mut tracker = scene_tracker_with(|c| {
+                c.wheel_odom = Some(scene_wheel_config());
+                c.reset_map_on_loss = reset_map_on_loss;
+            });
+            push_scene_wheels(&mut tracker, 0..31);
+            for seq in 0..12 {
+                assert!(matches!(feed(&mut tracker, seq), TrackStatus::Tracked(_)));
+            }
+            for seq in 12..18 {
+                let TrackStatus::Coasting(pose) = blank_frame(&mut tracker, seq) else {
+                    panic!("frame {seq}: a dark frame with wheels must coast");
+                };
+                let err = centre_error(&pose, seq);
+                assert!(err < 0.01, "reset={reset_map_on_loss} frame {seq}: {err} m");
+            }
+            let mut tracked_again = false;
+            for seq in 18..30 {
+                let pose = match feed(&mut tracker, seq) {
+                    TrackStatus::Tracked(p) => {
+                        tracked_again = true;
+                        p
+                    }
+                    // The frame that re-anchors is itself a coast.
+                    TrackStatus::Coasting(p) => p,
+                    other => panic!("frame {seq}: {other:?}"),
+                };
+                let err = centre_error(&pose, seq);
+                assert!(err < 0.01, "reset={reset_map_on_loss} frame {seq}: {err} m");
+            }
+            assert!(tracked_again, "vision never took over again");
+        }
+    }
+
+    /// A `max_keyframes` drop must not move the world: the next map is seeded at the pose
+    /// propagated on the wheels, so every published pose stays on the truth while the epoch
+    /// still bumps for consumers that key on it.
+    #[test]
+    fn test_a_map_drop_keeps_the_world_continuous() {
+        let mut tracker = scene_tracker_with(|c| {
+            c.wheel_odom = Some(scene_wheel_config());
+            c.max_keyframes = Some(3);
+        });
+        push_scene_wheels(&mut tracker, 0..41);
+        let mut coasted = 0;
+        for seq in 0..40 {
+            let pose = match feed(&mut tracker, seq) {
+                TrackStatus::Tracked(p) => p,
+                TrackStatus::Coasting(p) => {
+                    coasted += 1;
+                    p
+                }
+                other => panic!("frame {seq}: {other:?}"),
+            };
+            let err = centre_error(&pose, seq);
+            assert!(err < 0.01, "frame {seq}: {err} m from the truth");
+        }
+        assert!(
+            tracker.world_generation() >= 1,
+            "the bound never dropped the map"
+        );
+        assert_eq!(
+            coasted,
+            tracker.world_generation(),
+            "each drop's re-anchor frame, and only it, is a coast"
+        );
+
+        // Without wheels the same drop restarts the world at identity: the regression this
+        // guards against.
+        let mut plain = scene_tracker_with(|c| c.max_keyframes = Some(3));
+        let mut jumped = false;
+        for seq in 0..40 {
+            if let TrackStatus::Tracked(p) = feed(&mut plain, seq) {
+                jumped |= centre_error(&p, seq) > 0.05;
+            }
+        }
+        assert!(
+            jumped,
+            "the drop no longer restarts the plain tracker; this test lost its control"
+        );
+    }
+
+    /// A requested reset is still a new world at identity, wheels or not.
+    #[test]
+    fn test_a_requested_reset_does_not_carry_the_pose() {
+        let mut tracker = scene_tracker_with(|c| c.wheel_odom = Some(scene_wheel_config()));
+        push_scene_wheels(&mut tracker, 0..21);
+        for seq in 0..10 {
+            feed(&mut tracker, seq);
+        }
+        tracker.reset();
+        let TrackStatus::Tracked(pose) = feed(&mut tracker, 10) else {
+            panic!("a fresh bootstrap is a measurement");
+        };
+        assert_eq!(
+            pose_bits(&pose.pose_world_to_cam),
+            pose_bits(&Pose3d::IDENTITY)
+        );
     }
 }

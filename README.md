@@ -9,7 +9,8 @@ input edge and can run with `background: true`.
 
 ## Crates
 
-- **`cu-kornia-vio`**: the tasks (`StereoVio`, `ImuFeed`) and the `VioBus` resource bundle.
+- **`cu-kornia-vio`**: the tasks (`StereoVio`, `ImuFeed`, `WheelFeed`, `MountFeed`) and the
+  `VioBus` resource bundle.
 - **`cu-stereo-payloads`**: the wire types alone. It depends on cu29, the upstream copper
   payload crates, bincode and serde and nothing else, so a stereo driver can name the types it
   produces without depending on `cu-kornia-vio` and, through it, on kornia-slam. That is the whole
@@ -33,7 +34,9 @@ All from `cu-stereo-payloads`. Time rides on the message `tov`, never in the pay
 |---|---|---|
 | `StereoPair` | two `CuImage` eyes (`CuHandle`-backed buffers) plus `RectifiedStereo`: intrinsics and baseline of the rectified pair | capture time of the pair |
 | `ImuBatch<N>` | up to `N` `ImuSample`s (an upstream `cu_sensor_payloads::ImuPayload` plus its own capture time), oldest first, a cumulative `dropped` counter and a `camera_aligned` flag | `ImuBatch::tov()`, a `Tov::Range` over the samples |
-| `VioPose` | a `cu_spatial_payloads::Pose<f64>` (camera in world) plus `VioStatus`: keyframe flag, reset epoch, landmark count; and `map_points`, an optional map snapshot, `Option<CuHandle<Vec<Landmark>>>`. An untracked frame carries no payload | the `tov` of the frame it was computed from |
+| `VioPose` | a `cu_spatial_payloads::Pose<f64>` (camera in world) plus `VioStatus`: keyframe flag, reset epoch, landmark count, `localization` (`Tracking`, `Coasting`, `NotLocalized`); and `map_points`, an optional map snapshot, `Option<CuHandle<Vec<Landmark>>>`. Without wheel odometry an untracked frame carries no payload | the `tov` of the frame it was computed from |
+| `WheelOdom` | a planar wheel-odometry reading: the CUMULATIVE base pose `x`, `y`, `theta` in the odometry frame (REP-103) and the producer's row-major 3x3 `covariance` | capture time of the reading |
+| `CameraMount` | `cam_in_base: Pose<f64>`, the rectified left camera's pose in the base frame, for a camera on a moving head | time the mount is valid from |
 | `Landmark` | one map point: world-frame `position: [f32; 3]` in metres and its map `index: u32` | element of a `VioPose` snapshot, no time of its own |
 
 `Landmark::index` is a `u32`, not a float in a fourth column: an `f32` is exact only to 2^24,
@@ -76,9 +79,9 @@ cnx: [
 ],
 ```
 
-- **`VioBus`** is a resource bundle with two members: `imu`, a bounded queue of IMU samples, and
+- **`VioBus`** is a resource bundle with three members: `imu`, a bounded queue of IMU samples,
   `reset_epoch`, a counter a caller bumps with `ResetEpoch::request` to drop the map on the next
-  frame. Each bus instance is independent, so two estimators in one graph need two buses.
+  frame, and `wheel`, a bounded queue of wheel readings and camera mounts. Each bus instance is independent, so two estimators in one graph need two buses.
 - **`ImuFeed<N>`** is an inline sink that pushes each `ImuBatch<N>` into the bus queue. Its `N`
   must match the source's batch capacity. The queue is armed only when `StereoVio` has an
   `inertial` config block; without one the push is a single atomic load.
@@ -86,7 +89,7 @@ cnx: [
   frame. Unknown config keys are refused at startup rather than ignored. The recognised keys are
   `on_tracking_loss` (`keep_map`, the default, or `reset_map` for a long-running graph),
   `max_keyframes`, `orb_keypoints`, `search_radius_px`, `max_covisible_keyframes`,
-  `pnp_lm_iterations`, `inertial` and `landmark_buffers`;
+  `pnp_lm_iterations`, `inertial`, `landmark_buffers` and `wheel_odom`;
   `cu_kornia_vio::config::CONFIG_KEYS` lists them. Its `Freezable` is a no-op (the kornia-slam
   map has no serialised form), so a resim of a `background: true` graph reproduces it only from
   the start of a log; see Known limitations.
@@ -154,6 +157,42 @@ config: {
 
 The doc comments on `InertialRon` in `src/config.rs` explain each field and why no default is
 defensible (the type is crate-private, so `cargo doc` does not render them).
+
+## Wheel odometry
+
+Off by default, and off means the tracker behaves exactly as without it. For a ground robot,
+add a `wheel_odom` block with `enabled: true`, bind the bus's `wheel` on `StereoVio` (the binding
+is optional otherwise), and feed it:
+
+```ron
+( id: "wheel_feed", type: "cu_kornia_vio::WheelFeed", resources: { "wheel": "bus.wheel" } ),
+( id: "mount_feed", type: "cu_kornia_vio::MountFeed", resources: { "wheel": "bus.wheel" } ),
+( id: "vio", type: "cu_kornia_vio::StereoVio", background: true,
+  config: { "wheel_odom": (
+      enabled: true,
+      cam_in_base_rotation: [/* camera in base, row-major */],
+      cam_in_base_translation: [/* metres */],
+      translation_noise: 0.02,  // m per sqrt(m) of path
+      rotation_noise: 0.05,     // rad per sqrt(rad) turned
+      // optional: z_sigma, tilt_sigma (planar stiffness), huber_chi2, max_gap_s
+  ) },
+  resources: { "imu": "bus.imu", "epoch": "bus.reset_epoch", "wheel": "bus.wheel" } ),
+```
+
+With it on:
+
+- each keyframe pair gets a kornia-slam `WheelOdomFactor` in local BA (an interval whose readings
+  have not arrived yet waits for a later keyframe). With the inertial path on, the factors join
+  the inertial solve once it is applied; before that, local BA stays visual;
+- the per-frame prior is the camera motion the wheels measured, with the gyro's rotation when
+  the inertial path is on, instead of constant velocity;
+- while vision is lost the pose keeps moving on that prior and is published as `Coasting`, or as
+  `NotLocalized` when no reading covers the frame;
+- a map drop (`max_keyframes`, or a loss with `reset_map`) seeds the next map at the pose
+  propagated on the wheels, so the world frame stays continuous. `reset_epoch` still bumps.
+
+`MountFeed` is only needed when the mount moves (a tilting head); the config's `cam_in_base_*`
+is used until the first `CameraMount` arrives.
 
 ## Documentation and development
 

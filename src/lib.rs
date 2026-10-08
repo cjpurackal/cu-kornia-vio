@@ -19,6 +19,10 @@
 //!   a second input edge. A [`VioBus`] resource bundle holds an [`ImuQueue`] that the inline
 //!   [`ImuFeed`] sink fills from the graph's IMU edge, and a [`ResetEpoch`] any bound task can
 //!   bump. One bus per estimator, so two estimators in one process stay independent.
+//! * [`wheel`], [`wheel_channel`], [`wheel_feed`]: optional planar wheel odometry, the same seam
+//!   as the IMU. It constrains local BA, replaces the constant-velocity prior, carries the pose
+//!   through a vision loss, and keeps the world continuous across a map drop. Off unless the
+//!   `wheel_odom` block enables it.
 //!
 //! That split is the reason this crate can be reviewed as a copper component rather than as a
 //! slice of an application: the estimation is testable without a graph, and the graph binding
@@ -38,6 +42,9 @@ mod stats;
 pub mod task;
 pub mod task_error;
 pub mod track;
+pub mod wheel;
+pub mod wheel_channel;
+pub mod wheel_feed;
 
 pub use bus::VioBus;
 pub use config::OnTrackingLoss;
@@ -49,3 +56,6 @@ pub use reset::ResetEpoch;
 pub use task::{DEFAULT_LANDMARK_BUFFERS, MAX_LANDMARK_BUFFERS, MAX_LANDMARKS, StereoVio};
 pub use task_error::{Eye, TaskError};
 pub use track::{SystemMode, TrackStatus, TrackedPose, Tracker, TrackerConfig, TrackerStats};
+pub use wheel::{WheelOdomConfig, WheelSample, WheelStats};
+pub use wheel_channel::WheelQueue;
+pub use wheel_feed::{MountFeed, WheelFeed};

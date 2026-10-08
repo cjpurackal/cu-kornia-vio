@@ -648,6 +648,20 @@ impl InertialConfig {
     }
 }
 
+/// `Some((max|R^T R - I|, det R))` when `r` is not a proper rotation, `None` when it is.
+pub(crate) fn rotation_residual(r: &Mat3F64) -> Option<(f64, f64)> {
+    let residual = r.transpose() * *r - Mat3F64::IDENTITY;
+    let orthonormality_error = residual
+        .to_cols_array()
+        .iter()
+        .fold(0.0f64, |acc, v| acc.max(v.abs()));
+    let determinant = r.determinant();
+    let rigid = orthonormality_error.is_finite()
+        && orthonormality_error <= 1e-6
+        && (determinant - 1.0).abs() <= 1e-6;
+    (!rigid).then_some((orthonormality_error, determinant))
+}
+
 /// Rejects a matrix that is not a proper rotation.
 ///
 /// Tolerance 1e-6 on both tests: a hand-entered rotation written to six decimals lands around
@@ -655,22 +669,13 @@ impl InertialConfig {
 /// the one that matters — a reflection (det = -1) mirrors the body frame, and a mirrored
 /// gravity direction is what `apply_initialization` would then rotate the whole map onto.
 fn validate_rotation(r: &Mat3F64) -> Result<(), VioError> {
-    let residual = r.transpose() * *r - Mat3F64::IDENTITY;
-    let orthonormality_error = residual
-        .to_cols_array()
-        .iter()
-        .fold(0.0f64, |acc, v| acc.max(v.abs()));
-    let determinant = r.determinant();
-    if !orthonormality_error.is_finite()
-        || orthonormality_error > 1e-6
-        || (determinant - 1.0).abs() > 1e-6
-    {
-        return Err(VioError::InertialExtrinsicNotRigid {
+    match rotation_residual(r) {
+        Some((orthonormality_error, determinant)) => Err(VioError::InertialExtrinsicNotRigid {
             orthonormality_error,
             determinant,
-        });
+        }),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// What the inertial path has done and refused. Diagnostics only.

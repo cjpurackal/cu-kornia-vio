@@ -160,6 +160,35 @@ pub enum VioError {
         value: f64,
     },
 
+    /// Wheel odometry was handed to a tracker whose wheel path is not configured.
+    #[error(
+        "wheel odometry is not configured (TrackerConfig::wheel_odom is None); \
+         add a `wheel_odom` block with `enabled: true`"
+    )]
+    WheelOdomDisabled,
+
+    /// The configured or published camera mount rotation is not a rotation.
+    #[error(
+        "camera mount rotation is not a rigid rotation: max|R^T R - I| = \
+         {orthonormality_error:e}, det = {determinant} (want 0 and +1)"
+    )]
+    WheelMountNotRigid {
+        /// Largest absolute entry of `R^T R - I`.
+        orthonormality_error: f64,
+        /// Determinant of `R`.
+        determinant: f64,
+    },
+
+    /// A wheel-odometry noise figure is not a usable positive number. A zero sigma is an
+    /// infinite information matrix: the wheels would then outweigh every visual constraint.
+    #[error("wheel_odom parameter `{field}` must be finite and > 0, got {value}")]
+    WheelParamInvalid {
+        /// Which parameter.
+        field: &'static str,
+        /// The offending value.
+        value: f64,
+    },
+
     /// ORB detection or a pyramid resize failed inside kornia-imgproc.
     #[error("image operation failed: {0}")]
     Image(#[from] ImageError),

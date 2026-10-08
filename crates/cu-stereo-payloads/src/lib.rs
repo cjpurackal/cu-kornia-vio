@@ -419,11 +419,82 @@ impl<'de, const N: usize> Deserialize<'de> for ImuBatch<N> {
     }
 }
 
+/// Planar wheel odometry of a ground robot's base: one reading of the integrated pose.
+///
+/// The CUMULATIVE pose of the base in the producer's odometry frame (REP-103: x forward, y left,
+/// theta counter-clockwise about +z), not a per-tick increment: a consumer differences two
+/// readings for the motion between them, and a lost message then costs resolution, not motion.
+/// The time of validity is the `tov` of the carrying `CuMsg`, as for every payload here.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect,
+)]
+pub struct WheelOdom {
+    /// Base position in the odometry frame, metres.
+    pub x: f64,
+    /// Base position in the odometry frame, metres.
+    pub y: f64,
+    /// Base heading in the odometry frame, radians. Wrapped or not; consumers unwrap differences.
+    pub theta: f64,
+    /// Row-major 3x3 covariance over `(x, y, theta)`, as the producer reports it, cumulative.
+    ///
+    /// Carried for logging and for consumers that want the producer's own figure. A VIO
+    /// consumer does NOT build its factor noise from it: the covariance of the motion between two
+    /// readings is not the difference of their cumulative covariances, so it takes a per-metre
+    /// and per-radian noise model from its own config instead.
+    pub covariance: [f64; 9],
+}
+
+/// Where the camera sits on the robot's base, for a consumer that fuses base motion with vision.
+///
+/// A message, not a config value, because a camera on a moving head (a tilt joint) has a
+/// time-varying mount; a producer publishes it at the joint's rate, stamped on the `tov` of the
+/// carrying `CuMsg`. A fixed mount can still publish it once, or a consumer can take it from its
+/// config instead.
+#[derive(Default, Debug, Clone, Encode, Serialize, Deserialize, Reflect)]
+#[reflect(from_reflect = false, no_field_bounds)]
+pub struct CameraMount {
+    /// Camera pose in the base frame, metres: `X_base = cam_in_base * X_cam`. "Camera" is the
+    /// RECTIFIED left camera, the frame the tracker's poses live in, with OpenCV axes (x right,
+    /// y down, z forward).
+    pub cam_in_base: Pose<f64>,
+}
+
+impl Decode<()> for CameraMount {
+    fn decode<D: Decoder<Context = ()>>(decoder: &mut D) -> Result<Self, DecodeError> {
+        Ok(Self {
+            cam_in_base: Decode::decode(decoder)?,
+        })
+    }
+}
+
+/// How the pose on a [`VioPose`] was obtained.
+///
+/// Without wheel odometry configured every published pose is [`Localization::Tracking`] and a
+/// frame the tracker could not place carries NO payload, exactly as before this field existed.
+/// The other two values appear only on a tracker fed wheel odometry, which can still say
+/// something on such a frame.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect,
+)]
+pub enum Localization {
+    /// Measured against the map.
+    #[default]
+    Tracking,
+    /// Vision is lost; the pose is the last measured one propagated on wheel odometry (and the
+    /// gyro, when the inertial path is on). Continuous, but drifting with distance travelled.
+    Coasting,
+    /// Vision is lost and nothing could propagate the pose (no wheel reading covers the
+    /// interval). `cam_in_world` is the tracker's last extrapolation and must not be used as a
+    /// position: hold the previous one, or drop the frame.
+    NotLocalized,
+}
+
 /// Tracker bookkeeping that accompanies each pose.
 ///
-/// There is no tracking-state field: a frame the tracker could not place carries NO payload, and
-/// that absence is the one way "untracked" is said. A consumer must skip such frames rather than
-/// hold the previous pose, which would read as a stationary camera.
+/// Without wheel odometry, a frame the tracker could not place carries NO payload, and that
+/// absence is the one way "untracked" is said. A consumer must skip such frames rather than hold
+/// the previous pose, which would read as a stationary camera. With it, see
+/// [`VioStatus::localization`].
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Serialize, Deserialize, Reflect,
 )]
@@ -438,6 +509,8 @@ pub struct VioStatus {
     pub reset_epoch: u64,
     /// Live (not culled) map points in the tracker's map.
     pub landmarks: u32,
+    /// Whether this pose is measured, coasted on the wheels, or not localized at all.
+    pub localization: Localization,
 }
 
 /// One point of the tracker's map, as carried by [`VioPose::map_points`].
@@ -638,6 +711,7 @@ mod tests {
                 keyframe: false,
                 reset_epoch: 6,
                 landmarks: 9,
+                localization: Localization::Coasting,
             },
             map_points: None,
         };
@@ -653,8 +727,8 @@ mod tests {
             row(ZERO, ONE, ZERO, three),
             row(ZERO, ZERO, ONE, four),
             row(ZERO, ZERO, ZERO, ONE),
-            // keyframe = false, reset_epoch, landmarks
-            vec![0, 6, 9],
+            // keyframe = false, reset_epoch, landmarks, localization = Coasting
+            vec![0, 6, 9, 1],
             // no map_points snapshot: the Option tag alone
             vec![0],
         ]
@@ -685,6 +759,7 @@ mod tests {
                 keyframe: true,
                 reset_epoch: 2,
                 landmarks: 5,
+                localization: Localization::Tracking,
             },
             map_points: Some(CuHandle::new_detached(points.clone())),
         };
@@ -692,7 +767,7 @@ mod tests {
         let head = encode(&pose.cam_in_world);
         #[rustfmt::skip]
         let tail: &[u8] = &[
-            1, 2, 5,                // keyframe = true, reset_epoch, landmarks
+            1, 2, 5, 0,             // keyframe = true, reset_epoch, landmarks, Tracking
             1,                      // Some: a snapshot follows
             2,                      // two points
             0x00, 0x00, 0x80, 0x3f, // x = 1.0
@@ -836,6 +911,43 @@ mod tests {
         assert_payload::<ImuBatch<32>>();
         assert_payload::<ImuPayload>();
         assert_payload::<VioPose>();
+        assert_payload::<WheelOdom>();
+        assert_payload::<CameraMount>();
+    }
+
+    #[test]
+    fn test_wheel_odom_golden_bytes() {
+        let odom = WheelOdom {
+            x: 1.0,
+            y: -2.0,
+            theta: 0.5,
+            covariance: [0.0; 9],
+        };
+        let bytes = encode(&odom);
+        let golden = [
+            1.0f64.to_le_bytes(),
+            (-2.0f64).to_le_bytes(),
+            0.5f64.to_le_bytes(),
+        ]
+        .concat();
+        assert_eq!(bytes, [golden, vec![0u8; 72]].concat());
+        assert_eq!(decode::<WheelOdom>(&bytes), odom);
+    }
+
+    #[test]
+    fn test_camera_mount_round_trips() {
+        let mount = CameraMount {
+            cam_in_base: Pose::from_matrix([
+                [0.0, 0.0, 1.0, 0.1],
+                [-1.0, 0.0, 0.0, 0.0],
+                [0.0, -1.0, 0.0, 0.9],
+                [0.0, 0.0, 0.0, 1.0],
+            ]),
+        };
+        let bytes = encode(&mount);
+        assert_eq!(bytes, encode(&mount.cam_in_base));
+        let back: CameraMount = decode(&bytes);
+        assert_eq!(back.cam_in_base.to_matrix(), mount.cam_in_base.to_matrix());
     }
 
     /// The pool bound: a `CuHostMemoryPool<Vec<Landmark>>` exists only for an `ElementType`.

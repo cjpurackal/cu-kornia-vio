@@ -12,6 +12,7 @@ use kornia_sensors::imu::ImuCalib;
 
 use crate::error::VioError;
 use crate::imu::InertialConfig;
+use crate::wheel::{WheelOdomConfig, mat3_from_rows};
 
 /// What the tracker does with its map after a sustained tracking loss: the `on_tracking_loss`
 /// key, spelled `"keep_map"` or `"reset_map"`.
@@ -193,6 +194,90 @@ pub(crate) fn optional_inertial(config: Option<&ComponentConfig>) -> CuResult<Op
         .flatten())
 }
 
+/// The `wheel_odom` block of a `vio` component config.
+///
+/// ```ron
+/// "wheel_odom": (
+///   enabled: true,
+///   // Camera pose in the base frame (the URDF base -> rectified left camera), ROW-major.
+///   // The fallback until a `CameraMount` arrives on the bus; a fixed mount needs nothing else.
+///   cam_in_base_rotation: [0.0, 0.0, 1.0,  -1.0, 0.0, 0.0,  0.0, -1.0, 0.0],
+///   cam_in_base_translation: [0.1, 0.0, 0.9],
+///   translation_noise: 0.02,   // m per sqrt(m) of path
+///   rotation_noise: 0.05,      // rad per sqrt(rad) turned
+///   // Optional:
+///   z_sigma: 0.01,             // m, planar stiffness on z
+///   tilt_sigma: 0.01,          // rad, planar stiffness on roll and pitch
+///   huber_chi2: 12.59,         // 6-DOF chi-square, 95 %; absent keeps the factor quadratic
+///   max_gap_s: 0.5,            // longest hole between readings an interval may span
+/// ),
+/// ```
+///
+/// Absent, or with `enabled: false` (the default), the tracker behaves exactly as without the
+/// block. Present, the mount and the two noise figures are required: there is no defensible
+/// default for where a camera sits or how good a robot's wheels are, and a wrong one is not an
+/// error but a confidently bent trajectory. The planar stiffness defaults to kornia-slam's
+/// (1 cm, 0.01 rad), itself unmeasured.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WheelOdomRon {
+    /// Off unless set, so a block can sit in a graph for an A/B without acting.
+    #[serde(default)]
+    pub enabled: bool,
+    /// `R` of the camera in the base, ROW-major: `X_base = R X_cam + t`.
+    pub cam_in_base_rotation: [f64; 9],
+    /// `t` of the camera in the base, metres.
+    pub cam_in_base_translation: [f64; 3],
+    /// m per sqrt(m) of path.
+    pub translation_noise: f64,
+    /// rad per sqrt(rad) turned.
+    pub rotation_noise: f64,
+    #[serde(default)]
+    pub z_sigma: Option<f64>,
+    #[serde(default)]
+    pub tilt_sigma: Option<f64>,
+    #[serde(default)]
+    pub huber_chi2: Option<f64>,
+    #[serde(default)]
+    pub max_gap_s: Option<f64>,
+}
+
+impl WheelOdomRon {
+    /// The tracker's config, or `None` when the block is disabled. Validated either way, so a
+    /// disabled block with a typo in it fails at startup rather than on the day it is enabled.
+    pub fn to_config(&self) -> Result<Option<WheelOdomConfig>, VioError> {
+        let cam_in_base = Pose3d::from_rt(
+            mat3_from_rows(&self.cam_in_base_rotation),
+            Vec3F64::from_array(self.cam_in_base_translation),
+        );
+        let mut cfg =
+            WheelOdomConfig::new(cam_in_base, self.translation_noise, self.rotation_noise)?;
+        if let Some(v) = self.z_sigma {
+            cfg.z_sigma = v;
+        }
+        if let Some(v) = self.tilt_sigma {
+            cfg.tilt_sigma = v;
+        }
+        cfg.huber_chi2 = self.huber_chi2;
+        if let Some(v) = self.max_gap_s {
+            // `from_secs_f64` would panic on a negative; `validate` refuses it instead.
+            cfg.max_gap = cu29::units::si::f64::Time::new::<cu29::units::si::time::second>(v);
+        }
+        cfg.validate()?;
+        Ok(self.enabled.then_some(cfg))
+    }
+}
+
+/// Reads the optional `wheel_odom` block; malformed is a hard error, like `inertial`.
+pub(crate) fn optional_wheel_odom(
+    config: Option<&ComponentConfig>,
+) -> CuResult<Option<WheelOdomRon>> {
+    Ok(config
+        .map(|c| c.get_value::<WheelOdomRon>(WHEEL_ODOM))
+        .transpose()?
+        .flatten())
+}
+
 /// Reads an optional finite, strictly-positive float key.
 pub(crate) fn optional_positive_f64(
     config: Option<&ComponentConfig>,
@@ -237,6 +322,7 @@ config_keys! {
     PNP_LM_ITERATIONS => "pnp_lm_iterations",
     INERTIAL => "inertial",
     LANDMARK_BUFFERS => "landmark_buffers",
+    WHEEL_ODOM => "wheel_odom",
 }
 
 /// Refuses a config key `task` does not read.
@@ -405,6 +491,80 @@ mod tests {
     fn test_keys_the_graphs_ship_are_accepted() {
         deny_unknown_keys(Some(&cfg(CONFIG_KEYS)), "task", CONFIG_KEYS).unwrap();
         deny_unknown_keys(None, "task", CONFIG_KEYS).unwrap();
+    }
+
+    /// The `wheel_odom` block read the way a graph reads it: through a RON config file.
+    fn wheel_ron(block: &str) -> CuResult<Option<WheelOdomRon>> {
+        let text = format!(
+            r#"( tasks: [ ( id: "vio", type: "t::T", config: {{ "wheel_odom": {block} }} ) ],
+                 cnx: [] )"#
+        );
+        let cfg = cu29::config::read_configuration_str(text, None)?;
+        let graph = cfg.get_graph(None)?;
+        let id = graph.get_node_id_by_name("vio").expect("the node");
+        let node = graph.get_node(id).expect("the node");
+        optional_wheel_odom(node.get_instance_config())
+    }
+
+    const WHEEL_BLOCK: &str = "(enabled: true, \
+        cam_in_base_rotation: [0.0, 0.0, 1.0, -1.0, 0.0, 0.0, 0.0, -1.0, 0.0], \
+        cam_in_base_translation: [0.1, 0.0, 0.9], translation_noise: 0.02, rotation_noise: 0.05)";
+
+    #[test]
+    fn test_a_wheel_odom_block_is_read_row_major_and_inverted_once() {
+        let ron = wheel_ron(WHEEL_BLOCK).unwrap().expect("present");
+        let cfg = ron.to_config().unwrap().expect("enabled");
+        // The camera's +z (optical axis) is the base's +x: t_cb maps base +x onto camera +z.
+        let fwd = cfg.t_cb.rotation * Vec3F64::new(1.0, 0.0, 0.0);
+        assert!(
+            (fwd - Vec3F64::new(0.0, 0.0, 1.0)).length() < 1e-12,
+            "{fwd:?}"
+        );
+        assert_eq!(
+            cfg.z_sigma,
+            kornia_slam::mapping::wheel_odom::WheelOdomMeasurement::DEFAULT_Z_SIGMA
+        );
+        assert_eq!(cfg.huber_chi2, None);
+    }
+
+    #[test]
+    fn test_a_wheel_odom_block_is_off_unless_enabled() {
+        let text = WHEEL_BLOCK.replace("enabled: true, ", "");
+        let ron = wheel_ron(&text).unwrap().expect("present");
+        assert!(
+            ron.to_config().unwrap().is_none(),
+            "enabled defaults to false"
+        );
+        assert!(optional_wheel_odom(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_a_malformed_wheel_odom_block_is_refused() {
+        // An unknown field: a misspelt optional must not silently keep its default.
+        let typo = WHEEL_BLOCK.replace("rotation_noise", "rotation_noise: 0.05, z_sigmaa");
+        assert!(wheel_ron(&typo).is_err(), "unknown field accepted");
+        // A required field missing.
+        let partial = WHEEL_BLOCK.replace(", translation_noise: 0.02", "");
+        assert!(wheel_ron(&partial).is_err(), "missing noise accepted");
+        // A non-positive sigma, even while disabled.
+        let zero = WHEEL_BLOCK
+            .replace("enabled: true", "enabled: false")
+            .replace(")", ", z_sigma: 0.0)");
+        let ron = wheel_ron(&zero).unwrap().expect("parses");
+        assert!(matches!(
+            ron.to_config(),
+            Err(VioError::WheelParamInvalid {
+                field: "z_sigma",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_wheel_odom_is_a_known_key() {
+        assert!(CONFIG_KEYS.contains(&"wheel_odom"));
+        deny_unknown_keys(Some(&cfg(&["wheel_odom"])), "task", CONFIG_KEYS).unwrap();
+        assert!(deny_unknown_keys(Some(&cfg(&["wheel_odometry"])), "task", CONFIG_KEYS).is_err());
     }
 
     fn cfg(keys: &[&str]) -> ComponentConfig {
