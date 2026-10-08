@@ -19,6 +19,11 @@
 //! every one; an interval whose end is not covered yet stays pending and is integrated at a
 //! later keyframe, when the readings have caught up. A factor is not stored in the map, so a late
 //! one costs nothing but the BA solves it missed.
+//!
+//! A prior cannot wait: it is wanted at the frame. Past the newest reading it extrapolates at the
+//! last reading pair's velocity, for at most `max_gap`. Holding the newest reading instead would
+//! drop the stretch `[newest, frame]` from every frame's interval (the next one starts at the
+//! frame stamp), and with a lag longer than a frame period integrate nothing at all.
 
 use std::collections::VecDeque;
 
@@ -36,13 +41,25 @@ use crate::imu::rotation_residual;
 /// start is evicted and its edge refused.
 pub const DEFAULT_WHEEL_BUFFER_CAPACITY: usize = 8192;
 
-/// Mount samples held. A head joint publishes at a few tens of Hz and only the stamps of the
-/// current frame and the pending keyframes are ever looked up.
+/// Mount samples held. Only a mount that MOVED is stored (see [`MOUNT_SAME_RAD`]), so a still
+/// head costs no slots however long the robot parks, and the last keyframe's mount survives an
+/// idle stretch the way its reading does. 256 changes is ~8 s of a head tilting at 30 Hz.
 const MOUNT_CAPACITY: usize = 256;
+
+/// A mount within this of the newest stored one is the same mount and is not stored. Far below
+/// what a head-joint encoder resolves; it only keeps repeated identical samples out of the ring.
+const MOUNT_SAME_RAD: f64 = 1e-4;
+/// See [`MOUNT_SAME_RAD`].
+const MOUNT_SAME_M: f64 = 1e-4;
 
 /// Pending keyframe intervals kept waiting for readings. Past this the stream has stopped, not
 /// lagged, and the oldest is refused as expired.
 const MAX_PENDING_EDGES: usize = 8;
+
+/// Consecutive frames outside the readings' span before the tracker says so, and how often it
+/// repeats after that: ~2 s, then ~1 min, at the head's 15 Hz.
+const UNCOVERED_WARN_AFTER: u64 = 30;
+const UNCOVERED_WARN_EVERY: u64 = 900;
 
 /// Integrated factors kept for local BA. The solve frees the newest three keyframes and drops a
 /// factor with both ends fixed, so only the last few can act; 16 is slack for a late edge.
@@ -242,6 +259,9 @@ pub struct WheelStats {
     pub prior_frames: u64,
     /// Frames on which no reading covered the interval and the prior fell back.
     pub prior_unavailable: u64,
+    /// Frames whose stamp lay outside `[oldest reading, newest reading + max_gap]`: the stream is
+    /// silent or on another clock, and the wheels are not being used.
+    pub frames_uncovered: u64,
 }
 
 /// A keyframe interval waiting for its readings.
@@ -258,8 +278,12 @@ pub(crate) struct WheelState {
     pub cfg: WheelOdomConfig,
     ring: VecDeque<WheelSample>,
     mounts: VecDeque<(u64, Pose3d)>,
+    /// The newest mount stamp seen, stored or not: the order check for the next one.
+    newest_mount_ns: Option<u64>,
     pending: Vec<PendingEdge>,
     factors: Vec<WheelOdomFactor>,
+    /// Consecutive frames counted in [`WheelStats::frames_uncovered`].
+    uncovered_streak: u64,
     pub stats: WheelStats,
 }
 
@@ -268,8 +292,10 @@ impl WheelState {
         Self {
             ring: VecDeque::with_capacity(cfg.buffer_capacity.min(1024)),
             mounts: VecDeque::new(),
+            newest_mount_ns: None,
             pending: Vec::new(),
             factors: Vec::new(),
+            uncovered_streak: 0,
             stats: WheelStats::default(),
             cfg,
         }
@@ -304,15 +330,23 @@ impl WheelState {
             self.stats.mounts_refused += 1;
             return Err(e);
         }
-        if self.mounts.back().is_some_and(|(t, _)| stamp_ns <= *t) {
+        if self.newest_mount_ns.is_some_and(|t| stamp_ns <= t) {
             self.stats.mounts_refused += 1;
+            return Ok(());
+        }
+        self.newest_mount_ns = Some(stamp_ns);
+        self.stats.mounts_accepted += 1;
+        if self
+            .mounts
+            .back()
+            .is_some_and(|(_, last)| same_mount(last, &t_cb))
+        {
             return Ok(());
         }
         self.mounts.push_back((stamp_ns, t_cb));
         while self.mounts.len() > MOUNT_CAPACITY {
             self.mounts.pop_front();
         }
-        self.stats.mounts_accepted += 1;
         Ok(())
     }
 
@@ -328,8 +362,9 @@ impl WheelState {
 
     /// Base motion over `[t0_ns, t1_ns]`.
     ///
-    /// `hold_ns` lets the end run past the newest reading by up to that much, holding it: a
-    /// prior wants the motion so far, while a BA factor (`hold_ns = 0`) must cover the interval.
+    /// `hold_ns` lets the end (and the start) run past the newest reading by up to that much,
+    /// extrapolated: a prior wants the motion now, while a BA factor (`hold_ns = 0`) must cover
+    /// the interval.
     pub fn delta(
         &self,
         t0_ns: u64,
@@ -362,9 +397,13 @@ impl WheelState {
             }
         }
 
-        let start = self.interpolate(a, t0_ns);
+        let start = if a + 1 == self.ring.len() {
+            self.extrapolate(t0_ns)
+        } else {
+            self.interpolate(a, t0_ns)
+        };
         let end = if held {
-            self.ring[b]
+            self.extrapolate(t1_ns)
         } else {
             self.interpolate(b - 1, t1_ns)
         };
@@ -372,9 +411,10 @@ impl WheelState {
         let (mut prev, mut turned, mut path_m, mut path_rad) = (start, 0.0, 0.0, 0.0);
         let inside = self
             .ring
-            .range((a + 1).min(b)..b)
+            .range(a + 1..)
             .copied()
-            .filter(|s| s.stamp_ns > t0_ns && s.stamp_ns < t1_ns);
+            .take_while(|s| s.stamp_ns < t1_ns)
+            .filter(|s| s.stamp_ns > t0_ns);
         for s in inside.chain(std::iter::once(end)) {
             let dth = wrap(s.theta - prev.theta);
             turned += dth;
@@ -412,6 +452,29 @@ impl WheelState {
         }
     }
 
+    /// The reading at `t_ns` at or past the newest one, continued at the last pair's velocity. A
+    /// pair further apart than `max_gap` has no velocity worth trusting (the stream resumed after
+    /// a hole), so the newest reading is held.
+    fn extrapolate(&self, t_ns: u64) -> WheelSample {
+        let n = self.ring.len();
+        let s1 = self.ring[n - 1];
+        if n < 2 || t_ns <= s1.stamp_ns {
+            return s1;
+        }
+        let s0 = self.ring[n - 2];
+        let dt = s1.stamp_ns - s0.stamp_ns;
+        if dt > self.cfg.max_gap_ns() {
+            return s1;
+        }
+        let a = (t_ns - s1.stamp_ns) as f64 / dt as f64;
+        WheelSample {
+            stamp_ns: t_ns,
+            x: s1.x + a * (s1.x - s0.x),
+            y: s1.y + a * (s1.y - s0.y),
+            theta: s1.theta + a * wrap(s1.theta - s0.theta),
+        }
+    }
+
     /// The CAMERA motion the wheels measured over `[t0_ns, t1_ns]`, as the world-to-camera
     /// increment `M` with `T_cw(t1) = M * T_cw(t0)`, or `None` when no reading covers it.
     ///
@@ -432,6 +495,28 @@ impl WheelState {
                 None
             }
         }
+    }
+
+    /// Checks a frame stamp against the readings' span. Returns `frame - newest reading` in ns
+    /// and the frames in the streak when the tracker should warn: a clock offset between the body (wheels) and the head
+    /// (frames) otherwise turns the wheels off with nothing but the stop-time counters to say so.
+    /// Silent before the first reading.
+    pub fn check_coverage(&mut self, stamp_ns: u64) -> Option<(i128, u64)> {
+        let (Some(oldest), Some(newest)) = (self.ring.front(), self.ring.back()) else {
+            return None;
+        };
+        let covered = oldest.stamp_ns <= stamp_ns
+            && stamp_ns <= newest.stamp_ns.saturating_add(self.cfg.max_gap_ns());
+        if covered {
+            self.uncovered_streak = 0;
+            return None;
+        }
+        self.stats.frames_uncovered += 1;
+        self.uncovered_streak += 1;
+        let n = self.uncovered_streak;
+        (n >= UNCOVERED_WARN_AFTER
+            && (n - UNCOVERED_WARN_AFTER).is_multiple_of(UNCOVERED_WARN_EVERY))
+        .then(|| (i128::from(stamp_ns) - i128::from(newest.stamp_ns), n))
     }
 
     /// Queues the interval a keyframe insertion closed, then integrates every queued interval
@@ -504,6 +589,14 @@ impl WheelState {
         self.pending.clear();
         self.factors.clear();
     }
+}
+
+/// Whether two mounts differ by less than [`MOUNT_SAME_RAD`] and [`MOUNT_SAME_M`].
+fn same_mount(a: &Pose3d, b: &Pose3d) -> bool {
+    let r = a.rotation.transpose() * b.rotation;
+    let cos = ((r.x_axis.x + r.y_axis.y + r.z_axis.z) - 1.0) * 0.5;
+    cos.clamp(-1.0, 1.0).acos() < MOUNT_SAME_RAD
+        && (a.translation - b.translation).length() < MOUNT_SAME_M
 }
 
 /// `a` wrapped to `(-pi, pi]`.
@@ -742,5 +835,43 @@ mod tests {
         w.prune([Some(150 * MS), None]);
         assert_eq!(w.ring.front().unwrap().stamp_ns, 100 * MS);
         assert!(w.delta(150 * MS, 200 * MS, 0).is_ok());
+    }
+
+    /// A prior past the newest reading continues at the last pair's velocity, from both ends:
+    /// a lag shorter than the interval, and one longer than it (start past the newest too).
+    #[test]
+    fn test_a_lagging_prior_extrapolates_instead_of_holding() {
+        let w = state(&[(0, 0.0, 0.0, 0.0), (100, 0.1, 0.0, 0.0)]);
+        let short = w
+            .delta(50 * MS, 150 * MS, 500 * MS)
+            .expect("within the hold");
+        assert!(close(short.delta, [0.1, 0.0, 0.0]), "{:?}", short.delta);
+        let long = w
+            .delta(150 * MS, 250 * MS, 500 * MS)
+            .expect("within the hold");
+        assert!(close(long.delta, [0.1, 0.0, 0.0]), "{:?}", long.delta);
+        // A factor still refuses to guess.
+        assert_eq!(
+            w.delta(50 * MS, 150 * MS, 0),
+            Err(WheelWindowError::Pending)
+        );
+    }
+
+    /// A still head stores one mount however long it publishes, so the mount at an old
+    /// keyframe stamp survives; a moving one is stored per change.
+    #[test]
+    fn test_a_still_mount_takes_one_slot() {
+        let mut w = WheelState::new(cfg());
+        let tilted = Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(0.0, 0.2, 0.0));
+        w.push_mount(MS, tilted).unwrap();
+        for k in 2..(MOUNT_CAPACITY as u64 + 10) {
+            w.push_mount(k * MS, Pose3d::IDENTITY).unwrap();
+        }
+        assert_eq!(w.mounts.len(), 2);
+        assert_eq!(w.t_cb_at(MS), tilted);
+        assert_eq!(w.stats.mounts_accepted, MOUNT_CAPACITY as u64 + 9);
+        // Order is still checked against the newest sample, stored or not.
+        w.push_mount(5 * MS, tilted).unwrap();
+        assert_eq!(w.stats.mounts_refused, 1);
     }
 }

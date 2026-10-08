@@ -740,6 +740,10 @@ pub struct Tracker {
     /// cleared by a requested [`reset`](Self::reset). With wheels it is what lets a map drop
     /// carry the pose into the next map instead of restarting at identity.
     world_anchored: bool,
+    /// Whether the current map was seeded at a carried pose rather than at identity. Its
+    /// inertial alignment then pivots on the robot, not on the world origin; see
+    /// [`Self::apply_inertial_init`].
+    map_carried: bool,
 }
 
 impl Tracker {
@@ -831,6 +835,7 @@ impl Tracker {
             wheel,
             frame_on_wheels: false,
             world_anchored: false,
+            map_carried: false,
         }
     }
 
@@ -1020,6 +1025,14 @@ impl Tracker {
 
         if let Some(w) = self.wheel.as_mut() {
             w.prune([self.last_keyframe_stamp_ns, self.last_frame_stamp_ns]);
+            if let Some((offset_ns, frames)) = w.check_coverage(stamp_ns) {
+                warning!(
+                    "wheel odometry: frame {} lies outside the readings for {} frames; frame -                      newest reading = {} ms. The stream is silent or its stamps are on another                      clock than the frames'; the wheels are not being used",
+                    frame_idx,
+                    frames,
+                    (offset_ns / 1_000_000) as i64
+                );
+            }
         }
 
         let pose = TrackedPose {
@@ -1303,7 +1316,8 @@ impl Tracker {
     /// Hands wheel-odometry readings to the tracker. Returns how many were accepted; readings
     /// whose stamp does not advance or whose pose is not finite are refused and counted.
     ///
-    /// Each reading's stamp must be on the SAME clock as the frames' `stamp`.
+    /// Each reading's stamp must be on the SAME clock as the frames' `stamp`. A frame outside
+    /// the readings' span for ~2 s is logged with the offset (see [`WheelStats::frames_uncovered`]).
     ///
     /// # Errors
     ///
@@ -1385,6 +1399,7 @@ impl Tracker {
         } else {
             self.world_anchored = false;
         }
+        self.map_carried = carry;
         self.last_keyframe_timestamp_sec = None;
         self.last_keyframe_stamp_ns = None;
         // The buffered samples span the OLD map's last keyframe, and `start_kf_idx` names a
@@ -2716,6 +2731,22 @@ impl Tracker {
         stage: InitStage,
     ) {
         let (scale, gravity, bias) = (init.scale, init.gravity_world, init.bias);
+        // The keyframe tracking resumes from, and its centre before the alignment moves it.
+        let pivot = self
+            .map_carried
+            .then(|| {
+                self.map
+                    .keyframes()
+                    .iter()
+                    .rfind(|kf| kf.frame.idx >= start_idx)
+                    .map(|kf| {
+                        (
+                            kf.frame.idx,
+                            kf.frame.pose_world_to_cam.inverse().translation,
+                        )
+                    })
+            })
+            .flatten();
         let applied = inert.initializer.apply_initialization(
             &mut self.map,
             &mut inert.bias,
@@ -2724,7 +2755,13 @@ impl Tracker {
             start_idx,
         );
         match applied {
-            Ok(Some(aligned)) => self.state.adopt_inertial_initialization(aligned),
+            Ok(Some(mut aligned)) => {
+                if let Some((idx, centre)) = pivot {
+                    aligned.pose_world_to_cam =
+                        self.repivot_map(idx, centre, aligned.pose_world_to_cam);
+                }
+                self.state.adopt_inertial_initialization(aligned)
+            }
             // `apply_inertial_alignment` refuses an empty velocity list, and a non-empty one
             // names a window keyframe, so `Ok` with no keyframe to resume from should be
             // unreachable. If it happens the map HAS been scaled and rotated (and the bias and
@@ -2789,6 +2826,44 @@ impl Tracker {
             bias.accel.length(),
             self.world_generation
         );
+    }
+
+    /// Translates the whole map so keyframe `idx`'s centre is back at `centre`, and returns
+    /// `pose` (that keyframe's aligned pose) moved the same way.
+    ///
+    /// `apply_initialization` scales and rotates about the world ORIGIN. A map that restarted at
+    /// identity sits on it and loses nothing, but a carried map sits wherever the robot drove:
+    /// at `c` metres out, a gravity re-estimate of 1 deg moves the pose ~`0.017 c` and a scale
+    /// of `s` moves it `(s - 1) c`, which grows with every drop. Gravity still lands on +y, since
+    /// a translation does not rotate. On a refusal the map stays aligned about the origin.
+    fn repivot_map(&mut self, idx: usize, centre: Vec3F64, pose: Pose3d) -> Pose3d {
+        let Some(kf) = self.map.get_keyframe(idx) else {
+            return pose;
+        };
+        let shift = centre - kf.frame.pose_world_to_cam.inverse().translation;
+        // `X_w' = X_w + shift`, so `X_c = R (X_w' - shift) + t`.
+        let moved = |p: &Pose3d| Pose3d::new(p.rotation, p.translation - p.rotation * shift);
+        let (indices, before): (Vec<usize>, Vec<Pose3d>) = self
+            .map
+            .keyframes()
+            .iter()
+            .map(|kf| (kf.frame.idx, kf.frame.pose_world_to_cam))
+            .unzip();
+        let after: Vec<Pose3d> = before.iter().map(moved).collect();
+        match self
+            .map
+            .apply_pose_graph_correction(&indices, &before, &after)
+        {
+            Ok(_) => moved(&pose),
+            Err(e) => {
+                warning!(
+                    "inertial: could not re-centre the carried map after its alignment, the pose                      jumps by {} m: error={}",
+                    shift.length(),
+                    e.to_string()
+                );
+                pose
+            }
+        }
     }
 
     /// Inserts each seed as a new landmark, returning how many the map accepted.
@@ -5113,5 +5188,105 @@ mod tests {
             pose_bits(&pose.pose_world_to_cam),
             pose_bits(&Pose3d::IDENTITY)
         );
+    }
+
+    /// Readings released only `lag` frames after their stamp, as they arrive over the head/body
+    /// link: the coast must still follow the truth. Holding the newest reading lost the stretch
+    /// `[newest, frame]` from every interval (12.5 mm a frame here), and with a lag over one
+    /// period integrated nothing.
+    #[test]
+    fn test_coasting_on_lagging_readings_keeps_up_with_the_truth() {
+        for lag in [1u32, 2] {
+            let mut tracker = scene_tracker_with(|c| c.wheel_odom = Some(scene_wheel_config()));
+            let mut released = 0u32;
+            let mut release = |tracker: &mut Tracker, seq: u32| {
+                let upto = (seq + 1).saturating_sub(lag);
+                if upto > released {
+                    push_scene_wheels(tracker, released..upto);
+                    released = upto;
+                }
+            };
+            for seq in 0..12 {
+                release(&mut tracker, seq);
+                assert!(matches!(feed(&mut tracker, seq), TrackStatus::Tracked(_)));
+            }
+            for seq in 12..18 {
+                release(&mut tracker, seq);
+                let TrackStatus::Coasting(pose) = blank_frame(&mut tracker, seq) else {
+                    panic!("lag {lag} frame {seq}: a dark frame with wheels must coast");
+                };
+                let err = centre_error(&pose, seq);
+                assert!(err < 0.01, "lag {lag} frame {seq}: {err} m");
+            }
+        }
+    }
+
+    /// Wheel stamps on another clock (+10 s) leave every frame outside the readings: no factor,
+    /// no prior, and a counted, logged condition instead of a silent pure-vision run.
+    #[test]
+    fn test_readings_on_another_clock_are_flagged() {
+        let mut tracker = scene_tracker_with(|c| c.wheel_odom = Some(scene_wheel_config()));
+        tracker
+            .push_wheel((0..41u32).map(|seq| WheelSample {
+                stamp_ns: EPOCH_NS + 10_000_000_000 + u64::from(seq) * FRAME_NS,
+                x: 0.0,
+                y: -SCENE_STEP_M * f64::from(seq),
+                theta: 0.0,
+            }))
+            .unwrap();
+        for seq in 0..40 {
+            feed(&mut tracker, seq);
+        }
+        let w = tracker.wheel_stats().expect("on");
+        assert_eq!((w.edges_added, w.prior_frames), (0, 0), "{w:?}");
+        assert_eq!(w.frames_uncovered, 40, "{w:?}");
+        // The same readings on the frames' clock are not flagged.
+        let mut ok = scene_tracker_with(|c| c.wheel_odom = Some(scene_wheel_config()));
+        push_scene_wheels(&mut ok, 0..41);
+        for seq in 0..40 {
+            feed(&mut ok, seq);
+        }
+        assert_eq!(ok.wheel_stats().unwrap().frames_uncovered, 0);
+    }
+
+    /// A carried map's inertial alignment must not move the robot: it rotates and scales about
+    /// the world origin, so at 20 m out the synthetic init (scale 1.7, gravity ~5 deg off +y)
+    /// would throw the pose ~14 m.
+    #[test]
+    fn test_a_carried_maps_inertial_alignment_keeps_the_pose_in_place() {
+        let mut tracker = tracker_with_inertial_ba(true);
+        tracker.wheel = Some(WheelState::new(scene_wheel_config()));
+        tracker.world_anchored = true;
+        tracker.reset_keeping_calibration();
+        assert!(tracker.map_carried);
+        let centre = Vec3F64::new(20.0, 0.3, -4.0);
+        tracker
+            .map
+            .insert_keyframe(bare_keyframe(3, centre))
+            .expect("a fresh keyframe id");
+        tracker
+            .map
+            .insert_keyframe(bare_keyframe(4, centre + Vec3F64::new(0.1, 0.0, 0.0)))
+            .expect("a fresh keyframe id");
+        tracker.arm_inertial_window(3, 0.0, EPOCH_NS);
+        let rotation_before = tracker.map.keyframes()[1].frame.pose_world_to_cam.rotation;
+        let mut inert = tracker.inertial.take().unwrap();
+        tracker.accept_inertial_init(&mut inert, accepted_init(), 3, 2.5, InitStage::Initial);
+        tracker.inertial = Some(inert);
+
+        assert!(tracker.state.imu_initialized);
+        let kf = tracker.map.get_keyframe(4).unwrap().frame.pose_world_to_cam;
+        let moved = (kf.inverse().translation - (centre + Vec3F64::new(0.1, 0.0, 0.0))).length();
+        assert!(moved < 0.01, "the resumed keyframe moved {moved} m");
+        assert_eq!(
+            pose_bits(&tracker.state.pose_world_to_cam),
+            pose_bits(&kf),
+            "tracking resumes from the re-centred keyframe"
+        );
+        assert_ne!(kf.rotation, rotation_before, "gravity was still aligned");
+        // The rest of the map moved with it, rigidly: the 0.1 m between the two scaled by 1.7.
+        let other = tracker.map.get_keyframe(3).unwrap().frame.pose_world_to_cam;
+        let gap = (other.inverse().translation - kf.inverse().translation).length();
+        assert!((gap - 0.17).abs() < 1e-9, "{gap}");
     }
 }
