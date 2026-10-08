@@ -88,7 +88,7 @@ use kornia_slam::Frame;
 use kornia_slam::TrackingStatus;
 use kornia_slam::initialization::two_view::TwoViewInitConfig;
 use kornia_slam::initialization::{AlignedTrackingState, ImuInitResult, ImuInitializer};
-use kornia_slam::mapping::bundle_adjustment::{run_local_ba, run_local_inertial_ba};
+use kornia_slam::mapping::bundle_adjustment::{local_window, run_local_ba, run_local_inertial_ba};
 use kornia_slam::mapping::culling::cull_landmarks;
 use kornia_slam::mapping::growth::accepted_pair_claims;
 use kornia_slam::mapping::map::{
@@ -416,7 +416,7 @@ pub enum SystemMode {
 /// Mutable tracker state carried across frames.
 ///
 /// Owned here since kornia-slam made its own `SystemState` crate-private. The fields and
-/// [`SystemState::reset`] are kornia-slam's (develop `7530df3`, `system/state.rs`, unchanged since
+/// [`SystemState::reset`] are kornia-slam's (main `a9f8c52`, `system/state.rs`, unchanged since
 /// `c94e2a8`), minus the monocular `bootstrap_frame`, which a single-frame stereo bootstrap never holds.
 #[derive(Debug, Clone)]
 struct SystemState {
@@ -2012,12 +2012,13 @@ impl Tracker {
             self.config.enable_local_ba && self.map.keyframes().len() > BA_ACTIVE_KEYFRAMES;
         if ran_ba {
             // kornia-slam's only BA entry points solve a `BaSnapshot` and hand back an update
-            // for `apply_ba_update` to validate and write. The solve is the one the removed
-            // live-map methods ran, but the path costs more: the snapshot deep-clones every
-            // keyframe, map point and IMU factor (raw samples included, ~53 MB after an hour
-            // of an unbounded inertial map) once per keyframe, and the write-back matches IMU
-            // factors in O(F^2). `max_keyframes` bounds both.
-            let snapshot = self.map.ba_snapshot();
+            // for `apply_ba_update` to validate and write. `local_window` is the selection
+            // kornia-slam's own local mapping captures: the solvers' active keyframes, their
+            // live landmarks, and as fixed context the keyframes observing those landmarks plus
+            // the active keyframes' IMU neighbours. Same solve as cloning the whole map (#143:
+            // byte-identical trajectory, peak RSS 768 -> 504 MB), at a cost that no longer
+            // grows with the map.
+            let snapshot = self.map.ba_snapshot(&local_window(&self.map));
             let update = match inertial_ba {
                 // 15 DOF per keyframe (pose, velocity, bias) instead of 6. Mirrors
                 // kornia-slam's own local mapping, which branches on exactly this flag.
@@ -4428,7 +4429,10 @@ mod tests {
 
         // Later keyframes, so the interval is outside any BA window.
         insert_bare_keyframes(&mut tracker, &[12, 13, 14, 15]);
-        let update = run_local_ba(tracker.map.ba_snapshot(), &tracker.camera);
+        let update = run_local_ba(
+            tracker.map.ba_snapshot(&local_window(&tracker.map)),
+            &tracker.camera,
+        );
         tracker
             .map
             .apply_ba_update(update)
