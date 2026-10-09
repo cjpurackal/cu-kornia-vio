@@ -53,7 +53,7 @@ pub use bus::VioBus;
 pub use config::OnTrackingLoss;
 pub use error::VioError;
 pub use feed::ImuFeed;
-pub use imu::{ImuGates, ImuWindowError, InertialConfig, InertialStats};
+pub use imu::{BiasLimit, ImuGates, ImuWindowError, InertialConfig, InertialStats};
 pub use imu_channel::ImuQueue;
 pub use reset::ResetEpoch;
 pub use stationary::{NotStill, StaticInitConfig};

@@ -590,6 +590,50 @@ pub struct InertialConfig {
     /// `None` (what [`InertialConfig::new`] sets) leaves the motion-based initializer as the
     /// only one. With it on, the motion path still runs whenever no still window is found.
     pub static_init: Option<StaticInitConfig>,
+    /// The largest IMU bias the tracker will believe; see [`BiasLimit`]. [`InertialConfig::new`]
+    /// sets [`BiasLimit::default`].
+    pub bias_limit: BiasLimit,
+}
+
+/// The physically plausible IMU bias range. A bias outside it is a solver artefact, never a
+/// sensor property, and the tracker treats it as one: it is not taken from local BA (the whole
+/// update is refused) or from an initialization — the only two writers of the bias the next
+/// edge is linearized at — and not carried across a map drop.
+///
+/// Why it exists: VI-BA has no absolute prior on the gyro bias, only random-walk edges between
+/// consecutive keyframes, so whatever lands in it stays (2e-6 rad/s^2/sqrt(Hz) pins it) and a
+/// map drop used to carry it into every later map. 2026-10-09 loop test: 0.0030 rad/s at one
+/// drop, 0.2845 rad/s at the next three — the commanded turn rate — and from then on the gyro
+/// prior cancelled every turn and the raw pose jumped 270-350 mm in the turns.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BiasLimit {
+    /// Largest gyro bias norm, rad/s.
+    pub gyro_rad_s: f64,
+    /// Largest accelerometer bias norm, m/s^2.
+    pub accel_m_s2: f64,
+}
+
+impl BiasLimit {
+    /// 0.05 rad/s: ~17x the 0.0031 rad/s measured parked on the BNO086 and above its datasheet
+    /// zero-rate offset; a MEMS gyro of the class does not reach it.
+    pub const DEFAULT_GYRO_RAD_S: f64 = 0.05;
+    /// 0.5 m/s^2: above the ~0.23 m/s^2 the static initialization measured on the same chip.
+    pub const DEFAULT_ACCEL_M_S2: f64 = 0.5;
+
+    /// Whether `bias` is finite and inside both norms.
+    pub fn admits(&self, bias: &ImuBias) -> bool {
+        let (g, a) = (bias.gyro.length(), bias.accel.length());
+        g.is_finite() && a.is_finite() && g <= self.gyro_rad_s && a <= self.accel_m_s2
+    }
+}
+
+impl Default for BiasLimit {
+    fn default() -> Self {
+        Self {
+            gyro_rad_s: Self::DEFAULT_GYRO_RAD_S,
+            accel_m_s2: Self::DEFAULT_ACCEL_M_S2,
+        }
+    }
 }
 
 impl InertialConfig {
@@ -643,6 +687,7 @@ impl InertialConfig {
             init_retry: Time::new::<second>(5.0),
             enable_inertial_ba: true,
             static_init: None,
+            bias_limit: BiasLimit::default(),
         })
     }
 }
@@ -731,6 +776,10 @@ pub struct InertialStats {
     /// Carried alignments given up at the re-bootstrap because no wheel velocity was available
     /// for the new anchor; each one is followed by a fresh initialization.
     pub carry_dropped: u64,
+    /// Bias estimates refused for leaving [`BiasLimit`]: local BA updates refused whole,
+    /// initializations refused, and carries given up at a map drop. Each one is also a
+    /// `warning!` saying which.
+    pub bias_rejected: u64,
     /// Whether visual-inertial initialization has succeeded.
     pub initialized: bool,
     /// Whether the first inertial refinement pass (after ~5 s of initialized tracking) has run.

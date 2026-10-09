@@ -1494,8 +1494,30 @@ impl Tracker {
         // reset still means a new world at identity.
         let carry = keep_calibration && self.wheel.is_some() && self.world_anchored;
         let carried_pose = self.state.pose_world_to_cam;
+        // A bias outside the plausible range is NEVER carried: not as the calibration and not
+        // with the alignment. The next map starts from `initial_bias` and initializes again
+        // (the still window when parked), which is what a drop did before the carry existed.
+        let bias_plausible = self.inertial.as_ref().is_none_or(|inert| {
+            let ok = inert.cfg.bias_limit.admits(&inert.bias);
+            if !ok && keep_calibration {
+                warning!(
+                    "inertial: not carrying an IMU bias outside the plausible range into the \
+                     next map; it re-initializes: gyro_bias={} accel_bias={}",
+                    inert.bias.gyro.length(),
+                    inert.bias.accel.length()
+                );
+            }
+            ok
+        });
+        if !bias_plausible
+            && keep_calibration
+            && let Some(inert) = self.inertial.as_mut()
+        {
+            inert.stats.bias_rejected += 1;
+        }
+        let keep_calibration_bias = keep_calibration && bias_plausible;
         // A carried world keeps its gravity, so an initialized inertial path carries too.
-        let carry_alignment = carry && self.state.imu_initialized;
+        let carry_alignment = carry && self.state.imu_initialized && bias_plausible;
         let carried_stamp = self.last_frame_stamp_ns;
         if let Some(w) = self.wheel.as_mut() {
             w.reset_map();
@@ -1516,7 +1538,7 @@ impl Tracker {
         // prunes what is older than itself.
         if let Some(inert) = self.inertial.as_mut() {
             let gravity_world = inert.gravity_world;
-            inert.reset(keep_calibration);
+            inert.reset(keep_calibration_bias);
             if carry_alignment {
                 inert.gravity_world = gravity_world;
                 inert.carried_alignment = true;
@@ -2382,7 +2404,41 @@ impl Tracker {
             // its pre-BA state, exactly what a solver failure has always left. Counted, because
             // that state is indistinguishable from a BA that ran; throttled, because a cause
             // that persists refuses every keyframe's BA until the map drops.
-            if let Err(e) = self.map.apply_ba_update(update) {
+            // A bias outside the plausible range is refused with the WHOLE update: the poses and
+            // velocities were co-estimated with it, and written alone it would sit in the map
+            // where the random-walk edges hold every later keyframe to it. See `BiasLimit`.
+            let implausible = self.inertial.as_ref().and_then(|inert| {
+                let limit = inert.cfg.bias_limit;
+                update
+                    .keyframe_biases()
+                    .find(|b| !limit.admits(b))
+                    .map(|b| (b, limit))
+            });
+            if let Some((bias, limit)) = implausible {
+                self.ba_updates_refused += 1;
+                if let Some(inert) = self.inertial.as_mut() {
+                    inert.stats.bias_rejected += 1;
+                }
+                if should_log_throttled(
+                    self.last_ba_refusal_log,
+                    timestamp_sec,
+                    true,
+                    LOSS_LOG_RETRY_SEC,
+                ) {
+                    self.last_ba_refusal_log = Some((timestamp_sec, true));
+                    warning!(
+                        "keyframe: local BA result refused, its IMU bias is outside the plausible \
+                         range; map left as it was: frame={} gyro_bias={} accel_bias={} \
+                         gyro_limit={} accel_limit={} refused_total={}",
+                        frame.idx,
+                        bias.gyro.length(),
+                        bias.accel.length(),
+                        limit.gyro_rad_s,
+                        limit.accel_m_s2,
+                        self.ba_updates_refused
+                    );
+                }
+            } else if let Err(e) = self.map.apply_ba_update(update) {
                 self.ba_updates_refused += 1;
                 if should_log_throttled(
                     self.last_ba_refusal_log,
@@ -3174,6 +3230,23 @@ impl Tracker {
         now_sec: f64,
         stage: InitStage,
     ) {
+        // An implausible bias is a failed solve whatever its gates said (with a wrong extrinsic
+        // the gyro/visual inconsistency lands exactly there): refused before anything is
+        // applied or counted as accepted, so the map, the world and the bias stay as they were.
+        if !inert.cfg.bias_limit.admits(&init.bias) {
+            inert.stats.bias_rejected += 1;
+            warning!(
+                "inertial: initialization refused, its IMU bias is outside the plausible range; \
+                 map left unchanged: stage={} gyro_bias={} accel_bias={} gyro_limit={} \
+                 accel_limit={}",
+                stage.as_str(),
+                init.bias.gyro.length(),
+                init.bias.accel.length(),
+                inert.cfg.bias_limit.gyro_rad_s,
+                inert.cfg.bias_limit.accel_m_s2
+            );
+            return;
+        }
         if inert.cfg.enable_inertial_ba {
             self.apply_inertial_init(inert, init, start_idx, now_sec, stage);
             return;
@@ -6150,6 +6223,141 @@ mod tests {
         assert_eq!(stats.refused_gap, 0, "{stats:?}");
         assert_eq!(stats.refused_total(), 0, "{stats:?}");
         assert!(tracker.state.imu_initialized);
+    }
+
+    /// The 2026-10-09 loop test's diverged gyro bias: the commanded turn rate.
+    fn implausible_bias(sane: ImuBias) -> ImuBias {
+        ImuBias {
+            gyro: Vec3F64::new(0.0, 0.0, 0.2845),
+            accel: sane.accel,
+        }
+    }
+
+    /// Writes `bias` onto every keyframe of the map, as a solver result would.
+    fn write_map_bias(tracker: &mut Tracker, bias: ImuBias) {
+        use kornia_slam::mapping::map::{InertialAlignment, KeyframeVelocity};
+        let keyframe_velocities = tracker
+            .map
+            .keyframes()
+            .iter()
+            .map(|kf| KeyframeVelocity {
+                keyframe_idx: kf.frame.idx,
+                velocity_world: Vec3F64::ZERO,
+            })
+            .collect();
+        tracker
+            .map
+            .apply_inertial_alignment(InertialAlignment {
+                scale: 1.0,
+                rotation: kornia_algebra::SO3F64::IDENTITY,
+                keyframe_velocities,
+                bias,
+            })
+            .expect("a valid alignment");
+    }
+
+    /// BUG 2 guard: a local BA update carrying a gyro bias above `BiasLimit` is refused WHOLE
+    /// (map left as it was), the newest keyframe's plausible bias is what the next edge is
+    /// linearized at, and the stop line counts it.
+    ///
+    /// Mutation: dropping the `implausible` check before `apply_ba_update` turned this red (BA
+    /// wrote the window, `bias_rejected` 0).
+    #[test]
+    fn test_a_local_ba_update_with_an_implausible_bias_is_refused() {
+        let mut tracker = scene_tracker_with(|c| {
+            c.inertial = Some(static_inertial_config());
+            c.wheel_odom = Some(scene_wheel_config());
+        });
+        let mut seq = park_until_static_init(&mut tracker);
+        while tracker.map().keyframes().len() < 5 {
+            feed_parked(&mut tracker, seq, &no_extra, &parked_wheels);
+            seq += 1;
+        }
+        let sane = tracker.inertial.as_ref().unwrap().bias;
+        let bad = implausible_bias(sane);
+        write_map_bias(&mut tracker, bad);
+        let poses: Vec<Pose3d> = tracker
+            .map()
+            .keyframes()
+            .iter()
+            .map(|kf| kf.frame.pose_world_to_cam)
+            .collect();
+        let (n, refused) = (
+            tracker.map().keyframes().len(),
+            tracker.ba_updates_refused(),
+        );
+        while tracker.map().keyframes().len() == n {
+            feed_parked(&mut tracker, seq, &no_extra, &parked_wheels);
+            seq += 1;
+        }
+        assert_eq!(tracker.ba_updates_refused(), refused + 1);
+        let inert = tracker.inertial.as_ref().unwrap();
+        assert_eq!(inert.stats.bias_rejected, 1);
+        assert_eq!(inert.bias.gyro, sane.gyro, "the next edge's bias moved");
+        for (kf, pose) in tracker.map().keyframes().iter().zip(&poses) {
+            assert_eq!(
+                kf.imu_bias.gyro, bad.gyro,
+                "kf {} was written",
+                kf.frame.idx
+            );
+            assert_eq!(kf.frame.pose_world_to_cam.translation, pose.translation);
+        }
+    }
+
+    /// BUG 2 guard: an initialization whose bias is above `BiasLimit` is refused before
+    /// anything is applied or counted as accepted — map, world generation and bias untouched.
+    ///
+    /// Mutation: dropping the `admits` check at the top of `accept_inertial_init` turned this
+    /// red (the map rotated, generation 1, bias adopted).
+    #[test]
+    fn test_an_initialization_with_an_implausible_bias_is_refused() {
+        let mut tracker = tracker_with_inertial_ba(true);
+        tracker
+            .map
+            .insert_keyframe(bare_keyframe(3, Vec3F64::new(0.5, -0.25, 2.0)))
+            .expect("a fresh keyframe id");
+        tracker.arm_inertial_window(3, 0.0, EPOCH_NS);
+        let pose_before = pose_bits(&tracker.map.keyframes()[0].frame.pose_world_to_cam);
+        let mut init = accepted_init();
+        init.bias.gyro = Vec3F64::new(0.0, 0.0, 0.2845);
+        let mut inert = tracker.inertial.take().unwrap();
+        let bias_before = inert.bias;
+        tracker.accept_inertial_init(&mut inert, init, 3, 2.5, InitStage::Initial);
+        tracker.inertial = Some(inert);
+        assert_eq!(
+            pose_bits(&tracker.map.keyframes()[0].frame.pose_world_to_cam),
+            pose_before
+        );
+        assert_eq!(tracker.world_generation(), 0);
+        assert!(!tracker.state.imu_initialized);
+        let inert = tracker.inertial.as_ref().unwrap();
+        assert_eq!(inert.bias.gyro, bias_before.gyro);
+        assert_eq!(inert.stats.init_accepted, 0);
+        assert_eq!(inert.stats.bias_rejected, 1);
+    }
+
+    /// BUG 2 guard: a map drop never carries an implausible bias — not as the calibration and
+    /// not with the alignment. The next map starts from `initial_bias` and initializes again;
+    /// a plausible bias still carries (the drop-keeps-the-bias tests).
+    ///
+    /// Mutation: carrying the bias regardless (`inert.reset(keep_calibration)`) turned this red.
+    #[test]
+    fn test_a_map_drop_never_carries_an_implausible_bias() {
+        let mut tracker = scene_tracker_with(|c| {
+            c.inertial = Some(static_inertial_config());
+            c.wheel_odom = Some(scene_wheel_config());
+        });
+        let seq = park_until_static_init(&mut tracker);
+        feed_parked(&mut tracker, seq, &no_extra, &parked_wheels);
+        let sane = tracker.inertial.as_ref().unwrap().bias;
+        tracker.inertial.as_mut().unwrap().bias = implausible_bias(sane);
+        tracker.pending_map_reset = true;
+        tracker.apply_pending_map_reset();
+        let inert = tracker.inertial.as_ref().unwrap();
+        assert_eq!(inert.bias.gyro, inert.cfg.initial_bias.gyro);
+        assert_eq!(inert.bias.accel, inert.cfg.initial_bias.accel);
+        assert!(!inert.carried_alignment, "the alignment rode along");
+        assert_eq!(inert.stats.bias_rejected, 1);
     }
 
     /// Runs a parked robot with wheels until the stationary initialization lands, returning the

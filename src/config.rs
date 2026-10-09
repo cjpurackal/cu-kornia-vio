@@ -152,6 +152,14 @@ pub(crate) struct InertialRon {
     /// inertial path waits for the robot to move, as it always has.
     #[serde(default)]
     pub static_init: Option<StaticInitRon>,
+    /// Largest gyro bias norm the tracker believes, rad/s; see [`crate::BiasLimit`]. Absent is
+    /// [`crate::BiasLimit::DEFAULT_GYRO_RAD_S`].
+    #[serde(default)]
+    pub gyro_bias_limit: Option<f64>,
+    /// Largest accelerometer bias norm, m/s^2. Absent is
+    /// [`crate::BiasLimit::DEFAULT_ACCEL_M_S2`].
+    #[serde(default)]
+    pub accel_bias_limit: Option<f64>,
 }
 
 /// The `static_init` block inside `inertial`.
@@ -268,6 +276,25 @@ impl InertialRon {
             Frequency::new::<hertz>(self.rate_hz),
         )?;
         cfg.enable_inertial_ba = self.enable_inertial_ba;
+        for (field, value, slot) in [
+            (
+                "gyro_bias_limit",
+                self.gyro_bias_limit,
+                &mut cfg.bias_limit.gyro_rad_s,
+            ),
+            (
+                "accel_bias_limit",
+                self.accel_bias_limit,
+                &mut cfg.bias_limit.accel_m_s2,
+            ),
+        ] {
+            if let Some(value) = value {
+                if !value.is_finite() || value <= 0.0 {
+                    return Err(VioError::InertialParamInvalid { field, value });
+                }
+                *slot = value;
+            }
+        }
         if let Some(block) = &self.static_init {
             cfg.static_init = block.to_config(StaticInitConfig::from_noise(
                 &cfg.calib,
@@ -511,6 +538,8 @@ mod tests {
             rate_hz: 200.0,
             enable_inertial_ba: false,
             static_init: None,
+            gyro_bias_limit: None,
+            accel_bias_limit: None,
         }
     }
 
@@ -530,6 +559,31 @@ mod tests {
         let id = graph.get_node_id_by_name("vio").expect("the node");
         let node = graph.get_node(id).expect("the node");
         optional_inertial(node.get_instance_config())
+    }
+
+    /// The bias limits: absent is the default, a value replaces its own norm only, and a
+    /// non-positive or non-finite one is refused.
+    ///
+    /// Mutation: dropping the `*slot = value` write turned this red.
+    #[test]
+    fn test_the_bias_limit_keys() {
+        let cfg = |extra: &str| inertial_ron(extra).unwrap().expect("present").to_config();
+        assert_eq!(cfg("").unwrap().bias_limit, crate::BiasLimit::default());
+        let tuned = cfg(", gyro_bias_limit: Some(0.03)").unwrap().bias_limit;
+        assert_eq!(tuned.gyro_rad_s, 0.03);
+        assert_eq!(tuned.accel_m_s2, crate::BiasLimit::DEFAULT_ACCEL_M_S2);
+        let tuned = cfg(", accel_bias_limit: Some(0.8)").unwrap().bias_limit;
+        assert_eq!(tuned.accel_m_s2, 0.8);
+        assert_eq!(tuned.gyro_rad_s, crate::BiasLimit::DEFAULT_GYRO_RAD_S);
+        for bad in ["gyro_bias_limit: Some(0.0)", "accel_bias_limit: Some(-1.0)"] {
+            assert!(
+                matches!(
+                    cfg(&format!(", {bad}")),
+                    Err(VioError::InertialParamInvalid { .. })
+                ),
+                "{bad} accepted"
+            );
+        }
     }
 
     /// `static_init`: absent and disabled are off; enabled takes the noise-derived defaults; an
