@@ -105,6 +105,7 @@ pub fn frame_diagnostics(
         keyframes: sat(tracker.map().keyframes().len()),
         map_drops: tracker.map_drops(),
         reset_epoch: tracker.world_generation(),
+        map_generation: tracker.map_generation(),
         solve_ms: stream.solve_ms,
         vision_degraded: tracker.vision_degraded(),
         inertial_stage,

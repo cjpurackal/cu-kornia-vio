@@ -865,6 +865,10 @@ pub struct Tracker {
     frame_report: FrameReport,
     /// Maps dropped (size bound, sustained loss, refused biases), lifetime.
     map_drops: u64,
+    /// Maps discarded by ANY reset (requested, loss, size bound, refused biases), lifetime: each
+    /// one means the next bootstrap starts a new map. Not `world_generation`, which also moves on
+    /// an inertial alignment and a kept-map re-bootstrap, neither of which starts a map.
+    map_generation: u64,
     /// Whether a map was anchored since construction or the last requested reset: what tells
     /// "initializing" from "recovering" on a frame that could not be placed.
     anchored_since_reset: bool,
@@ -995,6 +999,7 @@ impl Tracker {
             bias_refusals_in_a_row: 0,
             frame_report: FrameReport::default(),
             map_drops: 0,
+            map_generation: 0,
             anchored_since_reset: false,
             last_motion: MotionCheck::default(),
             features: Vec::new(),
@@ -1666,6 +1671,7 @@ impl Tracker {
         // Kept across a carried drop: it starts the wheel interval that propagates the pose.
         self.last_frame_stamp_ns = if carry { carried_stamp } else { None };
         self.world_generation += 1;
+        self.map_generation += 1;
         if keep_calibration {
             self.map_drops += 1;
         } else {
@@ -2796,6 +2802,12 @@ impl Tracker {
     /// [`reset`](Self::reset) is not counted.
     pub fn map_drops(&self) -> u64 {
         self.map_drops
+    }
+
+    /// Maps discarded by any reset, lifetime: bumps on EVERY new map (requested reset, loss, size
+    /// bound), and on nothing else. See the field.
+    pub fn map_generation(&self) -> u64 {
+        self.map_generation
     }
 
     /// Whether a map was anchored since construction or the last requested reset.
@@ -4742,12 +4754,14 @@ mod tests {
                 .expect("a fresh keyframe id");
         }
         let gen_before = tracker.world_generation();
+        let maps_before = tracker.map_generation();
 
         // Not armed: the bound must never fire on its own, or every consumer sees spurious
         // reset epochs.
         tracker.apply_pending_map_reset();
         assert_eq!(tracker.map.keyframes().len(), 6, "unarmed reset fired");
         assert_eq!(tracker.world_generation(), gen_before);
+        assert_eq!(tracker.map_generation(), maps_before);
 
         tracker.pending_map_reset = true;
         tracker.apply_pending_map_reset();
@@ -4757,8 +4771,22 @@ mod tests {
             gen_before + 1,
             "a dropped map MUST bump the generation, or a consumer composes two worlds"
         );
+        assert_eq!(
+            tracker.map_generation(),
+            maps_before + 1,
+            "a dropped map is a new map"
+        );
         // One-shot: the flag is consumed, so the next frame does not reset again.
         assert!(!tracker.pending_map_reset);
+        // A requested reset is a new map too, though it is not a drop.
+        let drops = tracker.map_drops();
+        tracker.reset();
+        assert_eq!(tracker.map_generation(), maps_before + 2);
+        assert_eq!(
+            tracker.map_drops(),
+            drops,
+            "a requested reset is not a drop"
+        );
     }
 
     /// The arming predicate itself, which nothing else reaches: `tracking_step` is private and

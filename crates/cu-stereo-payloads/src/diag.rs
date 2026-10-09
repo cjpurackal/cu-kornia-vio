@@ -233,6 +233,9 @@ pub struct VioDiagnostics {
     pub map_drops: u64,
     /// The tracker world this frame belongs to; see `VioStatus::reset_epoch`.
     pub reset_epoch: u64,
+    /// Maps started over by any reset (requested, tracking loss, size bound), lifetime: bumps on
+    /// every new map and on nothing else, unlike `reset_epoch` (also an inertial alignment).
+    pub map_generation: u64,
     /// Wall-clock cost of the solve, milliseconds.
     pub solve_ms: f32,
     /// An interval vision disagreed on is in the local BA window: the pose may be frozen.
@@ -307,6 +310,7 @@ mod tests {
             stereo_matches: 120,
             inertial_stage: InertialStage::Refine1,
             gyro_bias: [0.01, -0.02, 0.003],
+            map_generation: 5,
             motion: MotionCheck {
                 checks: 3,
                 verdict: MotionVerdict::WheelsDisagree,
@@ -322,6 +326,7 @@ mod tests {
         assert_eq!(back.state, TrackingState::Lost);
         assert_eq!(back.failure, FailureReason::LowPnpInliers);
         assert_eq!(back.gyro_bias, d.gyro_bias);
+        assert_eq!(back.map_generation, 5);
         assert!(back.motion.gyro_deg.is_nan());
         assert_eq!(back.motion.verdict, MotionVerdict::WheelsDisagree);
     }
