@@ -21,6 +21,8 @@
 //!   a second input edge. A [`VioBus`] resource bundle holds an [`ImuQueue`] that the inline
 //!   [`ImuFeed`] sink fills from the graph's IMU edge, and a [`ResetEpoch`] any bound task can
 //!   bump. One bus per estimator, so two estimators in one process stay independent.
+//! * [`tap`], [`diag`]: what the tracker saw and concluded per frame, out through the bus to an
+//!   inline [`VioTapSource`]: a status record, the stereo pair it solved and its keypoints.
 //! * [`wheel`], [`wheel_channel`], [`wheel_feed`]: optional planar wheel odometry, the same seam
 //!   as the IMU. It constrains local BA, replaces the constant-velocity prior, carries the pose
 //!   through a vision loss, and keeps the world continuous across a map drop. Off unless the
@@ -35,6 +37,7 @@
 pub mod bus;
 pub mod config;
 pub mod consistency;
+pub mod diag;
 pub mod error;
 pub mod feed;
 pub mod imu;
@@ -43,6 +46,7 @@ pub mod pose;
 pub mod reset;
 pub mod stationary;
 mod stats;
+pub mod tap;
 pub mod task;
 pub mod task_error;
 pub mod track;
@@ -59,9 +63,12 @@ pub use imu::{BiasLimit, ImuGates, ImuWindowError, InertialConfig, InertialStats
 pub use imu_channel::ImuQueue;
 pub use reset::ResetEpoch;
 pub use stationary::{NotStill, StaticInitConfig};
+pub use tap::{MAX_TAP_FEATURES, VioTap, VioTapSource};
 pub use task::{DEFAULT_LANDMARK_BUFFERS, MAX_LANDMARK_BUFFERS, MAX_LANDMARKS, StereoVio};
 pub use task_error::{Eye, TaskError};
-pub use track::{SystemMode, TrackStatus, TrackedPose, Tracker, TrackerConfig, TrackerStats};
+pub use track::{
+    FrameReport, SystemMode, TrackStatus, TrackedPose, Tracker, TrackerConfig, TrackerStats,
+};
 pub use wheel::{WheelOdomConfig, WheelSample, WheelStats};
 pub use wheel_channel::WheelQueue;
 pub use wheel_feed::{MountFeed, WheelFeed};

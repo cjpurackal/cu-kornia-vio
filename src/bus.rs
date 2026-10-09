@@ -26,10 +26,11 @@ use cu29::prelude::*;
 
 use crate::imu_channel::ImuQueue;
 use crate::reset::ResetEpoch;
+use crate::tap::VioTap;
 use crate::wheel_channel::WheelQueue;
 
-/// The provider of an [`ImuQueue`] (`<id>.imu`), a [`ResetEpoch`] (`<id>.reset_epoch`) and a
-/// [`WheelQueue`] (`<id>.wheel`).
+/// The provider of an [`ImuQueue`] (`<id>.imu`), a [`ResetEpoch`] (`<id>.reset_epoch`), a
+/// [`WheelQueue`] (`<id>.wheel`) and a [`VioTap`] (`<id>.tap`, see [`crate::tap`]).
 ///
 /// Takes no config; any key is refused, as with the tasks.
 pub struct VioBus;
@@ -41,7 +42,7 @@ pub mod bus_ids {
     use super::VioBus;
     use cu29::bundle_resources;
 
-    bundle_resources!(VioBus: Imu, ResetEpoch, Wheel);
+    bundle_resources!(VioBus: Imu, ResetEpoch, Wheel, Tap);
 }
 
 use bus_ids::VioBusId;
@@ -59,6 +60,7 @@ impl ResourceBundle for VioBus {
             Arc::new(ResetEpoch::new()),
         )?;
         manager.add_shared(bundle.key(VioBusId::Wheel), Arc::new(WheelQueue::new()))?;
+        manager.add_shared(bundle.key(VioBusId::Tap), Arc::new(VioTap::new()))?;
         Ok(())
     }
 }
@@ -69,6 +71,9 @@ mod tests {
 
     #[test]
     fn test_bus_resource_names_match_the_documented_bindings() {
-        assert_eq!(bus_ids::VIO_BUS_ID_NAMES, ["imu", "reset_epoch", "wheel"]);
+        assert_eq!(
+            bus_ids::VIO_BUS_ID_NAMES,
+            ["imu", "reset_epoch", "wheel", "tap"]
+        );
     }
 }

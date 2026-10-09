@@ -9,10 +9,12 @@
 use std::sync::Arc;
 
 use crate::config::{InertialRon, OnTrackingLoss, WheelOdomRon};
+use crate::diag::{StreamCounters, frame_diagnostics, seq_gap};
 use crate::imu_channel::ImuQueue;
 use crate::pose::cam_in_world;
 use crate::reset::ResetEpoch;
 use crate::stats::{Durations, TrackerTiming};
+use crate::tap::VioTap;
 use crate::task_error::{Eye, TaskError};
 use crate::track::{TrackStatus, Tracker, TrackerConfig};
 use crate::wheel_channel::WheelQueue;
@@ -83,7 +85,7 @@ fn snapshot_map_points(
 pub mod vio_resources {
     use std::sync::Arc;
 
-    use super::{ImuQueue, ResetEpoch, WheelQueue};
+    use super::{ImuQueue, ResetEpoch, VioTap, WheelQueue};
     use cu29::resource::{ResourceBindingMap, ResourceBindings, ResourceKey, ResourceManager};
     use cu29::{CuError, CuResult};
 
@@ -92,6 +94,7 @@ pub mod vio_resources {
         Imu,
         Epoch,
         Wheel,
+        Tap,
     }
 
     pub struct Resources {
@@ -99,11 +102,13 @@ pub mod vio_resources {
         pub epoch: Arc<ResetEpoch>,
         /// `None` when the graph binds no `wheel`: then `wheel_odom` cannot be enabled.
         pub wheel: Option<Arc<WheelQueue>>,
+        /// `None` when the graph binds no `tap`: then no diagnostics leave the task.
+        pub tap: Option<Arc<VioTap>>,
     }
 
     impl ResourceBindings<'_> for Resources {
         type Binding = Binding;
-        const NAMES: &'static [&'static str] = &["imu", "epoch", "wheel"];
+        const NAMES: &'static [&'static str] = &["imu", "epoch", "wheel", "tap"];
 
         fn from_bindings(
             manager: &mut ResourceManager,
@@ -122,6 +127,10 @@ pub mod vio_resources {
                 wheel: mapping
                     .get(Binding::Wheel)
                     .map(|k: ResourceKey| manager.borrow_shared_arc::<WheelQueue>(k.typed()))
+                    .transpose()?,
+                tap: mapping
+                    .get(Binding::Tap)
+                    .map(|k: ResourceKey| manager.borrow_shared_arc::<VioTap>(k.typed()))
                     .transpose()?,
             })
         }
@@ -232,6 +241,15 @@ pub struct StereoVio {
     /// Keyframe poses published with a snapshot, and without one because the pool was empty.
     landmark_snapshots: u64,
     landmark_pool_exhausted: u64,
+    /// The bus's diagnostics tap, when bound; see [`crate::tap`].
+    #[reflect(ignore)]
+    tap: Option<Arc<VioTap>>,
+    /// The last processed frame's sequence number, for the skipped-frame count.
+    last_seq: Option<u64>,
+    /// Frames the stream skipped past this task (refused mid-solve, dropped upstream), lifetime.
+    skipped_frames: u64,
+    /// Frames handed to the tracker.
+    frames: u64,
 }
 
 /// A no-op, following `cu_anynet::AnyNetStereo`, whose `Freezable` is empty because nothing it
@@ -298,7 +316,12 @@ impl CuTask for StereoVio {
             crate::config::CONFIG_KEYS,
         )?;
         let inertial = crate::config::optional_inertial(config)?;
-        let vio_resources::Resources { imu, epoch, wheel } = resources;
+        let vio_resources::Resources {
+            imu,
+            epoch,
+            wheel,
+            tap,
+        } = resources;
         let wheel_odom = crate::config::optional_wheel_odom(config)?;
         // Validated here, enabled or not, so a bad block fails at graph construction.
         let wheel_enabled = match &wheel_odom {
@@ -388,6 +411,10 @@ impl CuTask for StereoVio {
             })?,
             landmark_snapshots: 0,
             landmark_pool_exhausted: 0,
+            tap,
+            last_seq: None,
+            skipped_frames: 0,
+            frames: 0,
         })
     }
 
@@ -559,6 +586,22 @@ impl CuTask for StereoVio {
         self.scratch_left = left.into_vec();
         self.scratch_right = right.into_vec();
         let tracked = tracked.map_err(|e| TaskError::from(e).into_cu_error("vio"))?;
+        self.skipped_frames += seq_gap(self.last_seq, seq);
+        self.last_seq = Some(seq);
+        self.frames += 1;
+        if let Some(tap) = self.tap.as_ref().filter(|t| t.is_armed()) {
+            let diag = frame_diagnostics(
+                tracker,
+                &tracked,
+                StreamCounters {
+                    seq,
+                    frames: self.frames,
+                    skipped_frames: self.skipped_frames,
+                    solve_ms: (dt.as_secs_f64() * 1e3) as f32,
+                },
+            );
+            tap.publish(input.tov, diag, frame, tracker.frame_features());
+        }
 
         let (pose, localization) = match tracked {
             TrackStatus::Tracked(pose) => (pose, Localization::Tracking),
@@ -775,6 +818,7 @@ mod tests {
                 imu: Arc::clone(&imu),
                 epoch: Arc::clone(&epoch),
                 wheel: None,
+                tap: None,
             },
         )
         .expect("an empty config is valid");
@@ -1008,6 +1052,7 @@ mod tests {
                 imu: Arc::new(ImuQueue::new()),
                 epoch: Arc::new(ResetEpoch::new()),
                 wheel: None,
+                tap: None,
             },
         )
     }
@@ -1062,6 +1107,7 @@ mod tests {
                 imu: Arc::new(ImuQueue::new()),
                 epoch: Arc::new(ResetEpoch::new()),
                 wheel,
+                tap: None,
             },
         )
     }
@@ -1130,5 +1176,68 @@ mod tests {
             x - last.unwrap()
         );
         assert_eq!(task.coasted, 1);
+    }
+
+    /// Through the tap: an unanchored dark frame is INITIALIZING with its cause, a textured run
+    /// TRACKS with inliers among its keypoints, and the seq gap is counted.
+    #[test]
+    fn test_the_tap_carries_each_processed_frame() {
+        use cu_stereo_payloads::{FEATURE_INLIER, FailureReason, TrackingState};
+        let tap = Arc::new(VioTap::new());
+        tap.arm(true);
+        let mut task = StereoVio::new(
+            None,
+            vio_resources::Resources {
+                imu: Arc::new(ImuQueue::new()),
+                epoch: Arc::new(ResetEpoch::new()),
+                wheel: None,
+                tap: Some(Arc::clone(&tap)),
+            },
+        )
+        .expect("task");
+        let ctx = CuContext::new_with_clock();
+        let mut out = CuMsg::<VioPose>::default();
+        let dark = pair_msg(
+            vec![0; (W * H) as usize],
+            vec![0; (W * H) as usize],
+            Tov::Time(CuTime::from_nanos(1)),
+        );
+        task.process(&ctx, &dark, &mut out).expect("frame");
+        tap.take(|d, f, _| {
+            let (tov, d) = d.expect("a record per processed frame, placed or not");
+            assert_eq!(tov, Tov::Time(CuTime::from_nanos(1)));
+            assert_eq!(d.state, TrackingState::Initializing);
+            assert_eq!(d.failure, FailureReason::TooFewStereoPoints);
+            assert!(f.is_some(), "the solved pair is retained");
+        });
+        let mut last = None;
+        for seq in 0..4u32 {
+            let mut msg = trackable_frame(
+                seq,
+                Tov::Time(CuTime::from_nanos(2_000_000 + u64::from(seq) * 66_000_000)),
+            );
+            if let Some(p) = msg.payload_mut() {
+                // Every other frame of the stream reaches the task: one skipped each time.
+                p.left.seq = 2 + 2 * u64::from(seq);
+            }
+            task.process(&ctx, &msg, &mut out).expect("frame");
+            last = tap.take(|d, _, feats| {
+                d.map(|(_, d)| {
+                    (
+                        d,
+                        feats
+                            .iter()
+                            .filter(|f| f.class & FEATURE_INLIER != 0)
+                            .count(),
+                    )
+                })
+            });
+        }
+        let (d, inliers) = last.expect("record");
+        assert_eq!(d.state, TrackingState::Tracking);
+        assert_eq!(d.failure, FailureReason::None);
+        assert!(inliers > 0, "a tracked frame marks its PnP inliers");
+        assert_eq!(d.frames, 5);
+        assert_eq!(d.skipped_frames, 1 + 3, "0 -> 2, then 2 -> 4 -> 6 -> 8");
     }
 }

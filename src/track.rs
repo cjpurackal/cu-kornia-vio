@@ -118,6 +118,10 @@ use crate::imu::{
 use crate::stationary::{NotStill, StaticInitConfig, check_camera, check_imu, check_wheels};
 use crate::wheel::{WheelOdomConfig, WheelSample, WheelState, WheelStats};
 use cu_stereo_payloads::ImuSample;
+use cu_stereo_payloads::{
+    FEATURE_INLIER, FEATURE_OUTLIER, FEATURE_STEREO, FailureReason, FeaturePoint, InertialStage,
+    MotionCheck, MotionVerdict as VerdictLabel,
+};
 
 /// Close-depth threshold in baselines: the near/far split is `35 * baseline`
 /// metres (the stereo close/far split of Campos et al., ORB-SLAM3, IEEE T-RO
@@ -576,6 +580,9 @@ struct InertialState {
     /// it (`MissingVelocities`), the one way to reach the map-refusal path from a real window.
     #[cfg(test)]
     refuse_static_alignment: bool,
+    /// The stage of the last APPLIED initialization, for diagnostics; `None` until one, and
+    /// after a reset (a carried alignment then reads as the motion solve's).
+    applied_stage: Option<InitStage>,
     /// Counters, plus the staged initialization's progress (`first_refinement_done` / `second_refinement_done` mark the
     /// first and second refinement, live here and nowhere else, and are read by the ladder and
     /// published as-is).
@@ -601,6 +608,7 @@ impl InertialState {
             carried_alignment: false,
             static_hold: None,
             static_map_refused_at: None,
+            applied_stage: None,
             #[cfg(test)]
             refuse_static_alignment: false,
             stats: InertialStats::default(),
@@ -645,6 +653,7 @@ impl InertialState {
         self.carried_alignment = false;
         self.static_hold = None;
         self.static_map_refused_at = None;
+        self.applied_stage = None;
         self.stats.first_refinement_done = false;
         self.stats.second_refinement_done = false;
     }
@@ -852,6 +861,28 @@ pub struct Tracker {
     /// Local BA updates refused for an implausible bias in a row; see
     /// [`BIAS_REFUSALS_BEFORE_DROP`].
     bias_refusals_in_a_row: u32,
+    /// This frame's diagnostics, reset at the top of every frame; see [`Tracker::frame_report`].
+    frame_report: FrameReport,
+    /// Maps dropped (size bound, sustained loss, refused biases), lifetime.
+    map_drops: u64,
+    /// Whether a map was anchored since construction or the last requested reset: what tells
+    /// "initializing" from "recovering" on a frame that could not be placed.
+    anchored_since_reset: bool,
+    /// The last keyframe interval the wheels moved in, as the motion check saw it.
+    last_motion: MotionCheck,
+    /// The last frame's left keypoints, classified. Reused: cleared and refilled per frame.
+    features: Vec<FeaturePoint>,
+}
+
+/// Why the current frame was or was not measured, beyond its [`TrackStatus`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FrameReport {
+    /// The FIRST cause of the frame not being measured; `None` on a measured frame.
+    pub failure: FailureReason,
+    /// Placed by relocalization against the existing map.
+    pub relocalized: bool,
+    /// A map was anchored on this frame at a dead-reckoned pose (a loss re-bootstrap).
+    pub reanchored: bool,
 }
 
 /// Consecutive local BA updates refused for an implausible bias (`BiasLimit`) before the map is
@@ -962,6 +993,11 @@ impl Tracker {
             vision_degraded: false,
             consistent_gyro_bias: None,
             bias_refusals_in_a_row: 0,
+            frame_report: FrameReport::default(),
+            map_drops: 0,
+            anchored_since_reset: false,
+            last_motion: MotionCheck::default(),
+            features: Vec::new(),
         }
     }
 
@@ -1073,6 +1109,7 @@ impl Tracker {
         validate_frame_arrays(&frame)?;
         let stamp_ns = stamp.as_nanos();
 
+        self.frame_report = FrameReport::default();
         self.apply_pending_map_reset();
 
         frame.idx = self.next_frame_idx;
@@ -1091,6 +1128,23 @@ impl Tracker {
         self.stats.keypoints = frame.features.keypoints_xy.len();
         self.stats.stereo_matches = frame.depth.iter().filter(|&&d| d > 0.0).count();
         self.stats.inliers = 0;
+        self.features.clear();
+        self.features.extend(
+            frame
+                .features
+                .keypoints_xy
+                .iter()
+                .enumerate()
+                .map(|(i, &[x, y])| FeaturePoint {
+                    x,
+                    y,
+                    class: if frame.depth.get(i).is_some_and(|&d| d > 0.0) {
+                        FEATURE_STEREO
+                    } else {
+                        0
+                    },
+                }),
+        );
 
         // No `ImuInit` arm: see [`SystemMode`] for why this tracker never parks there.
         let frame_idx = frame.idx;
@@ -1113,6 +1167,8 @@ impl Tracker {
                     && std::mem::take(&mut self.coast_rebootstrap_pending)
                 {
                     // The deferred half of the loss path's re-bootstrap; see the field.
+                    self.frame_report.reanchored = true;
+                    self.note_failure(FailureReason::DeadReckonedAnchor);
                     warning!(
                         "re-bootstrapped at the extrapolated pose on frame {}; reporting Skipped \
                          because that pose is dead-reckoned, not measured",
@@ -1231,6 +1287,12 @@ impl Tracker {
             keyframes: self.map.keyframes().len(),
             ..self.stats
         }
+    }
+
+    /// The last frame's counters WITHOUT the two whole-map scans [`stats`](Self::stats) runs:
+    /// `map_points` and `keyframes` read zero here. Cheap enough to call per frame.
+    pub fn frame_stats(&self) -> TrackerStats {
+        self.stats
     }
 
     /// Rotation the gyro says the CAMERA turned through over `[t0_ns, t1_ns]`.
@@ -1604,6 +1666,11 @@ impl Tracker {
         // Kept across a carried drop: it starts the wheel interval that propagates the pose.
         self.last_frame_stamp_ns = if carry { carried_stamp } else { None };
         self.world_generation += 1;
+        if keep_calibration {
+            self.map_drops += 1;
+        } else {
+            self.anchored_since_reset = false;
+        }
         // `next_frame_idx` and `epoch_ns` deliberately keep counting: frame
         // indices must stay unique for `Map::get_keyframe`, and restarting the
         // clock would corrupt the loss grace period.
@@ -1634,6 +1701,7 @@ impl Tracker {
                 cam_points.len(),
                 self.config.min_bootstrap_stereo_points
             );
+            self.note_failure(FailureReason::TooFewStereoPoints);
             return TrackingStatus::Skipped;
         }
 
@@ -1677,6 +1745,7 @@ impl Tracker {
                 self.state.velocity_world = Vec3F64::ZERO;
             }
             self.map_writes_refused += 1;
+            self.note_failure(FailureReason::MapRefused);
             error!(
                 "bootstrap_stereo: the map refused the bootstrap keyframe, frame dropped: frame={} error={}",
                 curr_idx,
@@ -1696,6 +1765,7 @@ impl Tracker {
         self.state.velocity = None;
         self.state.mode = SystemMode::Tracking;
         self.world_anchored = true;
+        self.anchored_since_reset = true;
         self.last_keyframe_timestamp_sec = Some(timestamp_sec);
         self.last_keyframe_stamp_ns = Some(stamp_ns);
         self.arm_inertial_window(curr_idx, timestamp_sec, stamp_ns);
@@ -1955,6 +2025,7 @@ impl Tracker {
                 // those writes, so a rejected correspondence never reaches
                 // the map's bookkeeping.
                 let matches = self.reject_pnp_outliers(&frame, &estimate.pose, &estimate.matches);
+                self.classify_matches(&estimate.matches, &matches);
                 debug!(
                     "track: ok frame={} matches={} kept={} inliers={}",
                     frame.idx,
@@ -1976,6 +2047,7 @@ impl Tracker {
                     frame.idx,
                     reject_reason_str(reason)
                 );
+                self.note_failure(failure_reason(reason));
                 (TrackingStatus::Skipped, Vec::new(), 0)
             }
         };
@@ -2075,6 +2147,8 @@ impl Tracker {
                 self.state.current_keyframe_idx = Some(kf_idx);
                 self.state.lost_since_sec = None;
                 self.state.last_frame_timestamp_sec = timestamp_sec;
+                self.frame_report.relocalized = true;
+                self.frame_report.failure = FailureReason::None;
                 // Measured (PnP inliers), so it may leave as Tracked — unlike the
                 // re-bootstrap coast below, which must not.
                 return TrackingStatus::Tracked;
@@ -2166,6 +2240,7 @@ impl Tracker {
                 // the next frame that actually tracks against it is the first
                 // measured pose again.
                 if recovered == TrackingStatus::KeyframeAccepted {
+                    self.frame_report.reanchored = true;
                     warning!(
                         "re-bootstrapped at the extrapolated pose on frame {}; reporting Skipped \
                          because that pose is dead-reckoned, not measured",
@@ -2618,6 +2693,10 @@ impl Tracker {
                     MotionVerdict::Consistent | MotionVerdict::Inconclusive
                 );
             let moving = motion.wheels_moved();
+            if moving {
+                self.last_motion =
+                    motion_check(&motion, verdict, translation, self.last_motion.checks + 1);
+            }
             let speak = moving
                 || (notable
                     && should_log_throttled(
@@ -2706,6 +2785,77 @@ impl Tracker {
     /// on is still in the local BA window ([`crate::consistency`]).
     pub fn vision_degraded(&self) -> bool {
         self.vision_degraded
+    }
+
+    /// Why the last frame was or was not measured; see [`FrameReport`].
+    pub fn frame_report(&self) -> FrameReport {
+        self.frame_report
+    }
+
+    /// Maps dropped by the size bound, a sustained loss or refused biases, lifetime. A requested
+    /// [`reset`](Self::reset) is not counted.
+    pub fn map_drops(&self) -> u64 {
+        self.map_drops
+    }
+
+    /// Whether a map was anchored since construction or the last requested reset.
+    pub fn anchored_since_reset(&self) -> bool {
+        self.anchored_since_reset
+    }
+
+    /// The last keyframe interval the wheels moved in; `checks == 0` before the first.
+    pub fn last_motion_check(&self) -> MotionCheck {
+        self.last_motion
+    }
+
+    /// The last frame's left keypoints, with `FEATURE_*` classes: stereo depth, and, on a tracked
+    /// frame, PnP inlier or outlier among the map matches.
+    pub fn frame_features(&self) -> &[FeaturePoint] {
+        &self.features
+    }
+
+    /// The inertial initialization's progress, and the current `(gyro, accel)` bias.
+    pub fn inertial_diag(&self) -> (InertialStage, [f64; 3], [f64; 3]) {
+        let Some(inert) = self.inertial.as_ref() else {
+            return (InertialStage::Off, [0.0; 3], [0.0; 3]);
+        };
+        let s = &inert.stats;
+        let stage = if !self.state.imu_initialized {
+            InertialStage::Uninitialized
+        } else if s.second_refinement_done {
+            InertialStage::Refine2
+        } else if s.first_refinement_done {
+            InertialStage::Refine1
+        } else if inert.applied_stage == Some(InitStage::Static) {
+            InertialStage::Static
+        } else {
+            InertialStage::Initial
+        };
+        let (g, a) = (inert.bias.gyro, inert.bias.accel);
+        (stage, [g.x, g.y, g.z], [a.x, a.y, a.z])
+    }
+
+    /// Records the frame's failure cause; the first one wins, since later ones (a re-bootstrap
+    /// that also failed) follow from it.
+    fn note_failure(&mut self, reason: FailureReason) {
+        if self.frame_report.failure == FailureReason::None {
+            self.frame_report.failure = reason;
+        }
+    }
+
+    /// Marks the feature classes of a tracked frame: every map match an outlier, then the ones
+    /// PnP's final gate kept inliers. `(map point, keypoint)` pairs.
+    fn classify_matches(&mut self, all: &[(usize, usize)], kept: &[(usize, usize)]) {
+        for &(_, kp) in all {
+            if let Some(f) = self.features.get_mut(kp) {
+                f.class |= FEATURE_OUTLIER;
+            }
+        }
+        for &(_, kp) in kept {
+            if let Some(f) = self.features.get_mut(kp) {
+                f.class = (f.class & !FEATURE_OUTLIER) | FEATURE_INLIER;
+            }
+        }
     }
 
     /// The interval a wheel factor spans, as the wheels, vision (the keyframes' tracked poses)
@@ -3575,6 +3725,7 @@ impl Tracker {
         );
         match applied {
             Ok(Some(mut aligned)) => {
+                inert.applied_stage = Some(stage);
                 if let Some((idx, centre)) = pivot {
                     aligned.pose_world_to_cam =
                         self.repivot_map(idx, centre, aligned.pose_world_to_cam);
@@ -4154,6 +4305,45 @@ fn reject_reason_str(reason: MapProjectionRejectReason) -> &'static str {
         MapProjectionRejectReason::LowPnpInliers => "low_pnp_inliers",
         MapProjectionRejectReason::LowReferenceMatches => "low_reference_matches",
         MapProjectionRejectReason::LowReferenceCorrespondences => "low_reference_correspondences",
+    }
+}
+
+/// The diagnostic label of a map-projection rejection.
+fn failure_reason(reason: MapProjectionRejectReason) -> FailureReason {
+    match reason {
+        MapProjectionRejectReason::LowProjectionMatches => FailureReason::LowProjectionMatches,
+        MapProjectionRejectReason::PnpFailed => FailureReason::PnpFailed,
+        MapProjectionRejectReason::LowPnpInliers => FailureReason::LowPnpInliers,
+        MapProjectionRejectReason::LowReferenceMatches => FailureReason::LowReferenceMatches,
+        MapProjectionRejectReason::LowReferenceCorrespondences => {
+            FailureReason::LowReferenceCorrespondences
+        }
+    }
+}
+
+/// One moving interval's motion check, as the status topic carries it.
+fn motion_check(
+    motion: &IntervalMotion,
+    verdict: MotionVerdict,
+    translation_disagrees: bool,
+    checks: u64,
+) -> MotionCheck {
+    let deg = |r: &Mat3F64| crate::consistency::angle(r).to_degrees() as f32;
+    MotionCheck {
+        checks,
+        verdict: match verdict {
+            MotionVerdict::Consistent => VerdictLabel::Consistent,
+            MotionVerdict::VisionDisagrees => VerdictLabel::VisionDisagrees,
+            MotionVerdict::WheelsDisagree => VerdictLabel::WheelsDisagree,
+            MotionVerdict::GyroDisagrees => VerdictLabel::GyroDisagrees,
+            MotionVerdict::Inconclusive => VerdictLabel::Inconclusive,
+        },
+        translation_disagrees,
+        wheels_deg: deg(&motion.wheels.rotation),
+        gyro_deg: motion.gyro.as_ref().map_or(f32::NAN, deg),
+        vision_deg: deg(&motion.vision.rotation),
+        wheels_mm: (motion.wheels.translation.length() * 1e3) as f32,
+        vision_mm: (motion.vision.translation.length() * 1e3) as f32,
     }
 }
 
