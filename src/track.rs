@@ -548,10 +548,33 @@ struct InertialState {
     /// When the stationary initialization's refusal line last spoke; see [`should_log_throttled`].
     last_static_log: Option<(f64, bool)>,
     /// Set by a map drop that kept the world (wheels carried the pose, or a loss re-bootstrapped
-    /// into the kept map) while the inertial path was initialized: the velocity to resume from.
-    /// The world frame did not change, so neither did gravity in it, and the next bootstrap
-    /// adopts the alignment instead of re-initializing; see [`Tracker::adopt_carried_alignment`].
-    carried_velocity: Option<Vec3F64>,
+    /// into the kept map) while the inertial path was initialized. The world frame did not
+    /// change, so neither did gravity in it, and the next bootstrap adopts the alignment instead
+    /// of re-initializing; see [`Tracker::carried_velocity`] and
+    /// [`Tracker::adopt_carried_alignment`].
+    ///
+    /// No velocity is carried with it. The tracker's velocity is synced only at keyframes (~1.4 s
+    /// apart on the robot), a loss adds its grace period, and a bootstrap that keeps failing
+    /// (a dark room) can defer the adoption by minutes: a velocity from before the drop says
+    /// nothing about the robot when the next map starts. The anchor's velocity is measured at
+    /// the bootstrap instead, from the wheels, or the alignment is not adopted.
+    carried_alignment: bool,
+    /// Set when a stationary initialization was applied: the newest keyframe of its still
+    /// window. While set the refinements wait. On parked data they cannot separate the
+    /// accelerometer bias from tilt any better than the still window did, yet an accepted one
+    /// rotates the world again and bumps the generation (every consumer wipes its trail), and
+    /// each stage runs once, so both would be spent before the robot moved. Cleared, with the
+    /// refinement window re-armed at that moment, once the camera has moved
+    /// [`STATIC_REFINE_MOTION_M`] or turned [`STATIC_REFINE_MOTION_RAD`] from that keyframe.
+    static_hold: Option<usize>,
+    /// When the map last refused a stationary initialization: the still window is not searched
+    /// again for `init_retry`, as the motion solve is throttled after its own refusals. Without
+    /// it a refused alignment re-ran the search and the apply, and warned, on every keyframe.
+    static_map_refused_at: Option<f64>,
+    /// Test-only fault injection: empties the stationary result's velocities so the map refuses
+    /// it (`MissingVelocities`), the one way to reach the map-refusal path from a real window.
+    #[cfg(test)]
+    refuse_static_alignment: bool,
     /// Counters, plus the staged initialization's progress (`first_refinement_done` / `second_refinement_done` mark the
     /// first and second refinement, live here and nowhere else, and are read by the ladder and
     /// published as-is).
@@ -574,7 +597,11 @@ impl InertialState {
             last_window_log: None,
             dry_run_accepted: false,
             last_static_log: None,
-            carried_velocity: None,
+            carried_alignment: false,
+            static_hold: None,
+            static_map_refused_at: None,
+            #[cfg(test)]
+            refuse_static_alignment: false,
             stats: InertialStats::default(),
             cfg,
         }
@@ -591,8 +618,8 @@ impl InertialState {
     /// i.e. one large world rotation per map cycle.
     ///
     /// `gravity_world` is NOT carried here: it is expressed in the world frame, and the bootstrap
-    /// that follows a reset defines a new one. `Tracker::reset_inner` restores it, with
-    /// [`Self::carried_velocity`], when the drop keeps the world.
+    /// that follows a reset defines a new one. `Tracker::reset_inner` restores it, and sets
+    /// [`Self::carried_alignment`], when the drop keeps the world.
     fn reset(&mut self, keep_bias: bool) {
         self.buffer.clear();
         if !keep_bias {
@@ -607,7 +634,9 @@ impl InertialState {
         self.last_window_log = None;
         self.dry_run_accepted = false;
         self.last_static_log = None;
-        self.carried_velocity = None;
+        self.carried_alignment = false;
+        self.static_hold = None;
+        self.static_map_refused_at = None;
         self.stats.first_refinement_done = false;
         self.stats.second_refinement_done = false;
     }
@@ -670,8 +699,6 @@ impl std::fmt::Display for InitStage {
 struct StillWindow {
     /// `Frame::idx` of its first keyframe.
     first_kf: usize,
-    /// Its start, seconds since the tracker epoch.
-    t0_sec: f64,
     /// Seconds of contiguous IMU edges it spans.
     span_s: f64,
     stats: ImuWindowStats,
@@ -693,6 +720,18 @@ enum StaticRefusal {
 /// fill an embedded disk. 5 s is ~1 line per 19 losses; `suppressed` carries the rest, so
 /// throttling never hides the volume.
 const LOSS_LOG_RETRY_SEC: f64 = 5.0;
+
+/// Camera translation from the still window that ends a stationary initialization's hold on the
+/// refinements, metres. Two orders over a parked keyframe's drift (0.2 mm), and enough motion for
+/// the accelerometer bias to begin separating from tilt.
+const STATIC_REFINE_MOTION_M: f64 = 0.2;
+
+/// Camera rotation from the still window that ends the same hold, radians (10 deg).
+const STATIC_REFINE_MOTION_RAD: f64 = 0.174_532_925_199_432_95;
+
+/// Wheel-odometry span the anchor velocity of a carried alignment is measured over: a few wheel
+/// readings, short enough to be the velocity at the bootstrap and not an average over a stop.
+const CARRY_VELOCITY_WINDOW_NS: u64 = 200_000_000;
 
 /// Replace a world-to-camera pose's rotation while leaving the camera CENTRE where it is.
 ///
@@ -1071,11 +1110,19 @@ impl Tracker {
             .and_then(|i| i.cfg.static_init)
             .zip(self.last_keyframe_stamp_ns)
             .map(|(c, t)| t.saturating_sub((2.0 * c.window.get::<second>() * 1e9) as u64));
+        // A carried alignment measures its anchor velocity over the wheel readings that END at
+        // the next bootstrap, so they are kept from that window's length before this frame. Kept
+        // always, not only while a carry is pending: the drop that arms one can land on the very
+        // frame that bootstraps, before any prune sees the flag. A few readings.
+        let carry_velocity_start = self
+            .last_frame_stamp_ns
+            .map(|t| t.saturating_sub(CARRY_VELOCITY_WINDOW_NS));
         if let Some(w) = self.wheel.as_mut() {
             w.prune([
                 self.last_keyframe_stamp_ns,
                 self.last_frame_stamp_ns,
                 still_window_start,
+                carry_velocity_start,
             ]);
             if let Some((offset_ns, frames)) = w.check_coverage(stamp_ns) {
                 warning!(
@@ -1441,8 +1488,7 @@ impl Tracker {
         let carry = keep_calibration && self.wheel.is_some() && self.world_anchored;
         let carried_pose = self.state.pose_world_to_cam;
         // A carried world keeps its gravity, so an initialized inertial path carries too.
-        let carried_velocity =
-            (carry && self.state.imu_initialized).then_some(self.state.velocity_world);
+        let carry_alignment = carry && self.state.imu_initialized;
         let carried_stamp = self.last_frame_stamp_ns;
         if let Some(w) = self.wheel.as_mut() {
             w.reset_map();
@@ -1463,9 +1509,9 @@ impl Tracker {
         if let Some(inert) = self.inertial.as_mut() {
             let gravity_world = inert.gravity_world;
             inert.reset(keep_calibration);
-            if carried_velocity.is_some() {
+            if carry_alignment {
                 inert.gravity_world = gravity_world;
-                inert.carried_velocity = carried_velocity;
+                inert.carried_alignment = true;
             }
         }
         self.stats = TrackerStats::default();
@@ -1531,8 +1577,18 @@ impl Tracker {
             .collect();
 
         // A carried alignment initializes the anchor keyframe itself, so `seeded_keyframe` gives
-        // it the carried velocity.
-        let carried = self.inertial.as_ref().and_then(|i| i.carried_velocity);
+        // it the velocity measured now. With none measurable the alignment is dropped and the
+        // still window or the motion solve initializes again, as a loss always did before the
+        // carry existed.
+        let carried = if self.inertial.as_ref().is_some_and(|i| i.carried_alignment) {
+            let v = self.carried_velocity(stamp_ns, curr_frame.pose_world_to_cam);
+            if v.is_none() {
+                self.drop_carried_alignment(curr_frame.idx);
+            }
+            v
+        } else {
+            None
+        };
         if let Some(v) = carried {
             self.state.imu_initialized = true;
             self.state.velocity_world = v;
@@ -1567,7 +1623,7 @@ impl Tracker {
         self.last_keyframe_timestamp_sec = Some(timestamp_sec);
         self.last_keyframe_stamp_ns = Some(stamp_ns);
         self.arm_inertial_window(curr_idx, timestamp_sec, stamp_ns);
-        self.adopt_carried_alignment(timestamp_sec);
+        self.adopt_carried_alignment(carried, timestamp_sec);
 
         TrackingStatus::KeyframeAccepted
     }
@@ -1609,6 +1665,8 @@ impl Tracker {
         // `reset_map_on_loss` off (the default) re-arms here without any `InertialState::reset`.
         inert.dry_run_accepted = false;
         inert.last_window_log = None;
+        inert.static_hold = None;
+        inert.static_map_refused_at = None;
         inert.stats.first_refinement_done = false;
         inert.stats.second_refinement_done = false;
         // Samples older than the anchor can never bound an interval again.
@@ -2006,13 +2064,10 @@ impl Tracker {
                     // every non-culled point.
                     // The kept map is the same world, gravity included: an initialized inertial
                     // path carries into the re-anchor rather than rotating the world again.
-                    let carried = self
-                        .state
-                        .imu_initialized
-                        .then_some(self.state.velocity_world);
+                    let carried = self.state.imu_initialized;
                     self.state.reset();
-                    if let (Some(v), Some(inert)) = (carried, self.inertial.as_mut()) {
-                        inert.carried_velocity = Some(v);
+                    if let (true, Some(inert)) = (carried, self.inertial.as_mut()) {
+                        inert.carried_alignment = true;
                     }
                     self.world_generation += 1;
                 }
@@ -2633,6 +2688,9 @@ impl Tracker {
             return;
         }
 
+        if inert.static_hold.is_some() && !self.release_static_hold(inert, now_sec) {
+            return;
+        }
         let Some(window_start) = inert.window_start_sec else {
             return;
         };
@@ -2677,9 +2735,10 @@ impl Tracker {
     /// (no `static_init` config, no still window, or a refusal by kornia-slam or the map) leaves
     /// the motion solve to run.
     ///
-    /// Applied, it re-arms the initialization window at the still window's first keyframe: the
-    /// refinements re-solve over keyframes whose zero velocity was written, scheduled from the
-    /// still window's start, not over earlier keyframes the alignment gave no velocity.
+    /// Applied, it writes zero velocity from the still window on and finite-difference velocities
+    /// to the initialization window's earlier keyframes ([`Self::pre_window_velocities`]), and
+    /// holds the refinements until the robot moves ([`InertialState::static_hold`]). A map
+    /// refusal is not retried for `init_retry` ([`InertialState::static_map_refused_at`]).
     fn try_static_init(&mut self, inert: &mut InertialState, now_sec: f64) -> bool {
         let Some(cfg) = inert.cfg.static_init else {
             return false;
@@ -2688,6 +2747,12 @@ impl Tracker {
         else {
             return false;
         };
+        if inert
+            .static_map_refused_at
+            .is_some_and(|t| now_sec - t < inert.cfg.init_retry.get::<second>())
+        {
+            return false;
+        }
         let found = self
             .still_window(newest, start_idx, &cfg)
             .map_err(StaticRefusal::NotStill)
@@ -2705,7 +2770,7 @@ impl Tracker {
                     .map(|init| (w, init))
                     .map_err(StaticRefusal::Init)
             });
-        let (window, init) = match found {
+        let (window, mut init) = match found {
             Ok(found) => found,
             Err(reason) => {
                 inert.stats.static_refused += 1;
@@ -2737,14 +2802,122 @@ impl Tracker {
             window.stats.gyro_rms_dev,
             window.stats.mean_gyro.length()
         );
-        self.accept_inertial_init(inert, init, window.first_kf, now_sec, InitStage::Static);
+        // Keyframes of the initialization window before the still one get the velocity their
+        // visual track shows, not the zero `initialize_stationary` writes only from the still
+        // window on: their IMU edges stay in VI-BA, and an edge spanning real motion between two
+        // keyframes that both claim rest is a residual the size of that speed.
+        let before = self.pre_window_velocities(start_idx, window.first_kf);
+        let apply_from = if before.is_empty() {
+            window.first_kf
+        } else {
+            start_idx
+        };
+        init.velocities_world.splice(0..0, before);
+        #[cfg(test)]
+        if inert.refuse_static_alignment {
+            init.velocities_world.clear();
+        }
+        self.accept_inertial_init(inert, init, apply_from, now_sec, InitStage::Static);
         if self.state.imu_initialized {
-            inert.start_kf_idx = Some(window.first_kf);
-            inert.window_start_sec = Some(window.t0_sec);
+            inert.static_hold = Some(newest);
             inert.stats.first_refinement_done = false;
             inert.stats.second_refinement_done = false;
+        } else if !inert.dry_run_accepted {
+            inert.static_map_refused_at = Some(now_sec);
         }
         self.state.imu_initialized || inert.dry_run_accepted
+    }
+
+    /// Velocities, in the current world, for the keyframes in `[start_idx, first_still)` in map
+    /// order, by finite differences of their camera centres over the keyframe stamps the IMU
+    /// edges carry (central where both neighbours are known, one-sided at the ends; the still
+    /// window's first keyframe is the right neighbour of the last). A keyframe with no stamped
+    /// neighbour gets zero. Empty when the still window starts at the initialization window.
+    ///
+    /// The camera centre's velocity stands in for the IMU's, as in [`Self::carried_velocity`].
+    fn pre_window_velocities(&self, start_idx: usize, first_still: usize) -> Vec<Vec3F64> {
+        if first_still <= start_idx {
+            return Vec::new();
+        }
+        let mut stamps: std::collections::HashMap<usize, f64> = std::collections::HashMap::new();
+        for f in self.map.imu_factors() {
+            stamps.insert(f.prev_kf_idx, f.t0);
+            stamps.insert(f.curr_kf_idx, f.t1);
+        }
+        let kfs: Vec<(usize, Vec3F64)> = self
+            .map
+            .keyframes()
+            .iter()
+            .filter(|kf| kf.frame.idx >= start_idx && kf.frame.idx <= first_still)
+            .map(|kf| {
+                (
+                    kf.frame.idx,
+                    kf.frame.pose_world_to_cam.inverse().translation,
+                )
+            })
+            .collect();
+        let at = |i: usize| {
+            kfs.get(i)
+                .and_then(|(idx, c)| Some((*stamps.get(idx)?, *c)))
+        };
+        kfs.iter()
+            .enumerate()
+            .take_while(|(_, (idx, _))| *idx < first_still)
+            .map(|(i, _)| {
+                let prev = i.checked_sub(1).and_then(at).or_else(|| at(i));
+                let next = at(i + 1).or_else(|| at(i));
+                match (prev, next) {
+                    (Some((t0, c0)), Some((t1, c1))) if t1 - t0 > 1e-3 => (c1 - c0) / (t1 - t0),
+                    _ => Vec3F64::ZERO,
+                }
+            })
+            .collect()
+    }
+
+    /// Whether the refinements held by a stationary initialization may run: the camera has moved
+    /// [`STATIC_REFINE_MOTION_M`] or turned [`STATIC_REFINE_MOTION_RAD`] from the still window's
+    /// newest keyframe. On release the refinement window is re-armed at the newest keyframe's
+    /// predecessor (the edge into it spans the start of the motion), so the 5 s / 15 s schedule
+    /// counts from when the robot started moving and the solve does not span the whole stop.
+    ///
+    /// Returns `true` only on the keyframe that releases it; that keyframe is the window's
+    /// second, so the refinement branch it falls into has nothing scheduled yet anyway.
+    fn release_static_hold(&self, inert: &mut InertialState, now_sec: f64) -> bool {
+        let Some(hold) = inert.static_hold else {
+            return true;
+        };
+        let Some(newest) = self.map.keyframes().last() else {
+            return false;
+        };
+        if let Some(held) = self.map.get_keyframe(hold) {
+            let (p0, p1) = (held.frame.pose_world_to_cam, newest.frame.pose_world_to_cam);
+            let moved = (p1.inverse().translation - p0.inverse().translation).length();
+            let r = p1.rotation * p0.rotation.transpose();
+            let cos = ((r.x_axis.x + r.y_axis.y + r.z_axis.z) - 1.0) * 0.5;
+            let turned = cos.clamp(-1.0, 1.0).acos();
+            #[allow(clippy::neg_cmp_op_on_partial_ord)] // a NaN pose is not motion
+            if !(moved >= STATIC_REFINE_MOTION_M || turned >= STATIC_REFINE_MOTION_RAD) {
+                return false;
+            }
+        }
+        // Held keyframe gone (a reset clears the hold, so this is defensive): release as well.
+        let newest_idx = newest.frame.idx;
+        let (start, t0) = self
+            .map
+            .imu_factors()
+            .iter()
+            .rev()
+            .find(|f| f.curr_kf_idx == newest_idx)
+            .map_or((newest_idx, now_sec), |f| (f.prev_kf_idx, f.t0));
+        inert.static_hold = None;
+        inert.start_kf_idx = Some(start);
+        inert.window_start_sec = Some(t0);
+        info!(
+            "inertial: motion after the stationary initialization; refinements scheduled from \
+             here: held_kf={} start_kf={} kf={}",
+            hold, start, newest_idx
+        );
+        true
     }
 
     /// The newest run of contiguous IMU edges ending at keyframe `newest` that spans at least
@@ -2807,25 +2980,64 @@ impl Tracker {
 
         Ok(StillWindow {
             first_kf: first.prev_kf_idx,
-            t0_sec: first.t0,
             span_s,
             stats,
         })
     }
 
-    /// Adopts an alignment a map drop carried: the new map's anchor keyframe was seeded in a
-    /// world that is still gravity-aligned, at the carried velocity, so the tracker is
-    /// initialized from its first keyframe with no rotation and no extra world-generation bump.
+    /// The anchor velocity for a carried alignment, measured at the bootstrap `stamp_ns`: the
+    /// camera's velocity over the last [`CARRY_VELOCITY_WINDOW_NS`] of wheel odometry, in the
+    /// world through `pose_world_to_cam`. `None` without a wheel feed or without readings that
+    /// cover the interval.
     ///
-    /// The refinements are marked spent: each one rotates the world, and a carried world is
-    /// already the product of the initialization (and refinements) that aligned it.
-    fn adopt_carried_alignment(&mut self, timestamp_sec: f64) {
+    /// The camera's velocity stands in for the IMU's: they differ by the angular rate times the
+    /// IMU-to-camera lever arm (centimetres on a stereo head), well inside what one VI-BA solve
+    /// corrects. What it must not be is the stale velocity from before the drop.
+    fn carried_velocity(&mut self, stamp_ns: u64, pose_world_to_cam: Pose3d) -> Option<Vec3F64> {
+        let w = self.wheel.as_mut()?;
+        let t0 = stamp_ns.checked_sub(CARRY_VELOCITY_WINDOW_NS)?;
+        // `M` takes world-to-camera at t0 to t1: `T_c1w = M T_c0w`, so `M^-1` takes camera-1
+        // coordinates to camera-0 and its translation is camera 1's centre in camera 0.
+        let c0_c1 = w.camera_motion(t0, stamp_ns)?.inverse();
+        let r_wc1 = pose_world_to_cam.inverse().rotation;
+        let r_wc0 = r_wc1 * c0_c1.rotation.transpose();
+        let v = r_wc0 * c0_c1.translation / (CARRY_VELOCITY_WINDOW_NS as f64 * 1e-9);
+        (v.x.is_finite() && v.y.is_finite() && v.z.is_finite()).then_some(v)
+    }
+
+    /// Gives up a carried alignment whose anchor velocity could not be measured: the inertial
+    /// path initializes again (still window or motion solve), which rotates the world and bumps
+    /// the generation, as every loss did before the carry existed.
+    fn drop_carried_alignment(&mut self, frame_idx: usize) {
         let Some(inert) = self.inertial.as_mut() else {
             return;
         };
-        let Some(velocity) = inert.carried_velocity.take() else {
+        inert.carried_alignment = false;
+        inert.stats.carry_dropped += 1;
+        warning!(
+            "inertial: carried alignment dropped, no wheel velocity at the re-bootstrap; the \
+             inertial path initializes again: frame={} wheel_feed={}",
+            frame_idx,
+            self.wheel.is_some()
+        );
+    }
+
+    /// Adopts an alignment a map drop carried: the new map's anchor keyframe was seeded in a
+    /// world that is still gravity-aligned, at `carried`, the velocity measured at the bootstrap,
+    /// so the tracker is initialized from its first keyframe with no rotation and no extra
+    /// world-generation bump.
+    ///
+    /// The refinements are marked spent: each one rotates the world, and a carried world is
+    /// already the product of the initialization (and refinements) that aligned it.
+    fn adopt_carried_alignment(&mut self, carried: Option<Vec3F64>, timestamp_sec: f64) {
+        let Some(inert) = self.inertial.as_mut() else {
             return;
         };
+        let Some(velocity) = carried else {
+            return;
+        };
+        inert.carried_alignment = false;
+        inert.static_hold = None;
         self.state.imu_init_timestamp_sec = Some(timestamp_sec);
         inert.stats.first_refinement_done = true;
         inert.stats.second_refinement_done = true;
@@ -5604,6 +5816,18 @@ mod tests {
         accel_extra: &dyn Fn(u64) -> Vec3F64,
         wheel_x: &dyn Fn(u32) -> f64,
     ) -> TrackStatus {
+        feed_parked_frame(tracker, seq, accel_extra, wheel_x, false)
+    }
+
+    /// [`feed_parked`], with `blank` replacing the pair by two black images: no keypoints, so a
+    /// bootstrap on it fails (the dark room).
+    fn feed_parked_frame(
+        tracker: &mut Tracker,
+        seq: u32,
+        accel_extra: &dyn Fn(u64) -> Vec3F64,
+        wheel_x: &dyn Fn(u32) -> f64,
+        blank: bool,
+    ) -> TrackStatus {
         let stamp = EPOCH_NS + u64::from(seq) * FRAME_NS;
         let from = seq
             .checked_sub(1)
@@ -5620,7 +5844,12 @@ mod tests {
                 }])
                 .unwrap();
         }
-        let (left, right, _) = scene_pair(0);
+        let (mut left, mut right, _) = scene_pair(0);
+        if blank {
+            let size = left.size();
+            left = Image::new(size, vec![0u8; size.width * size.height]).expect("sized");
+            right = Image::new(size, vec![0u8; size.width * size.height]).expect("sized");
+        }
         tracker
             .process_stereo(&left, &right, CuTime::from_nanos(stamp))
             .expect("a valid pair")
@@ -5652,7 +5881,7 @@ mod tests {
     /// window, the world is rotated onto the IMU's gravity (from 22 deg off to under half a
     /// degree), consumers see it as a reset, the gyro bias is the true one, and tracking and
     /// inertial BA carry on with nothing refused. The first 1.5 s vibrate, so the still window
-    /// starts after the map's anchor and the initialization window is re-armed there.
+    /// starts after the map's anchor.
     ///
     /// Mutations (each turned this red): making `try_static_init` return `false` before looking
     /// (the pre-change behaviour: parked never initializes); dropping the still-window horizon
@@ -5715,16 +5944,11 @@ mod tests {
             "{:?}",
             tracker.state.velocity_world
         );
-        let start = inert.start_kf_idx.expect("armed");
         assert!(
-            start > 0,
-            "the window was not re-armed at the still window's start"
+            inert.static_hold.is_some(),
+            "the refinements wait for motion"
         );
-        assert!(
-            inert.window_start_sec.is_some_and(|t| t >= 1.5 - 0.6),
-            "{:?}",
-            inert.window_start_sec
-        );
+        assert!(!inert.stats.first_refinement_done && !inert.stats.second_refinement_done);
         assert!(
             inert.stats.static_refused > 0,
             "the vibrating stretch was not refused"
@@ -5809,7 +6033,7 @@ mod tests {
     /// generation bump beyond the drop's own. Without wheels the world restarts at identity and
     /// the still window runs again.
     ///
-    /// Mutation: not restoring `carried_velocity` in `reset_inner` turned the wheel case red
+    /// Mutation: not setting `carried_alignment` in `reset_inner` turned the wheel case red
     /// (a second static init, generation 3).
     #[test]
     fn test_a_map_drop_carries_the_alignment_or_re_runs_the_still_window() {
@@ -5850,5 +6074,331 @@ mod tests {
             }
             assert_eq!(tracker.ba_updates_refused(), 0, "wheels={wheels}");
         }
+    }
+    /// Runs a parked robot with wheels until the stationary initialization lands, returning the
+    /// next frame sequence number.
+    fn park_until_static_init(tracker: &mut Tracker) -> u32 {
+        for seq in 0..80 {
+            feed_parked(tracker, seq, &no_extra, &parked_wheels);
+            if tracker.state.imu_initialized {
+                return seq + 1;
+            }
+        }
+        panic!("a parked robot never initialized");
+    }
+
+    /// Finding 3: a parked robot past both refinement times (5 s, 15 s) keeps the one static
+    /// alignment. The refinements wait for motion rather than re-solving the parked window,
+    /// which on stationary data separates nothing the still window did not, rotates the world
+    /// again (a second wipe for every consumer) and spends each once-only stage.
+    ///
+    /// Mutation: dropping the `static_hold` gate from the refinement branch turned this red
+    /// (both stages spent while parked).
+    #[test]
+    fn test_a_parked_robot_past_the_refinement_times_keeps_one_alignment() {
+        let mut tracker = scene_tracker_with(|c| {
+            c.inertial = Some(static_inertial_config());
+            c.wheel_odom = Some(scene_wheel_config());
+        });
+        let from = park_until_static_init(&mut tracker);
+        // 18 s more at 15 fps.
+        for seq in from..from + 270 {
+            feed_parked(&mut tracker, seq, &no_extra, &parked_wheels);
+        }
+        let inert = tracker.inertial.as_ref().unwrap();
+        assert_eq!(
+            tracker.world_generation(),
+            1,
+            "one alignment, no refinement wipe"
+        );
+        assert!(
+            !inert.stats.first_refinement_done && !inert.stats.second_refinement_done,
+            "a refinement was spent on the parked window"
+        );
+        assert_eq!(inert.stats.init_attempts, 0, "no solve ran while parked");
+        assert!(inert.static_hold.is_some());
+        assert!(up_error_deg(&tracker) < 0.5);
+    }
+
+    /// The hold's release: the camera moving 0.2 m from the still window's newest keyframe
+    /// re-arms the refinement window at the moving keyframe's predecessor, stamped at its edge's
+    /// start, so the 5 s / 15 s schedule counts from the motion. Below the threshold nothing
+    /// changes.
+    ///
+    /// Mutation: re-arming at the held keyframe instead of the edge into the newest turned this
+    /// red.
+    #[test]
+    fn test_motion_releases_the_static_hold_and_restarts_the_refinement_clock() {
+        let mut tracker = tracker_with_inertial_ba(true);
+        tracker.epoch_ns = Some(EPOCH_NS);
+        for (i, x) in [(0, 0.0), (1, 0.0), (2, 0.05)] {
+            tracker
+                .map
+                .insert_keyframe(bare_keyframe(i, Vec3F64::new(x, 0.0, 0.0)))
+                .expect("a fresh keyframe id");
+        }
+        let edge = |prev: usize, curr: usize, t0: f64, t1: f64| ImuFactor {
+            prev_kf_idx: prev,
+            curr_kf_idx: curr,
+            preintegrated: PreintegratedImu::new(ImuBias::default(), inertial_config().calib),
+            raw_samples: Vec::new(),
+            t0,
+            t1,
+        };
+        let mut inert = tracker.inertial.take().unwrap();
+        inert.static_hold = Some(1);
+        inert.start_kf_idx = Some(0);
+        inert.window_start_sec = Some(0.0);
+
+        // Keyframe 2: 5 cm from the held one. Held.
+        tracker
+            .map
+            .apply_insertion(MapInsertion {
+                imu_factors: vec![edge(1, 2, 1.0, 2.0)],
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!tracker.release_static_hold(&mut inert, 2.0));
+        assert_eq!(inert.static_hold, Some(1));
+        assert_eq!(inert.start_kf_idx, Some(0));
+
+        // Keyframe 3: 0.4 m away. Released, re-armed at keyframe 2 from t = 2.0.
+        tracker
+            .map
+            .insert_keyframe(bare_keyframe(3, Vec3F64::new(0.4, 0.0, 0.0)))
+            .expect("a fresh keyframe id");
+        tracker
+            .map
+            .apply_insertion(MapInsertion {
+                imu_factors: vec![edge(2, 3, 2.0, 3.0)],
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(tracker.release_static_hold(&mut inert, 3.0));
+        assert_eq!(inert.static_hold, None);
+        assert_eq!(inert.start_kf_idx, Some(2));
+        assert_eq!(inert.window_start_sec, Some(2.0));
+    }
+
+    /// Finding 2: a carried alignment does not carry a velocity from before the drop. A robot
+    /// that drove into a `max_keyframes` drop at 0.5 m/s, then sat in the dark (the bootstrap
+    /// failing for 2 s) and parked, resumes on the new map at the velocity the wheels measure at
+    /// the bootstrap, ~0, with the alignment and no extra generation bump.
+    ///
+    /// Mutation: seeding the anchor from the pre-drop `velocity_world` (the original carry)
+    /// turned this red at 0.5 m/s.
+    #[test]
+    fn test_a_carried_alignment_takes_the_bootstrap_velocity_not_the_stale_one() {
+        let mut tracker = scene_tracker_with(|c| {
+            c.inertial = Some(static_inertial_config());
+            c.wheel_odom = Some(scene_wheel_config());
+        });
+        let from = park_until_static_init(&mut tracker);
+        for seq in from..from + 5 {
+            feed_parked(&mut tracker, seq, &no_extra, &parked_wheels);
+        }
+        // The drop arrives with the tracker believing it is moving.
+        tracker.state.velocity_world = Vec3F64::new(0.5, 0.0, 0.0);
+        tracker.reset_keeping_calibration();
+        let generation = tracker.world_generation();
+        let from = from + 5;
+        for seq in from..from + 30 {
+            feed_parked_frame(&mut tracker, seq, &no_extra, &parked_wheels, true);
+            assert!(
+                !tracker.state.imu_initialized,
+                "no map, nothing initialized"
+            );
+        }
+        let mut resumed = None;
+        for seq in from + 30..from + 40 {
+            feed_parked(&mut tracker, seq, &no_extra, &parked_wheels);
+            if tracker.state.imu_initialized {
+                resumed = Some(tracker.state.velocity_world);
+                break;
+            }
+        }
+        let v = resumed.expect("the alignment carried into the new map");
+        assert!(v.length() < 0.01, "anchor velocity {v:?}");
+        let inert = tracker.inertial.as_ref().unwrap();
+        assert_eq!(
+            inert.stats.static_accepted, 1,
+            "carried, not re-initialized"
+        );
+        assert_eq!(inert.stats.carry_dropped, 0);
+        assert_eq!(
+            tracker.world_generation(),
+            generation,
+            "no bump beyond the drop's"
+        );
+        let anchor = tracker.map.keyframes().first().unwrap();
+        assert!(
+            anchor.velocity_world.length() < 0.01,
+            "{:?}",
+            anchor.velocity_world
+        );
+    }
+
+    /// Finding 2, the fallback: with no wheel velocity at the re-bootstrap (here, wheel readings
+    /// stop at the drop) the alignment is dropped rather than resumed on a guess, and the still
+    /// window initializes again.
+    ///
+    /// Mutation: adopting the alignment with a zero velocity when none is measured turned this
+    /// red.
+    #[test]
+    fn test_a_carried_alignment_without_a_wheel_velocity_re_initializes() {
+        let mut tracker = scene_tracker_with(|c| {
+            c.inertial = Some(static_inertial_config());
+            c.wheel_odom = Some(scene_wheel_config());
+        });
+        let from = park_until_static_init(&mut tracker);
+        tracker.reset_keeping_calibration();
+        let generation = tracker.world_generation();
+        // Frames resume 30 s later, the wheel ring holding nothing near them.
+        let from = from + 450;
+        let mut stamp_wheels = false;
+        for seq in from..from + 60 {
+            let stamp = EPOCH_NS + u64::from(seq) * FRAME_NS;
+            let prev = EPOCH_NS + u64::from(seq - 1) * FRAME_NS;
+            let samples = parked_imu(&tracker, Some(prev), stamp, no_extra);
+            tracker.push_raw_imu(samples, 0, false).unwrap();
+            if stamp_wheels {
+                tracker
+                    .push_wheel([WheelSample {
+                        stamp_ns: stamp,
+                        x: 0.0,
+                        y: 0.0,
+                        theta: 0.0,
+                    }])
+                    .unwrap();
+            }
+            let (left, right, _) = scene_pair(0);
+            tracker
+                .process_stereo(&left, &right, CuTime::from_nanos(stamp))
+                .expect("a valid pair");
+            // Readings return after the bootstrap, so the still window can vouch for the base.
+            stamp_wheels = true;
+        }
+        let inert = tracker.inertial.as_ref().unwrap();
+        assert_eq!(inert.stats.carry_dropped, 1);
+        assert_eq!(inert.stats.static_accepted, 2, "the still window ran again");
+        assert!(tracker.state.imu_initialized);
+        assert_eq!(
+            tracker.world_generation(),
+            generation + 1,
+            "re-init is a reset"
+        );
+    }
+
+    /// A keyframe for the bare-map tests that counts as stereo.
+    fn stereo_bare_keyframe(idx: usize, centre: Vec3F64) -> Keyframe {
+        let mut frame = bare_keyframe(idx, centre).frame;
+        frame.features = kornia_imgproc::features::OrbFeatures {
+            keypoints_xy: vec![[10.0, 10.0]],
+            orientations: vec![0.0],
+            descriptors: vec![[0u8; 32]],
+            octaves: vec![0],
+        };
+        frame.keypoint_colors = vec![[0; 3]];
+        frame.u_right = vec![5.0];
+        frame.depth = vec![2.0];
+        Keyframe::from_frame(frame)
+    }
+
+    /// Finding 4: a robot that drove 0.1 m/s, stopped, and initialized from the still window
+    /// gives the keyframes it drove through their visual velocity, not the zero the still window
+    /// writes, so the IMU edges spanning that motion do not enter VI-BA claiming rest at both
+    /// ends. The still keyframes stay at zero, and every keyframe takes the new bias.
+    ///
+    /// Mutation: applying from the still window's first keyframe only (the original behaviour)
+    /// turned this red.
+    #[test]
+    fn test_keyframes_before_the_still_window_get_their_visual_velocity() {
+        let mut config = TrackerConfig::new(Length::new::<meter>(0.075));
+        config.inertial = Some(static_inertial_config());
+        let mut tracker = Tracker::new(rectified_camera(), config);
+        tracker.epoch_ns = Some(EPOCH_NS);
+        const STEP_NS: u64 = 250_000_000;
+        let stamp = |i: usize| EPOCH_NS + 1_000_000_000 + i as u64 * STEP_NS;
+        // 0..=3 drive 2.5 cm per keyframe (0.1 m/s), 3..=8 sit still.
+        let x = |i: usize| 0.025 * i.min(3) as f64;
+        for i in 0..9 {
+            tracker
+                .map
+                .insert_keyframe(stereo_bare_keyframe(i, Vec3F64::new(x(i), 0.0, 0.0)))
+                .unwrap_or_else(|e| panic!("kf {i}: {e}"));
+        }
+        let n = (9 * STEP_NS / IMU_PERIOD_NS) as usize + 10;
+        let samples: Vec<RawImuSample> = (0..n)
+            .map(|k| {
+                let j = k as f64;
+                RawImuSample {
+                    stamp_ns: stamp(0) + k as u64 * IMU_PERIOD_NS,
+                    gyro: [0.002, -0.001, 0.0015],
+                    accel: [0.01 * (1.7 * j).sin(), 9.81, 0.01 * (2.9 * j).sin()],
+                }
+            })
+            .collect();
+        tracker.push_raw_imu(samples, 0, false).unwrap();
+        tracker.arm_inertial_window(0, 1.0, stamp(0));
+        for i in 1..9 {
+            tracker.state.last_keyframe_idx = Some(i);
+            tracker.on_keyframe_inertial(Some((i - 1, stamp(i - 1))), i, stamp(i));
+        }
+        assert!(
+            tracker.state.imu_initialized,
+            "the still window initialized"
+        );
+        let inert = tracker.inertial.as_ref().unwrap();
+        assert_eq!(inert.stats.static_accepted, 1);
+        assert_eq!(inert.stats.init_attempts, 0, "the motion solve never ran");
+        let bias = inert.bias;
+        for kf in tracker.map.keyframes() {
+            let speed = kf.velocity_world.length();
+            match kf.frame.idx {
+                0..=2 => assert!(
+                    (speed - 0.1).abs() < 1e-6,
+                    "kf {} drove at 0.1 m/s, has {speed}",
+                    kf.frame.idx
+                ),
+                3 => {}
+                _ => assert!(speed < 1e-9, "still kf {} has {speed}", kf.frame.idx),
+            }
+            assert_eq!(kf.imu_bias.gyro, bias.gyro, "kf {}", kf.frame.idx);
+        }
+    }
+
+    /// Finding 6: a stationary result the map refuses is not retried on every keyframe. The
+    /// still window is searched again only after `init_retry` (5 s), as the motion solve is.
+    ///
+    /// Mutation: dropping the `static_map_refused_at` throttle turned this red (one refusal per
+    /// keyframe).
+    #[test]
+    fn test_a_map_refused_static_init_is_throttled() {
+        let mut tracker = scene_tracker_with(|c| {
+            c.inertial = Some(static_inertial_config());
+            c.wheel_odom = Some(scene_wheel_config());
+        });
+        tracker.inertial.as_mut().unwrap().refuse_static_alignment = true;
+        let mut first_refusal = None;
+        for seq in 0..120 {
+            feed_parked(&mut tracker, seq, &no_extra, &parked_wheels);
+            let inert = tracker.inertial.as_ref().unwrap();
+            if inert.stats.init_apply_refused > 0 && first_refusal.is_none() {
+                first_refusal = Some((seq, tracker.map.keyframes().len()));
+            }
+        }
+        let (seq0, kfs0) = first_refusal.expect("the map refused the still window");
+        let inert = tracker.inertial.as_ref().unwrap();
+        let elapsed_s = f64::from(120 - seq0) * FRAME_NS as f64 * 1e-9;
+        let kfs_since = tracker.map.keyframes().len() - kfs0;
+        assert!(kfs_since > 3, "too few keyframes to tell: {kfs_since}");
+        let allowed = 1 + (elapsed_s / 5.0).floor() as u64;
+        assert!(
+            inert.stats.init_apply_refused <= allowed,
+            "{} map refusals in {elapsed_s:.1} s over {kfs_since} keyframes",
+            inert.stats.init_apply_refused
+        );
+        assert!(!tracker.state.imu_initialized);
+        assert_eq!(tracker.world_generation(), 0);
     }
 }

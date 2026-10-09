@@ -735,6 +735,9 @@ pub struct InertialStats {
     pub static_accepted: u64,
     /// Keyframes on which a still window was looked for and not found, or refused.
     pub static_refused: u64,
+    /// Carried alignments given up at the re-bootstrap because no wheel velocity was available
+    /// for the new anchor; each one is followed by a fresh initialization.
+    pub carry_dropped: u64,
     /// Whether visual-inertial initialization has succeeded.
     pub initialized: bool,
     /// Whether the first inertial refinement pass (after ~5 s of initialized tracking) has run.

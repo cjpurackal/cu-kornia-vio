@@ -77,7 +77,15 @@ impl StaticInitConfig {
     /// measured on a BNO086 (0.0031 rad/s). `gravity_tolerance` 0.3 m/s^2 is 3 % of g: an
     /// accelerometer scale error is well inside it, a robot braking at 0.3 m/s^2 is not. The wheel
     /// floors (5 mm, 0.01 rad) are NET motion, so encoder jitter does not accumulate. The camera
-    /// floors (1 cm, 1 deg) are ~50x the drift measured on a parked robot's keyframes (0.2 mm).
+    /// translation floor (1 cm) is ~50x the drift measured on a parked robot's keyframes (0.2 mm).
+    ///
+    /// The camera ROTATION floor (0.25 deg) is the one that bounds the gyro bias. Nothing else ties
+    /// the gyro to the visual track: a rotation the wheels cannot see (a head pan, a slow base turn
+    /// with the wheel feed off) at under `gyro_mean_max` has no spread and passes the IMU checks,
+    /// and its rate would be written as gyro bias. Over the 1.2 s window 0.25 deg admits at most
+    /// ~0.0036 rad/s of unseen rotation, about the BNO086's own bias (0.0031), where 1 deg admitted
+    /// 0.0145, 5x it. Stereo keyframe attitude noise is hundredths of a degree, so a parked robot
+    /// still clears it; a refusal only falls through to the motion solve.
     pub fn from_noise(calib: &ImuCalib, rate: Frequency) -> Self {
         let per_sample = |density: f64| density * rate.get::<hertz>().sqrt() * 3f64.sqrt();
         Self {
@@ -89,7 +97,7 @@ impl StaticInitConfig {
             wheel_translation_max: 0.005,
             wheel_rotation_max: 0.01,
             camera_translation_max: 0.01,
-            camera_rotation_max: 1f64.to_radians(),
+            camera_rotation_max: 0.25f64.to_radians(),
         }
     }
 }
@@ -392,11 +400,12 @@ mod tests {
         assert_eq!(check_wheels(None, &c), Err(NotStill::WheelsSilent));
     }
 
-    /// Camera: keyframes at VO noise pass; a drift of centimetres or a rotation of degrees is
-    /// refused, whichever keyframe carries it.
+    /// Camera: keyframes at VO noise pass; a drift of centimetres, a rotation of degrees, or a
+    /// slow pan of one degree is refused, whichever keyframe carries it.
     ///
-    /// Mutation: comparing only against the FIRST keyframe instead of every one (the middle
-    /// keyframe's excursion passes) turned this red.
+    /// Mutations (each turned this red): comparing only against the FIRST keyframe instead of
+    /// every one (the middle keyframe's excursion passes); the original 1 deg rotation floor (the
+    /// slow pan passes).
     #[test]
     fn camera_check_refuses_a_moving_track() {
         let c = cfg();
@@ -417,6 +426,14 @@ mod tests {
         ));
         assert!(matches!(
             check_camera(&[at(0.0, 0.0), at(0.0, 0.1), at(0.0, 0.0)], &c),
+            Err(NotStill::CameraMoved { .. })
+        ));
+        // A head pan at 0.0145 rad/s over 1.2 s: 1 deg, under `gyro_mean_max` and invisible to the
+        // wheels, so the camera is the only check that sees it. Its rate must not become bias.
+        let pan = 0.0145 * 1.2;
+        assert!(pan < 1f64.to_radians());
+        assert!(matches!(
+            check_camera(&[at(0.0, 0.0), at(0.0, pan / 2.0), at(0.0, pan)], &c),
             Err(NotStill::CameraMoved { .. })
         ));
         assert_eq!(check_camera(&[], &c), Ok(()));

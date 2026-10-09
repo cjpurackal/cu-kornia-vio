@@ -177,13 +177,23 @@ what the configured noise densities predict, the mean rate stays under a plausib
 the wheels (when `wheel_odom` is on) report no net motion and the keyframes agree on the camera
 pose. Finding one, it takes gravity from the mean specific force, the gyro bias from the mean
 rate and zero velocity, and rotates the map onto gravity exactly as a motion initialization
-does, bumping `reset_epoch`. The accelerometer bias is unobservable at rest and stays at its
-prior. A window that is not still falls through to the motion initializer on the same keyframe.
+does, bumping `reset_epoch`. The accelerometer bias across gravity is unobservable at rest and
+stays at its prior; along gravity it is corrected by `|f| - g`. Keyframes of the window before
+the still one get their finite-difference visual velocity. A window that is not still falls
+through to the motion initializer on the same keyframe; one the map refuses is not retried for
+`init_retry`. The camera must hold its attitude to 0.25 deg across the window, which is what
+keeps a head pan or a slow turn the wheels cannot see out of the gyro bias.
+
+After a static initialization the two refinements wait until the camera has moved 0.2 m or
+turned 10 deg, and are then scheduled (5 s, 15 s) from that moment: on parked data they would only
+rotate the world again and bump `reset_epoch` for nothing.
 
 A map drop that keeps the world (with wheels, or a loss with `keep_map`) keeps the alignment: the
 next map is inertial from its first keyframe, with no new rotation and no extra `reset_epoch`
-bump. A drop that restarts the world at identity runs the still window (or the motion solve)
-again.
+bump. Its anchor velocity is measured from the last 0.2 s of wheel odometry at the re-bootstrap,
+never carried from before the drop; with no wheel velocity available the alignment is dropped
+and the inertial path initializes again. A drop that restarts the world at identity runs the
+still window (or the motion solve) again.
 
 ## Wheel odometry
 
