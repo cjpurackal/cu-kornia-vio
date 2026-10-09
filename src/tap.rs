@@ -6,8 +6,9 @@
 //! latest frame's [`VioDiagnostics`], its stereo pair (a refcount on the camera's buffers, never a
 //! copy) and its classified keypoints; the inline [`VioTapSource`] emits them into the graph.
 //!
-//! Latest wins: a record the source has not taken when the next frame lands is overwritten and
-//! counted. The source polls every copperlist (5 ms on the head graph) against a ~10 Hz tracker, so
+//! Latest wins, unless it is milder: a record the source has not taken when the next frame lands
+//! is overwritten and counted, except that an unread loss (or other vision failure) is kept over a
+//! less severe newer frame, so a reader keyed on state edges still sees it. The source polls every copperlist (5 ms on the head graph) against a ~10 Hz tracker, so
 //! that count is a stalled main loop, not a design rate.
 //!
 //! Inert until a source arms it: an unarmed tap is one atomic load per frame and retains no camera
@@ -49,7 +50,7 @@ pub struct VioTap {
     frames: AtomicBool,
     /// Records written; a reader compares against the last value it took.
     published: AtomicU64,
-    /// Records overwritten before anyone took them.
+    /// Records lost unread: overwritten, or dropped behind a more severe unread one.
     overwritten: AtomicU64,
     slot: Mutex<Slot>,
 }
@@ -77,7 +78,7 @@ impl VioTap {
         self.published.load(Ordering::Acquire)
     }
 
-    /// Records overwritten before a consumer took them.
+    /// Records lost before a consumer took them (overwritten, or dropped behind a worse one).
     pub fn overwritten(&self) -> u64 {
         self.overwritten.load(Ordering::Relaxed)
     }
@@ -101,8 +102,15 @@ impl VioTap {
         }
         let keep_frame = self.frames.load(Ordering::Relaxed);
         let mut slot = self.lock();
-        if slot.diag.is_some() {
+        if let Some((_, unread)) = &slot.diag {
             self.overwritten.fetch_add(1, Ordering::Relaxed);
+            // A one-frame loss must not vanish under the next tracked frame before anyone read
+            // it: the reader acts on state EDGES, and this is the edge.
+            if severity(unread) > severity(&diag) {
+                drop(slot);
+                self.published.fetch_add(1, Ordering::Release);
+                return;
+            }
         }
         slot.diag = Some((tov, diag));
         slot.frame = keep_frame.then(|| frame.clone());
@@ -122,6 +130,18 @@ impl VioTap {
         let diag = slot.diag.take();
         let frame = slot.frame.take();
         f(diag, frame, &slot.features)
+    }
+}
+
+/// How bad a record is, for which of two unread records the slot keeps: a loss, then a
+/// re-anchor, then any other vision failure (a coast or an unanchored frame), then the rest.
+fn severity(d: &VioDiagnostics) -> u8 {
+    use cu_stereo_payloads::{FailureReason, TrackingState};
+    match d.state {
+        TrackingState::Lost => 3,
+        TrackingState::Recovering => 2,
+        _ if d.failure != FailureReason::None => 1,
+        _ => 0,
     }
 }
 
@@ -367,5 +387,66 @@ mod tests {
         }
         assert_eq!(tap.overwritten(), 2);
         assert_eq!(tick(&mut src).0.payload().map(|d| d.seq), Some(3));
+    }
+
+    /// A one-frame loss the source has not read survives the tracked frames behind it; a worse
+    /// state replaces a milder unread one; once read, the slot is latest-wins again.
+    #[test]
+    fn test_an_unread_loss_is_not_overwritten_by_a_milder_frame() {
+        use cu_stereo_payloads::FailureReason;
+        let tap = Arc::new(VioTap::new());
+        let mut src = source(&tap);
+        let d = |seq, state, failure| VioDiagnostics {
+            seq,
+            state,
+            failure,
+            ..Default::default()
+        };
+        tap.publish(
+            Tov::None,
+            d(1, TrackingState::Tracking, FailureReason::None),
+            &pair(),
+            &[],
+        );
+        tap.publish(
+            Tov::None,
+            d(2, TrackingState::Coasting, FailureReason::PnpFailed),
+            &pair(),
+            &[],
+        );
+        tap.publish(
+            Tov::None,
+            d(3, TrackingState::Lost, FailureReason::PnpFailed),
+            &pair(),
+            &[],
+        );
+        tap.publish(
+            Tov::None,
+            d(4, TrackingState::Tracking, FailureReason::None),
+            &pair(),
+            &[],
+        );
+        tap.publish(
+            Tov::None,
+            d(5, TrackingState::Coasting, FailureReason::PnpFailed),
+            &pair(),
+            &[],
+        );
+        assert_eq!(tap.overwritten(), 4);
+        assert_eq!(
+            tick(&mut src).0.payload().map(|d| (d.seq, d.state)),
+            Some((3, TrackingState::Lost))
+        );
+        tap.publish(
+            Tov::None,
+            d(6, TrackingState::Tracking, FailureReason::None),
+            &pair(),
+            &[],
+        );
+        assert_eq!(
+            tick(&mut src).0.payload().map(|d| d.seq),
+            Some(6),
+            "a new record after the read is emitted"
+        );
     }
 }
