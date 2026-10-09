@@ -109,6 +109,7 @@ use kornia_slam::tracking::{
     select_local_map_points,
 };
 
+use crate::consistency::{ConsistencyStats, IntervalMotion, MotionVerdict};
 use crate::error::VioError;
 use crate::imu::{
     ImuBuffer, ImuWindowError, InertialConfig, InertialStats, RawImuSample, WindowExcitation,
@@ -829,7 +830,23 @@ pub struct Tracker {
     /// inertial alignment then pivots on the robot, not on the world origin; see
     /// [`Self::apply_inertial_init`].
     map_carried: bool,
+    /// Each recent keyframe's TRACKED pose at insertion, before any BA moved it, with the world
+    /// generation it was tracked in: vision's own word for the motion check
+    /// ([`crate::consistency`]). A BA-refined keyframe already leans on the gyro and the wheels
+    /// it is being compared with.
+    kf_tracked_poses: std::collections::VecDeque<(usize, u64, Pose3d)>,
+    /// Keyframe intervals `(from, to)` vision disagreed with the wheels and the gyro on. Local
+    /// BA is skipped while one ends at a free keyframe: it would explain frozen vision with a
+    /// gyro bias.
+    vision_suspect: std::collections::VecDeque<(usize, usize)>,
+    consistency: ConsistencyStats,
+    /// When a motion-consistency line last spoke; see [`should_log_throttled`].
+    last_consistency_log: Option<(f64, bool)>,
 }
+
+/// Keyframe tracked poses kept for the motion check: the pending wheel intervals (8) plus the
+/// factors that can still act (16), with slack.
+const KF_TRACKED_POSES: usize = 32;
 
 impl Tracker {
     /// Creates a tracker for a **rectified, zero-distortion** camera.
@@ -921,6 +938,10 @@ impl Tracker {
             frame_on_wheels: false,
             world_anchored: false,
             map_carried: false,
+            kf_tracked_poses: std::collections::VecDeque::new(),
+            vision_suspect: std::collections::VecDeque::new(),
+            consistency: ConsistencyStats::default(),
+            last_consistency_log: None,
         }
     }
 
@@ -1522,6 +1543,9 @@ impl Tracker {
         if let Some(w) = self.wheel.as_mut() {
             w.reset_map();
         }
+        // Their keyframe indices name keyframes of the dropped map.
+        self.kf_tracked_poses.clear();
+        self.vision_suspect.clear();
         self.map = Map::new();
         self.state = SystemState::new();
         if carry {
@@ -2354,16 +2378,38 @@ impl Tracker {
         // older keyframe for the same reason.
         // The wheel interval this keyframe closes, queued even when BA does not run: a factor
         // is keyed by `Frame::idx` and acts in every later solve whose window holds both ends.
-        let wheel_factors: Vec<WheelOdomFactor> = match self.wheel.as_mut() {
-            Some(w) => {
-                w.on_keyframe(prev_edge, frame.idx, stamp_ns);
-                w.factors().to_vec()
+        // Vision's word for this keyframe, before BA leans it on the gyro and the wheels.
+        if let Some(kf) = self.map.keyframes().last() {
+            self.kf_tracked_poses.push_back((
+                kf.frame.idx,
+                self.world_generation,
+                kf.frame.pose_world_to_cam,
+            ));
+            while self.kf_tracked_poses.len() > KF_TRACKED_POSES {
+                self.kf_tracked_poses.pop_front();
             }
+        }
+        let new_wheel_factors = match self.wheel.as_mut() {
+            Some(w) => w.on_keyframe(prev_edge, frame.idx, stamp_ns),
             None => Vec::new(),
         };
+        for (from_idx, to_idx) in self.check_motion(&new_wheel_factors, timestamp_sec) {
+            if let Some(w) = self.wheel.as_mut() {
+                w.drop_factor(from_idx, to_idx);
+            }
+        }
+        let wheel_factors: Vec<WheelOdomFactor> = self
+            .wheel
+            .as_ref()
+            .map_or_else(Vec::new, |w| w.factors().to_vec());
 
-        let ran_ba =
+        let ba_window_ready =
             self.config.enable_local_ba && self.map.keyframes().len() > BA_ACTIVE_KEYFRAMES;
+        let vision_suspect = ba_window_ready && self.vision_suspect_in_ba_window();
+        if vision_suspect {
+            self.consistency.ba_skipped += 1;
+        }
+        let ran_ba = ba_window_ready && !vision_suspect;
         if ran_ba {
             // kornia-slam's only BA entry points solve a `BaSnapshot` and hand back an update
             // for `apply_ba_update` to validate and write. `local_window` is the selection
@@ -2493,6 +2539,137 @@ impl Tracker {
             self.map.keyframes().len()
         );
         true
+    }
+
+    // ── Motion consistency ───────────────────────────────────────────────────
+
+    /// Checks each wheel factor just integrated against the gyro and vision over the same
+    /// keyframe interval ([`crate::consistency`]): counts the verdict, remembers an interval
+    /// vision disagreed on, and returns the intervals whose wheel factor must be dropped.
+    fn check_motion(
+        &mut self,
+        factors: &[WheelOdomFactor],
+        timestamp_sec: f64,
+    ) -> Vec<(usize, usize)> {
+        let mut slipped = Vec::new();
+        for f in factors {
+            let Some(motion) = self.interval_motion(f) else {
+                continue;
+            };
+            let verdict = motion.verdict();
+            let translation = motion.translation_disagrees();
+            self.consistency.count(verdict, translation);
+            match verdict {
+                MotionVerdict::VisionDisagrees => {
+                    self.vision_suspect.push_back((f.from_idx, f.to_idx));
+                    while self.vision_suspect.len() > KF_TRACKED_POSES {
+                        self.vision_suspect.pop_front();
+                    }
+                }
+                MotionVerdict::WheelsDisagree => slipped.push((f.from_idx, f.to_idx)),
+                _ => {}
+            }
+            let notable = translation
+                || !matches!(
+                    verdict,
+                    MotionVerdict::Consistent | MotionVerdict::Inconclusive
+                );
+            if notable
+                && should_log_throttled(
+                    self.last_consistency_log,
+                    timestamp_sec,
+                    true,
+                    LOSS_LOG_RETRY_SEC,
+                )
+            {
+                self.last_consistency_log = Some((timestamp_sec, true));
+                let deg = |r: &Mat3F64| crate::consistency::angle(r).to_degrees();
+                let action = match verdict {
+                    MotionVerdict::VisionDisagrees => {
+                        "tracking DEGRADED, local BA skipped while it is in the window"
+                    }
+                    MotionVerdict::WheelsDisagree => "wheel slip, the interval's factor dropped",
+                    MotionVerdict::GyroDisagrees => "gyro bias or extrinsic suspect, counted only",
+                    _ => "translation only, counted only (slip and frozen vision look alike)",
+                };
+                let c = self.consistency;
+                warning!(
+                    "motion check: {}: kf {}->{} wheels_deg={} gyro_deg={} vision_deg={} \
+                     wheels_m={} vision_m={} (checked={} vision={} wheels={} gyro={} \
+                     translation={})",
+                    action,
+                    f.from_idx,
+                    f.to_idx,
+                    deg(&motion.wheels.rotation),
+                    motion.gyro.as_ref().map_or(f64::NAN, deg),
+                    deg(&motion.vision.rotation),
+                    motion.wheels.translation.length(),
+                    motion.vision.translation.length(),
+                    c.checked,
+                    c.vision_disagrees,
+                    c.wheels_disagree,
+                    c.gyro_disagrees,
+                    c.translation_disagrees
+                );
+            }
+        }
+        slipped
+    }
+
+    /// The interval a wheel factor spans, as the wheels, vision (the keyframes' tracked poses)
+    /// and the gyro (the interval's IMU edge, at the current bias) saw it. `None` when either
+    /// tracked pose is gone or from another world.
+    fn interval_motion(&self, f: &WheelOdomFactor) -> Option<IntervalMotion> {
+        let tracked = |idx: usize| {
+            self.kf_tracked_poses
+                .iter()
+                .find(|(i, g, _)| *i == idx && *g == self.world_generation)
+                .map(|(_, _, p)| *p)
+        };
+        let (p0, p1) = (tracked(f.from_idx)?, tracked(f.to_idx)?);
+        let gyro = self.inertial.as_ref().and_then(|inert| {
+            let r_bc = inert.cfg.imu_t_bc.rotation;
+            self.map
+                .imu_factors()
+                .iter()
+                .find(|e| e.prev_kf_idx == f.from_idx && e.curr_kf_idx == f.to_idx)
+                .map(|e| {
+                    let p = &e.preintegrated;
+                    let db = inert.bias.gyro - p.bias.gyro;
+                    let r_b = p.delta_rotation
+                        * kornia_algebra::SO3F64::exp(p.d_rotation_d_bias_gyro * db).matrix();
+                    r_bc.transpose() * r_b * r_bc
+                })
+        });
+        Some(IntervalMotion {
+            wheels: f
+                .t_cb_from
+                .compose(&f.measurement.delta_pose())
+                .compose(&f.t_cb_to.inverse()),
+            vision: p0.compose(&p1.inverse()),
+            gyro,
+        })
+    }
+
+    /// Whether an interval vision disagreed on ends at a keyframe local BA would free. Prunes
+    /// the ones that have left the window for good.
+    fn vision_suspect_in_ba_window(&mut self) -> bool {
+        let kfs = self.map.keyframes();
+        let Some(oldest_free) = kfs
+            .len()
+            .checked_sub(BA_ACTIVE_KEYFRAMES)
+            .and_then(|i| kfs.get(i))
+            .map(|kf| kf.frame.idx)
+        else {
+            return false;
+        };
+        self.vision_suspect.retain(|&(_, to)| to >= oldest_free);
+        !self.vision_suspect.is_empty()
+    }
+
+    /// The motion-consistency counters; see [`crate::consistency`].
+    pub fn consistency_stats(&self) -> ConsistencyStats {
+        self.consistency
     }
 
     // ── Inertial ─────────────────────────────────────────────────────────────
@@ -6685,5 +6862,151 @@ mod tests {
         );
         assert!(!tracker.state.imu_initialized);
         assert_eq!(tracker.world_generation(), 0);
+    }
+
+    // ── Motion consistency ───────────────────────────────────────────────────
+
+    /// The scene's base yaw axis in the camera: `scene_wheel_config` mounts the camera with
+    /// base +z along camera -y.
+    fn base_up_in_cam() -> Vec3F64 {
+        Vec3F64::new(0.0, -1.0, 0.0)
+    }
+
+    /// A frame of FROZEN vision (the scene's first pair, as a head pointed at the robot's own
+    /// body sees) after the IMU samples up to it, the gyro turning the base at `gyro_rad_s`, and
+    /// a wheel reading at heading `wheel_theta(seq)`.
+    fn feed_frozen_turn(
+        tracker: &mut Tracker,
+        seq: u32,
+        gyro_rad_s: f64,
+        wheel_theta: &dyn Fn(u32) -> f64,
+    ) {
+        let stamp = EPOCH_NS + u64::from(seq) * FRAME_NS;
+        let from = seq
+            .checked_sub(1)
+            .map(|p| EPOCH_NS + u64::from(p) * FRAME_NS);
+        let r_bc = tracker.inertial.as_ref().unwrap().cfg.imu_t_bc.rotation;
+        let turn = r_bc * (base_up_in_cam() * gyro_rad_s);
+        let mut samples = parked_imu(tracker, from, stamp, no_extra);
+        for s in &mut samples {
+            s.gyro = [s.gyro[0] + turn.x, s.gyro[1] + turn.y, s.gyro[2] + turn.z];
+        }
+        tracker.push_raw_imu(samples, 0, false).unwrap();
+        tracker
+            .push_wheel([WheelSample {
+                stamp_ns: stamp,
+                x: 0.0,
+                y: 0.0,
+                theta: wheel_theta(seq),
+            }])
+            .unwrap();
+        let (left, right, _) = scene_pair(0);
+        tracker
+            .process_stereo(&left, &right, CuTime::from_nanos(stamp))
+            .expect("a valid pair");
+    }
+
+    /// THE LOOP TEST, synthetic: the base turns at 0.3 rad/s, the wheels and the gyro both say
+    /// so, and vision is frozen. The check calls vision the odd one out and holds local BA off
+    /// while such an interval is in its window: no solve reconciles the three by bending the
+    /// keyframes or the bias (on the robot it put the turn rate into the gyro bias), every
+    /// keyframe of the frozen turn keeps the pose vision tracked, and the bias the next edge is
+    /// linearized at is the parked one.
+    ///
+    /// Mutation: running local BA regardless (`ran_ba = ba_window_ready`) turned this red (the
+    /// solves moved the turn's keyframes off their tracked poses).
+    #[test]
+    fn test_frozen_vision_in_a_turn_holds_local_ba_off() {
+        const RATE: f64 = 0.3;
+        let mut tracker = scene_tracker_with(|c| {
+            c.inertial = Some(static_inertial_config());
+            c.wheel_odom = Some(scene_wheel_config());
+        });
+        let start = park_until_static_init(&mut tracker);
+        let refused_before = tracker.ba_updates_refused();
+        let t = |seq: u32| f64::from(seq - start) * FRAME_NS as f64 * 1e-9;
+        for seq in start..start + 60 {
+            feed_frozen_turn(&mut tracker, seq, RATE, &|s| RATE * t(s));
+        }
+        let c = tracker.consistency_stats();
+        assert!(c.vision_disagrees >= 2, "{c:?}");
+        assert_eq!(c.wheels_disagree, 0, "{c:?}");
+        assert!(c.ba_skipped >= 2, "{c:?}");
+        assert_eq!(
+            tracker.ba_updates_refused(),
+            refused_before,
+            "a solve over frozen vision ran and proposed a bias"
+        );
+        let inert = tracker.inertial.as_ref().unwrap();
+        let bg_err = (inert.bias.gyro - Vec3F64::from_array(PARKED_GYRO_BIAS)).length();
+        assert!(bg_err < 5e-3, "gyro bias moved by {bg_err} rad/s");
+        // Past the first interval (which straddles the start of the turn), nothing moved them.
+        let mut checked = 0;
+        for kf in tracker.map().keyframes() {
+            if kf.frame.idx <= start as usize + 8 {
+                continue;
+            }
+            let (_, _, tracked) = tracker
+                .kf_tracked_poses
+                .iter()
+                .find(|(i, _, _)| *i == kf.frame.idx)
+                .expect("a recent keyframe");
+            assert_eq!(
+                pose_bits(&kf.frame.pose_world_to_cam),
+                pose_bits(tracked),
+                "kf {} was moved by BA",
+                kf.frame.idx
+            );
+            checked += 1;
+        }
+        assert!(checked >= 3, "{checked} keyframes in the frozen turn");
+    }
+
+    /// Wheels that report a 0.3 rad/s turn the gyro and vision do not see: slip (or a base
+    /// lifted off the floor). Every such interval's factor is dropped before a solve sees it,
+    /// and BA runs on (it is the wheels that are wrong).
+    ///
+    /// Mutation: not dropping the factor (`check_motion` returning nothing) turned this red.
+    #[test]
+    fn test_slipping_wheels_lose_their_factor() {
+        const RATE: f64 = 0.3;
+        let mut tracker = scene_tracker_with(|c| {
+            c.inertial = Some(static_inertial_config());
+            c.wheel_odom = Some(scene_wheel_config());
+        });
+        let start = park_until_static_init(&mut tracker);
+        let t = |seq: u32| f64::from(seq - start) * FRAME_NS as f64 * 1e-9;
+        for seq in start..start + 60 {
+            feed_frozen_turn(&mut tracker, seq, 0.0, &|s| RATE * t(s));
+        }
+        let c = tracker.consistency_stats();
+        assert!(c.wheels_disagree >= 2, "{c:?}");
+        assert_eq!((c.vision_disagrees, c.ba_skipped), (0, 0), "{c:?}");
+        let turning = tracker
+            .wheel
+            .as_ref()
+            .unwrap()
+            .factors()
+            .iter()
+            .filter(|f| f.measurement.delta[2].abs() > 0.05)
+            .count();
+        assert_eq!(turning, 0, "a slipping interval's factor reached BA");
+    }
+
+    /// Parked, all three agree: every checked interval is consistent and nothing is dropped.
+    #[test]
+    fn test_a_parked_robot_is_consistent() {
+        let mut tracker = scene_tracker_with(|c| {
+            c.inertial = Some(static_inertial_config());
+            c.wheel_odom = Some(scene_wheel_config());
+        });
+        let start = park_until_static_init(&mut tracker);
+        for seq in start..start + 40 {
+            feed_frozen_turn(&mut tracker, seq, 0.0, &|_| 0.0);
+        }
+        let c = tracker.consistency_stats();
+        assert!(c.checked >= 3, "{c:?}");
+        assert_eq!(c.consistent, c.checked, "{c:?}");
+        assert_eq!(c.ba_skipped, 0);
     }
 }

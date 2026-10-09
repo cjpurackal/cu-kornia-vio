@@ -34,6 +34,7 @@
 
 pub mod bus;
 pub mod config;
+pub mod consistency;
 pub mod error;
 pub mod feed;
 pub mod imu;
@@ -51,6 +52,7 @@ pub mod wheel_feed;
 
 pub use bus::VioBus;
 pub use config::OnTrackingLoss;
+pub use consistency::{ConsistencyStats, MotionVerdict};
 pub use error::VioError;
 pub use feed::ImuFeed;
 pub use imu::{BiasLimit, ImuGates, ImuWindowError, InertialConfig, InertialStats};

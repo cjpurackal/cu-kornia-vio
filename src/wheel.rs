@@ -520,8 +520,15 @@ impl WheelState {
     }
 
     /// Queues the interval a keyframe insertion closed, then integrates every queued interval
-    /// whose readings have arrived.
-    pub fn on_keyframe(&mut self, prev: Option<(usize, u64)>, to_idx: usize, to_ns: u64) {
+    /// whose readings have arrived. Returns the factors integrated by this call, for the motion
+    /// consistency check ([`crate::consistency`]), which may [`drop_factor`](Self::drop_factor)
+    /// one before any solve sees it.
+    pub fn on_keyframe(
+        &mut self,
+        prev: Option<(usize, u64)>,
+        to_idx: usize,
+        to_ns: u64,
+    ) -> Vec<WheelOdomFactor> {
         if let Some((from_idx, from_ns)) = prev {
             self.pending.push(PendingEdge {
                 from_idx,
@@ -531,6 +538,7 @@ impl WheelState {
             });
         }
         let mut still = Vec::new();
+        let first_new = self.factors.len();
         for e in std::mem::take(&mut self.pending) {
             match self.delta(e.from_ns, e.to_ns, 0) {
                 Ok(d) => {
@@ -552,8 +560,19 @@ impl WheelState {
         self.stats.edges_expired += expired as u64;
         still.drain(..expired);
         self.pending = still;
+        let added = self.factors[first_new..].to_vec();
         let excess = self.factors.len().saturating_sub(MAX_FACTORS);
         self.factors.drain(..excess);
+        added
+    }
+
+    /// Removes the factor between keyframes `from_idx` and `to_idx`, if one is held: the motion
+    /// check found the wheels disagreeing with the gyro and vision over it (slip).
+    pub fn drop_factor(&mut self, from_idx: usize, to_idx: usize) -> bool {
+        let before = self.factors.len();
+        self.factors
+            .retain(|f| !(f.from_idx == from_idx && f.to_idx == to_idx));
+        self.factors.len() < before
     }
 
     /// The integrated factors, keyed by `Frame::idx` as `run_local_inertial_ba` wants them.

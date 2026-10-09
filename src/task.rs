@@ -649,6 +649,22 @@ impl CuTask for StereoVio {
                 w.mounts_refused,
             );
         }
+        if let Some(t) = self.tracker.as_ref() {
+            let c = t.consistency_stats();
+            info!(
+                "vio motion check: {} intervals, {} consistent; vision disagreed {} (local BA \
+                 skipped {}), wheels disagreed {} (factor dropped), gyro disagreed {}, \
+                 inconclusive {}, translation disagreed {}",
+                c.checked,
+                c.consistent,
+                c.vision_disagrees,
+                c.ba_skipped,
+                c.wheels_disagree,
+                c.gyro_disagrees,
+                c.inconclusive,
+                c.translation_disagrees
+            );
+        }
         info!(
             "vio: {} landmark snapshots, {} keyframes without one (pool exhausted)",
             self.landmark_snapshots, self.landmark_pool_exhausted
