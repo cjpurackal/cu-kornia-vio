@@ -12,6 +12,7 @@ use kornia_sensors::imu::ImuCalib;
 
 use crate::error::VioError;
 use crate::imu::InertialConfig;
+use crate::stationary::StaticInitConfig;
 use crate::wheel::{WheelOdomConfig, mat3_from_rows};
 
 /// What the tracker does with its map after a sustained tracking loss: the `on_tracking_loss`
@@ -147,6 +148,95 @@ pub(crate) struct InertialRon {
     /// three published-pose jumps in the first 15 s of every run.
     #[serde(default)]
     pub enable_inertial_ba: bool,
+    /// Initialize while parked, from a still window; see [`StaticInitRon`]. Absent, the
+    /// inertial path waits for the robot to move, as it always has.
+    #[serde(default)]
+    pub static_init: Option<StaticInitRon>,
+}
+
+/// The `static_init` block inside `inertial`.
+///
+/// ```ron
+/// static_init: (
+///   enabled: true,
+///   // Optional; each defaults to the value derived in `StaticInitConfig::from_noise`.
+///   window_s: 1.2,            // contiguous IMU edges the still window must span
+///   accel_rms_max: 0.186,     // m/s^2, accelerometer vector spread
+///   gyro_rms_max: 0.0118,     // rad/s, gyroscope vector spread
+///   gyro_mean_max: 0.02,      // rad/s, largest believable gyro bias
+///   gravity_tolerance: 0.3,   // m/s^2, | |mean accel| - 9.81 |
+/// ),
+/// ```
+///
+/// Off unless `enabled`. The spread ceilings default to four times what the block's own noise
+/// densities predict at `rate_hz`, so a config with honest densities needs nothing else. Like the
+/// rest of `inertial`, it moves the world only with `enable_inertial_ba` on: with it off an
+/// accepted still window is counted and logged, not applied.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StaticInitRon {
+    /// Off unless set.
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub window_s: Option<f64>,
+    #[serde(default)]
+    pub accel_rms_max: Option<f64>,
+    #[serde(default)]
+    pub gyro_rms_max: Option<f64>,
+    #[serde(default)]
+    pub gyro_mean_max: Option<f64>,
+    #[serde(default)]
+    pub gravity_tolerance: Option<f64>,
+}
+
+impl StaticInitRon {
+    /// The config over `defaults`, or `None` when disabled. Validated either way.
+    fn to_config(&self, defaults: StaticInitConfig) -> Result<Option<StaticInitConfig>, VioError> {
+        let mut cfg = defaults;
+        for (field, value, slot) in [
+            (
+                "static_init.accel_rms_max",
+                self.accel_rms_max,
+                &mut cfg.accel_rms_max,
+            ),
+            (
+                "static_init.gyro_rms_max",
+                self.gyro_rms_max,
+                &mut cfg.gyro_rms_max,
+            ),
+            (
+                "static_init.gyro_mean_max",
+                self.gyro_mean_max,
+                &mut cfg.gyro_mean_max,
+            ),
+            (
+                "static_init.gravity_tolerance",
+                self.gravity_tolerance,
+                &mut cfg.gravity_tolerance,
+            ),
+        ] {
+            if let Some(v) = value {
+                *slot = v;
+            }
+            if !slot.is_finite() || *slot <= 0.0 {
+                return Err(VioError::InertialParamInvalid {
+                    field,
+                    value: *slot,
+                });
+            }
+        }
+        if let Some(v) = self.window_s {
+            if !v.is_finite() || v <= 0.0 {
+                return Err(VioError::InertialParamInvalid {
+                    field: "static_init.window_s",
+                    value: v,
+                });
+            }
+            cfg.window = cu29::units::si::f64::Time::new::<cu29::units::si::time::second>(v);
+        }
+        Ok(self.enabled.then_some(cfg))
+    }
 }
 
 impl InertialRon {
@@ -178,6 +268,12 @@ impl InertialRon {
             Frequency::new::<hertz>(self.rate_hz),
         )?;
         cfg.enable_inertial_ba = self.enable_inertial_ba;
+        if let Some(block) = &self.static_init {
+            cfg.static_init = block.to_config(StaticInitConfig::from_noise(
+                &cfg.calib,
+                cfg.gates.nominal_rate,
+            ))?;
+        }
         Ok(cfg)
     }
 }
@@ -414,6 +510,73 @@ mod tests {
             accel_bias_noise: 3.0e-3,
             rate_hz: 200.0,
             enable_inertial_ba: false,
+            static_init: None,
+        }
+    }
+
+    /// The `inertial` block read the way a graph reads it, with `extra` appended to its fields.
+    fn inertial_ron(extra: &str) -> CuResult<Option<InertialRon>> {
+        let text = format!(
+            r#"( tasks: [ ( id: "vio", type: "t::T", config: {{ "inertial": (
+                 t_bc_rotation: [-1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0],
+                 t_bc_translation: [0.0, 0.0, 0.0],
+                 gyro_noise: 0.00012, accel_noise: 0.0019,
+                 gyro_bias_noise: 0.000002, accel_bias_noise: 0.00004,
+                 rate_hz: 200.0, enable_inertial_ba: true {extra} ) }} ) ],
+                 cnx: [] )"#
+        );
+        let cfg = cu29::config::read_configuration_str(text, None)?;
+        let graph = cfg.get_graph(None)?;
+        let id = graph.get_node_id_by_name("vio").expect("the node");
+        let node = graph.get_node(id).expect("the node");
+        optional_inertial(node.get_instance_config())
+    }
+
+    /// `static_init`: absent and disabled are off; enabled takes the noise-derived defaults; an
+    /// override replaces exactly its field; a typo or a non-positive value is refused.
+    ///
+    /// Mutation: ignoring `enabled` (always `Some`) turned this red.
+    #[test]
+    fn test_the_static_init_block() {
+        let cfg = |extra: &str| inertial_ron(extra).unwrap().expect("present").to_config();
+
+        assert!(cfg("").unwrap().static_init.is_none(), "absent is off");
+        assert!(
+            cfg(", static_init: (window_s: 2.0)")
+                .unwrap()
+                .static_init
+                .is_none(),
+            "enabled defaults to false"
+        );
+
+        let on = cfg(", static_init: (enabled: true)").unwrap();
+        let derived = StaticInitConfig::from_noise(&on.calib, on.gates.nominal_rate);
+        assert_eq!(on.static_init, Some(derived));
+
+        let tuned = cfg(", static_init: (enabled: true, gyro_rms_max: 0.02, window_s: 1.5)")
+            .unwrap()
+            .static_init
+            .unwrap();
+        assert_eq!(tuned.gyro_rms_max, 0.02);
+        assert_eq!(tuned.window.get::<cu29::units::si::time::second>(), 1.5);
+        assert_eq!(tuned.accel_rms_max, derived.accel_rms_max);
+
+        assert!(
+            inertial_ron(", static_init: (enabled: true, gyro_rms_mx: 0.02)").is_err(),
+            "unknown field accepted"
+        );
+        for bad in [
+            "gravity_tolerance: 0.0",
+            "window_s: -1.0",
+            "accel_rms_max: -0.1",
+        ] {
+            assert!(
+                matches!(
+                    cfg(&format!(", static_init: (enabled: false, {bad})")),
+                    Err(VioError::InertialParamInvalid { .. })
+                ),
+                "{bad} accepted"
+            );
         }
     }
 

@@ -52,6 +52,7 @@ use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 use kornia_slam::initialization::ImuInitConfig;
 
 use crate::error::VioError;
+use crate::stationary::StaticInitConfig;
 
 /// One raw IMU sample, in the units and the clock the driver publishes.
 ///
@@ -592,6 +593,10 @@ pub struct InertialConfig {
     /// are estimated and observable) while leaving the optimizer on the visual-only path — the
     /// setting to run first on hardware, because it cannot move a pose.
     pub enable_inertial_ba: bool,
+    /// Initialize from a still window instead of waiting for motion; see [`crate::stationary`].
+    /// `None` (what [`InertialConfig::new`] sets) leaves the motion-based initializer as the
+    /// only one. With it on, the motion path still runs whenever no still window is found.
+    pub static_init: Option<StaticInitConfig>,
 }
 
 impl InertialConfig {
@@ -644,6 +649,7 @@ impl InertialConfig {
             },
             init_retry: Time::new::<second>(5.0),
             enable_inertial_ba: true,
+            static_init: None,
         })
     }
 }
@@ -724,6 +730,11 @@ pub struct InertialStats {
     /// and is retried after `init_retry`; a refused refinement leaves it on the previous
     /// initialization, and that refinement is not retried.
     pub init_apply_refused: u64,
+    /// Initializations taken from a still window ([`crate::stationary`]), applied or dry. Also
+    /// counted in `init_accepted` when applied.
+    pub static_accepted: u64,
+    /// Keyframes on which a still window was looked for and not found, or refused.
+    pub static_refused: u64,
     /// Whether visual-inertial initialization has succeeded.
     pub initialized: bool,
     /// Whether the first inertial refinement pass (after ~5 s of initialized tracking) has run.

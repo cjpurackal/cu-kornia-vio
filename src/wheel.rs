@@ -156,7 +156,7 @@ impl WheelOdomConfig {
         Ok(())
     }
 
-    fn max_gap_ns(&self) -> u64 {
+    pub(crate) fn max_gap_ns(&self) -> u64 {
         (self.max_gap.get::<second>() * 1e9) as u64
     }
 

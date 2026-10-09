@@ -15,6 +15,8 @@
 //! * [`imu`]: the inertial ingest: the stamp-indexed sample ring, the coverage gates every
 //!   interval must pass before it may be preintegrated, and the configuration the inertial
 //!   path refuses to run without. Likewise free of copper runtime and graph types.
+//! * [`stationary`]: the stillness detector that lets a parked robot initialize the inertial
+//!   path from a still window instead of waiting to drive.
 //! * [`bus`], [`feed`], [`imu_channel`], [`reset`]: what reaches a BACKGROUNDED tracker without
 //!   a second input edge. A [`VioBus`] resource bundle holds an [`ImuQueue`] that the inline
 //!   [`ImuFeed`] sink fills from the graph's IMU edge, and a [`ResetEpoch`] any bound task can
@@ -38,6 +40,7 @@ pub mod imu;
 pub mod imu_channel;
 pub mod pose;
 pub mod reset;
+pub mod stationary;
 mod stats;
 pub mod task;
 pub mod task_error;
@@ -53,6 +56,7 @@ pub use feed::ImuFeed;
 pub use imu::{ImuGates, ImuWindowError, InertialConfig, InertialStats};
 pub use imu_channel::ImuQueue;
 pub use reset::ResetEpoch;
+pub use stationary::{NotStill, StaticInitConfig};
 pub use task::{DEFAULT_LANDMARK_BUFFERS, MAX_LANDMARK_BUFFERS, MAX_LANDMARKS, StereoVio};
 pub use task_error::{Eye, TaskError};
 pub use track::{SystemMode, TrackStatus, TrackedPose, Tracker, TrackerConfig, TrackerStats};

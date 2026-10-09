@@ -158,6 +158,33 @@ config: {
 The doc comments on `InertialRon` in `src/config.rs` explain each field and why no default is
 defensible (the type is crate-private, so `cargo doc` does not render them).
 
+### Initializing while parked
+
+The default initializer needs the robot to move (>= 5 cm over >= 10 keyframes): it finds gravity
+from how the IMU's integration differs from the visual trajectory. A stereo map is already
+metric, so a still window is enough. Add `static_init` inside the `inertial` block:
+
+```ron
+"inertial": ( /* ... */, enable_inertial_ba: true,
+    static_init: (enabled: true),   // optional: window_s, accel_rms_max, gyro_rms_max,
+                                    // gyro_mean_max, gravity_tolerance
+),
+```
+
+On each keyframe before initialization, the tracker looks for >= `window_s` (1.2 s) of contiguous
+IMU edges ending at it in which the accelerometer and gyroscope spreads stay under four times
+what the configured noise densities predict, the mean rate stays under a plausible gyro bias,
+the wheels (when `wheel_odom` is on) report no net motion and the keyframes agree on the camera
+pose. Finding one, it takes gravity from the mean specific force, the gyro bias from the mean
+rate and zero velocity, and rotates the map onto gravity exactly as a motion initialization
+does, bumping `reset_epoch`. The accelerometer bias is unobservable at rest and stays at its
+prior. A window that is not still falls through to the motion initializer on the same keyframe.
+
+A map drop that keeps the world (with wheels, or a loss with `keep_map`) keeps the alignment: the
+next map is inertial from its first keyframe, with no new rotation and no extra `reset_epoch`
+bump. A drop that restarts the world at identity runs the still window (or the motion solve)
+again.
+
 ## Wheel odometry
 
 Off by default, and off means the tracker behaves exactly as without it. For a ground robot,

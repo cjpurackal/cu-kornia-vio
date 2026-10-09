@@ -705,7 +705,8 @@ impl CuTask for StereoVio {
                  (dropped {}, gap {}, sparse {}, empty {}, bad-interval {}, zero-dt {}, \
                  non-finite {}, map {}); samples {} accepted / {} out-of-order / {} non-finite / \
                  {} evicted, {} drop reports; init {}/{} \
-                 accepted ({} refused by the map), initialized={} refine_1={} refine_2={}",
+                 accepted ({} refused by the map), static {} accepted / {} refused, \
+                 initialized={} refine_1={} refine_2={}",
                 stats.factors_added,
                 stats.retained_factors,
                 stats.retained_samples,
@@ -726,6 +727,8 @@ impl CuTask for StereoVio {
                 stats.init_accepted,
                 stats.init_attempts,
                 stats.init_apply_refused,
+                stats.static_accepted,
+                stats.static_refused,
                 stats.initialized,
                 stats.first_refinement_done,
                 stats.second_refinement_done,
