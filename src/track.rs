@@ -842,7 +842,24 @@ pub struct Tracker {
     consistency: ConsistencyStats,
     /// When a motion-consistency line last spoke; see [`should_log_throttled`].
     last_consistency_log: Option<(f64, bool)>,
+    /// A vision-suspect interval is in the local BA window: tracking is DEGRADED. Edge-logged.
+    vision_degraded: bool,
+    /// The gyro bias at the last interval all three sensors agreed on: what the motion check
+    /// integrates the gyro at. The CURRENT bias may already hold part of what it is checking (a
+    /// bias local BA absorbed under the limit, ~1.9 deg per keyframe interval at 0.05 rad/s),
+    /// which would make the gyro side with frozen vision.
+    consistent_gyro_bias: Option<Vec3F64>,
+    /// Local BA updates refused for an implausible bias in a row; see
+    /// [`BIAS_REFUSALS_BEFORE_DROP`].
+    bias_refusals_in_a_row: u32,
 }
+
+/// Consecutive local BA updates refused for an implausible bias (`BiasLimit`) before the map is
+/// dropped. One refusal leaves the map as it was; a run of them means the window's keyframes
+/// hold a conflict (or a bias) the solve keeps resolving the same impossible way, and without a
+/// drop BA stays off until `max_keyframes` (75-140 s on the robot). The drop keeps the plausible
+/// bias and re-initializes.
+const BIAS_REFUSALS_BEFORE_DROP: u32 = 3;
 
 /// Keyframe tracked poses kept for the motion check: the pending wheel intervals (8) plus the
 /// factors that can still act (16), with slack.
@@ -942,6 +959,9 @@ impl Tracker {
             vision_suspect: std::collections::VecDeque::new(),
             consistency: ConsistencyStats::default(),
             last_consistency_log: None,
+            vision_degraded: false,
+            consistent_gyro_bias: None,
+            bias_refusals_in_a_row: 0,
         }
     }
 
@@ -1546,6 +1566,8 @@ impl Tracker {
         // Their keyframe indices name keyframes of the dropped map.
         self.kf_tracked_poses.clear();
         self.vision_suspect.clear();
+        self.vision_degraded = false;
+        self.bias_refusals_in_a_row = 0;
         self.map = Map::new();
         self.state = SystemState::new();
         if carry {
@@ -2393,11 +2415,7 @@ impl Tracker {
             Some(w) => w.on_keyframe(prev_edge, frame.idx, stamp_ns),
             None => Vec::new(),
         };
-        for (from_idx, to_idx) in self.check_motion(&new_wheel_factors, timestamp_sec) {
-            if let Some(w) = self.wheel.as_mut() {
-                w.drop_factor(from_idx, to_idx);
-            }
-        }
+        self.check_motion(&new_wheel_factors, timestamp_sec);
         let wheel_factors: Vec<WheelOdomFactor> = self
             .wheel
             .as_ref()
@@ -2405,7 +2423,9 @@ impl Tracker {
 
         let ba_window_ready =
             self.config.enable_local_ba && self.map.keyframes().len() > BA_ACTIVE_KEYFRAMES;
-        let vision_suspect = ba_window_ready && self.vision_suspect_in_ba_window();
+        let suspect_in_window = self.vision_suspect_in_ba_window();
+        self.note_vision_degraded(suspect_in_window, frame.idx);
+        let vision_suspect = ba_window_ready && suspect_in_window;
         if vision_suspect {
             self.consistency.ba_skipped += 1;
         }
@@ -2465,6 +2485,17 @@ impl Tracker {
                 if let Some(inert) = self.inertial.as_mut() {
                     inert.stats.bias_rejected += 1;
                 }
+                self.bias_refusals_in_a_row += 1;
+                if self.bias_refusals_in_a_row >= BIAS_REFUSALS_BEFORE_DROP {
+                    warning!(
+                        "keyframe: {} local BA results in a row wanted an implausible IMU bias; \
+                         dropping the map (keeps the plausible bias, re-initializes) frame={}",
+                        self.bias_refusals_in_a_row,
+                        frame.idx
+                    );
+                    self.bias_refusals_in_a_row = 0;
+                    self.pending_map_reset = true;
+                }
                 if should_log_throttled(
                     self.last_ba_refusal_log,
                     timestamp_sec,
@@ -2484,7 +2515,11 @@ impl Tracker {
                         self.ba_updates_refused
                     );
                 }
-            } else if let Err(e) = self.map.apply_ba_update(update) {
+            } else if let Err(e) = {
+                // A plausible bias ends the run, written or refused for another reason.
+                self.bias_refusals_in_a_row = 0;
+                self.map.apply_ba_update(update)
+            } {
                 self.ba_updates_refused += 1;
                 if should_log_throttled(
                     self.last_ba_refusal_log,
@@ -2545,13 +2580,12 @@ impl Tracker {
 
     /// Checks each wheel factor just integrated against the gyro and vision over the same
     /// keyframe interval ([`crate::consistency`]): counts the verdict, remembers an interval
-    /// vision disagreed on, and returns the intervals whose wheel factor must be dropped.
-    fn check_motion(
-        &mut self,
-        factors: &[WheelOdomFactor],
-        timestamp_sec: f64,
-    ) -> Vec<(usize, usize)> {
-        let mut slipped = Vec::new();
+    /// vision disagreed on, and drops the wheel factor of one the wheels disagreed on.
+    ///
+    /// Every interval the wheels MOVED in is logged with all three sensors' numbers, whatever
+    /// the verdict (an on-robot drive is read off these lines); a notable verdict while parked is
+    /// throttled.
+    fn check_motion(&mut self, factors: &[WheelOdomFactor], timestamp_sec: f64) {
         for f in factors {
             let Some(motion) = self.interval_motion(f) else {
                 continue;
@@ -2566,7 +2600,16 @@ impl Tracker {
                         self.vision_suspect.pop_front();
                     }
                 }
-                MotionVerdict::WheelsDisagree => slipped.push((f.from_idx, f.to_idx)),
+                MotionVerdict::WheelsDisagree => {
+                    if let Some(w) = self.wheel.as_mut() {
+                        w.drop_factor(f.from_idx, f.to_idx);
+                    }
+                }
+                MotionVerdict::Consistent => {
+                    if let Some(inert) = self.inertial.as_ref() {
+                        self.consistent_gyro_bias = Some(inert.bias.gyro);
+                    }
+                }
                 _ => {}
             }
             let notable = translation
@@ -2574,50 +2617,100 @@ impl Tracker {
                     verdict,
                     MotionVerdict::Consistent | MotionVerdict::Inconclusive
                 );
-            if notable
-                && should_log_throttled(
-                    self.last_consistency_log,
-                    timestamp_sec,
-                    true,
-                    LOSS_LOG_RETRY_SEC,
-                )
-            {
+            let moving = motion.wheels_moved();
+            let speak = moving
+                || (notable
+                    && should_log_throttled(
+                        self.last_consistency_log,
+                        timestamp_sec,
+                        true,
+                        LOSS_LOG_RETRY_SEC,
+                    ));
+            if !speak {
+                continue;
+            }
+            if !moving {
                 self.last_consistency_log = Some((timestamp_sec, true));
-                let deg = |r: &Mat3F64| crate::consistency::angle(r).to_degrees();
-                let action = match verdict {
-                    MotionVerdict::VisionDisagrees => {
-                        "tracking DEGRADED, local BA skipped while it is in the window"
-                    }
-                    MotionVerdict::WheelsDisagree => "wheel slip, the interval's factor dropped",
-                    MotionVerdict::GyroDisagrees => "gyro bias or extrinsic suspect, counted only",
-                    _ => "translation only, counted only (slip and frozen vision look alike)",
-                };
-                let c = self.consistency;
-                warning!(
-                    "motion check: {}: kf {}->{} wheels_deg={} gyro_deg={} vision_deg={} \
-                     wheels_m={} vision_m={} (checked={} vision={} wheels={} gyro={} \
-                     translation={})",
-                    action,
-                    f.from_idx,
-                    f.to_idx,
-                    deg(&motion.wheels.rotation),
-                    motion.gyro.as_ref().map_or(f64::NAN, deg),
-                    deg(&motion.vision.rotation),
-                    motion.wheels.translation.length(),
-                    motion.vision.translation.length(),
-                    c.checked,
-                    c.vision_disagrees,
-                    c.wheels_disagree,
-                    c.gyro_disagrees,
-                    c.translation_disagrees
-                );
+            }
+            let deg = |r: &Mat3F64| crate::consistency::angle(r).to_degrees();
+            let action = match verdict {
+                MotionVerdict::Consistent if translation => {
+                    "consistent rotation, TRANSLATION disagrees (counted only: slip and frozen \
+                     vision look alike)"
+                }
+                MotionVerdict::Consistent => "consistent",
+                MotionVerdict::Inconclusive => "inconclusive",
+                MotionVerdict::VisionDisagrees => {
+                    "VISION disagrees, tracking DEGRADED, local BA held off while it is in the \
+                     window"
+                }
+                MotionVerdict::WheelsDisagree => {
+                    "WHEELS disagree (slip, or the head moved on its joint), the interval's \
+                     factor dropped"
+                }
+                MotionVerdict::GyroDisagrees => "GYRO disagrees (bias or extrinsic), counted only",
+            };
+            let c = self.consistency;
+            let line = format!(
+                "motion check: {action}: kf {}->{} wheels_deg={:.2} gyro_deg={:.2} \
+                 vision_deg={:.2} wheels_mm={:.1} vision_mm={:.1} (checked={} vision={} \
+                 wheels={} gyro={} translation={})",
+                f.from_idx,
+                f.to_idx,
+                deg(&motion.wheels.rotation),
+                motion.gyro.as_ref().map_or(f64::NAN, deg),
+                deg(&motion.vision.rotation),
+                motion.wheels.translation.length() * 1e3,
+                motion.vision.translation.length() * 1e3,
+                c.checked,
+                c.vision_disagrees,
+                c.wheels_disagree,
+                c.gyro_disagrees,
+                c.translation_disagrees
+            );
+            if notable {
+                warning!("{}", line.as_str());
+            } else {
+                info!("{}", line.as_str());
             }
         }
-        slipped
+    }
+
+    /// Edge-logs the degraded state: a vision-suspect interval entering or leaving the local BA
+    /// window. The published pose stays vision's while degraded (so it may be frozen); what
+    /// changes is that no solve bends the map or the bias to agree with it.
+    fn note_vision_degraded(&mut self, suspect_in_window: bool, frame_idx: usize) {
+        if suspect_in_window == self.vision_degraded {
+            return;
+        }
+        self.vision_degraded = suspect_in_window;
+        if suspect_in_window {
+            self.consistency.degraded_entries += 1;
+            warning!(
+                "tracking DEGRADED: vision disagrees with the wheels and the gyro (frozen or \
+                 self-tracking view); local BA held off, the published pose is vision's and may \
+                 be frozen frame={} times_degraded={}",
+                frame_idx,
+                self.consistency.degraded_entries
+            );
+        } else {
+            info!(
+                "tracking RECOVERED: no vision-suspect interval left in the local BA window \
+                 frame={}",
+                frame_idx
+            );
+        }
+    }
+
+    /// Whether tracking is DEGRADED: an interval vision disagreed with the wheels and the gyro
+    /// on is still in the local BA window ([`crate::consistency`]).
+    pub fn vision_degraded(&self) -> bool {
+        self.vision_degraded
     }
 
     /// The interval a wheel factor spans, as the wheels, vision (the keyframes' tracked poses)
-    /// and the gyro (the interval's IMU edge, at the current bias) saw it. `None` when either
+    /// and the gyro (the interval's IMU edge, at the bias of the last interval all three agreed
+    /// on, else the current one; see `consistent_gyro_bias`) saw it. `None` when either
     /// tracked pose is gone or from another world.
     fn interval_motion(&self, f: &WheelOdomFactor) -> Option<IntervalMotion> {
         let tracked = |idx: usize| {
@@ -2635,7 +2728,8 @@ impl Tracker {
                 .find(|e| e.prev_kf_idx == f.from_idx && e.curr_kf_idx == f.to_idx)
                 .map(|e| {
                     let p = &e.preintegrated;
-                    let db = inert.bias.gyro - p.bias.gyro;
+                    let bias = self.consistent_gyro_bias.unwrap_or(inert.bias.gyro);
+                    let db = bias - p.bias.gyro;
                     let r_b = p.delta_rotation
                         * kornia_algebra::SO3F64::exp(p.d_rotation_d_bias_gyro * db).matrix();
                     r_bc.transpose() * r_b * r_bc
@@ -7008,5 +7102,110 @@ mod tests {
         assert!(c.checked >= 3, "{c:?}");
         assert_eq!(c.consistent, c.checked, "{c:?}");
         assert_eq!(c.ba_skipped, 0);
+    }
+
+    /// A gyro bias local BA absorbed UNDER the limit must not flip the check: the gyro is
+    /// integrated at the bias of the last interval all three agreed on, not the current one. A
+    /// slow frozen turn (0.07 rad/s) with 0.045 rad/s of it already in the bias reads, at the
+    /// current bias, as a gyro that half-agrees with frozen vision.
+    ///
+    /// Mutation: integrating at the current bias (`consistent_gyro_bias` ignored) turned this
+    /// red (the verdict flipped away from vision).
+    #[test]
+    fn test_an_absorbed_gyro_bias_does_not_side_the_gyro_with_frozen_vision() {
+        const RATE: f64 = 0.07;
+        const ABSORBED: f64 = 0.045;
+        let mut tracker = scene_tracker_with(|c| {
+            c.inertial = Some(static_inertial_config());
+            c.wheel_odom = Some(scene_wheel_config());
+        });
+        let mut seq = park_until_static_init(&mut tracker);
+        for _ in 0..40 {
+            feed_frozen_turn(&mut tracker, seq, 0.0, &|_| 0.0);
+            seq += 1;
+        }
+        assert!(
+            tracker.consistent_gyro_bias.is_some(),
+            "parked intervals agree"
+        );
+        // Part of the turn rate already in the bias, map and next edge alike, as a solve that
+        // ran before the check could act leaves it.
+        let r_bc = tracker.inertial.as_ref().unwrap().cfg.imu_t_bc.rotation;
+        let mut absorbed = tracker.inertial.as_ref().unwrap().bias;
+        absorbed.gyro += r_bc * (base_up_in_cam() * ABSORBED);
+        assert!(
+            tracker
+                .inertial
+                .as_ref()
+                .unwrap()
+                .cfg
+                .bias_limit
+                .admits(&absorbed),
+            "under the limit, so BiasLimit cannot catch it"
+        );
+        write_map_bias(&mut tracker, absorbed);
+        tracker.inertial.as_mut().unwrap().bias = absorbed;
+        let before = tracker.consistency_stats();
+        let start = seq;
+        let t = |s: u32| f64::from(s - start) * FRAME_NS as f64 * 1e-9;
+        for _ in 0..60 {
+            feed_frozen_turn(&mut tracker, seq, RATE, &|s| RATE * t(s));
+            seq += 1;
+        }
+        let c = tracker.consistency_stats();
+        assert!(c.vision_disagrees >= before.vision_disagrees + 2, "{c:?}");
+        assert_eq!(c.wheels_disagree, before.wheels_disagree, "{c:?}");
+        assert!(tracker.vision_degraded(), "frozen vision is flagged");
+        assert!(c.degraded_entries >= 1, "{c:?}");
+    }
+
+    /// `BiasLimit` refuses; a RUN of refusals drops the map, so BA does not stay off until
+    /// `max_keyframes` with an implausible bias in the window. The next map holds only plausible
+    /// biases.
+    ///
+    /// Mutation: never arming the drop (`BIAS_REFUSALS_BEFORE_DROP` unreachable) turned this red
+    /// (the bad bias still in the map after the run).
+    #[test]
+    fn test_a_run_of_implausible_bias_refusals_drops_the_map() {
+        let mut tracker = scene_tracker_with(|c| {
+            c.inertial = Some(static_inertial_config());
+            c.wheel_odom = Some(scene_wheel_config());
+        });
+        let mut seq = park_until_static_init(&mut tracker);
+        while tracker.map().keyframes().len() < 5 {
+            feed_parked(&mut tracker, seq, &no_extra, &parked_wheels);
+            seq += 1;
+        }
+        let sane = tracker.inertial.as_ref().unwrap().bias;
+        write_map_bias(&mut tracker, implausible_bias(sane));
+        let refused = tracker.ba_updates_refused();
+        let mut fed = 0;
+        while tracker.ba_updates_refused() < refused + u64::from(BIAS_REFUSALS_BEFORE_DROP) {
+            feed_parked(&mut tracker, seq, &no_extra, &parked_wheels);
+            seq += 1;
+            fed += 1;
+            assert!(fed < 400, "never refused {BIAS_REFUSALS_BEFORE_DROP} times");
+        }
+        // The drop is deferred to the next frame, like the `max_keyframes` one.
+        for _ in 0..3 {
+            feed_parked(&mut tracker, seq, &no_extra, &parked_wheels);
+            seq += 1;
+        }
+        let limit = tracker.inertial.as_ref().unwrap().cfg.bias_limit;
+        let kfs = tracker.map().keyframes();
+        assert!(
+            kfs.len() < 5 + BIAS_REFUSALS_BEFORE_DROP as usize,
+            "{} keyframes: no drop",
+            kfs.len()
+        );
+        for kf in kfs {
+            assert!(
+                limit.admits(&kf.imu_bias),
+                "kf {} still holds {:?}",
+                kf.frame.idx,
+                kf.imu_bias
+            );
+        }
+        assert!(limit.admits(&tracker.inertial.as_ref().unwrap().bias));
     }
 }

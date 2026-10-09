@@ -653,12 +653,13 @@ impl CuTask for StereoVio {
             let c = t.consistency_stats();
             info!(
                 "vio motion check: {} intervals, {} consistent; vision disagreed {} (local BA \
-                 skipped {}), wheels disagreed {} (factor dropped), gyro disagreed {}, \
-                 inconclusive {}, translation disagreed {}",
+                 skipped {}, tracking DEGRADED {} times), wheels disagreed {} (factor dropped), \
+                 gyro disagreed {}, inconclusive {}, translation disagreed {}",
                 c.checked,
                 c.consistent,
                 c.vision_disagrees,
                 c.ba_skipped,
+                c.degraded_entries,
                 c.wheels_disagree,
                 c.gyro_disagrees,
                 c.inconclusive,

@@ -16,7 +16,7 @@
 //! |-------------|-------------|---------------|---------------------------------------------|
 //! | agree       | agree       | agree         | [`MotionVerdict::Consistent`]               |
 //! | agree       | disagree    | disagree      | [`MotionVerdict::VisionDisagrees`]: frozen or self-tracking vision. Local BA is skipped while the interval is in its window, so it cannot invent a bias to explain it |
-//! | disagree    | agree       | disagree      | [`MotionVerdict::WheelsDisagree`]: slip. The interval's wheel factor is dropped |
+//! | disagree    | agree       | disagree      | [`MotionVerdict::WheelsDisagree`]: slip, OR the head turned on its joint relative to the base (the IMU is in the OAK head, so the gyro and vision share any head-on-base motion). The interval's wheel factor is dropped either way: it constrains the camera through a fixed mount, which that interval broke |
 //! | disagree    | disagree    | agree         | [`MotionVerdict::GyroDisagrees`]: bias or extrinsic. Counted only |
 //!
 //! Anything else, or no gyro, is [`MotionVerdict::Inconclusive`].
@@ -26,6 +26,12 @@
 //! gyro that saw no turn. The loop test's straight legs were the second; dropping the wheels
 //! there would have dropped the one sensor that was right. A translation disagreement is
 //! counted and logged, never acted on.
+//!
+//! # What is logged
+//!
+//! Every interval the wheels moved in ([`IntervalMotion::wheels_moved`]), with all three
+//! sensors' rotations and both translations, whatever the verdict: a watched drive is read off
+//! these `motion check:` lines. Parked intervals speak only when notable, throttled.
 
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::Mat3F64;
@@ -41,8 +47,15 @@ pub const ROTATION_REL_TOL: f64 = 0.25;
 /// Translation is compared only once the wheels drove this far in the interval.
 pub const TRANSLATION_MIN_M: f64 = 0.03;
 
-/// A translation disagreement: vision's length outside this fraction of the wheels'.
-pub const TRANSLATION_REL_TOL: f64 = 0.5;
+/// A translation disagreement: vision's length outside this fraction of the wheels'. Counted
+/// only, so set to flag the 2026-10-09 10 cm drive's shape (71 vs 99 mm, 28 %): the wheels'
+/// straight-line error is ~1 %.
+pub const TRANSLATION_REL_TOL: f64 = 0.2;
+
+/// An interval the wheels moved in: logged whatever its verdict.
+pub const MOVED_MIN_M: f64 = 0.01;
+/// ...or turned this much, radians.
+pub const MOVED_MIN_RAD: f64 = 0.5 * std::f64::consts::PI / 180.0;
 
 /// What a keyframe interval's three rotations say about who is wrong.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +113,12 @@ impl IntervalMotion {
         }
     }
 
+    /// Whether the wheels moved in the interval: [`MOVED_MIN_M`] or [`MOVED_MIN_RAD`].
+    pub fn wheels_moved(&self) -> bool {
+        self.wheels.translation.length() >= MOVED_MIN_M
+            || angle(&self.wheels.rotation) >= MOVED_MIN_RAD
+    }
+
     /// Whether vision's translation length is outside [`TRANSLATION_REL_TOL`] of the wheels',
     /// once the wheels drove [`TRANSLATION_MIN_M`]. Counted, never acted on.
     pub fn translation_disagrees(&self) -> bool {
@@ -128,6 +147,8 @@ pub struct ConsistencyStats {
     pub translation_disagrees: u64,
     /// Local BA solves skipped because an interval vision disagreed on was in the window.
     pub ba_skipped: u64,
+    /// Times tracking turned DEGRADED (a vision-suspect interval entered the BA window).
+    pub degraded_entries: u64,
 }
 
 impl ConsistencyStats {
@@ -207,6 +228,18 @@ mod tests {
     }
 
     #[test]
+    fn a_parked_interval_did_not_move_and_a_drive_or_turn_did() {
+        assert!(!motion(0.2, 0.0, None).wheels_moved());
+        assert!(motion(1.0, 0.0, None).wheels_moved());
+        let drive = IntervalMotion {
+            wheels: yaw_pose(0.0, 0.03),
+            vision: yaw_pose(0.0, 0.0),
+            gyro: None,
+        };
+        assert!(drive.wheels_moved());
+    }
+
+    #[test]
     fn without_a_gyro_nothing_is_decided() {
         assert_eq!(
             motion(8.6, 0.0, None).verdict(),
@@ -224,6 +257,9 @@ mod tests {
         };
         assert!(m(0.4, 0.01).translation_disagrees());
         assert!(!m(0.4, 0.35).translation_disagrees());
+        // The 10 cm drive: 71 mm of vision against 98.9 mm of wheels is flagged.
+        assert!(m(0.0989, 0.071).translation_disagrees());
+        assert!(!m(0.0989, 0.095).translation_disagrees());
         assert!(!m(0.01, 0.0).translation_disagrees());
     }
 }
