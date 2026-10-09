@@ -621,7 +621,14 @@ impl InertialState {
     /// that follows a reset defines a new one. `Tracker::reset_inner` restores it, and sets
     /// [`Self::carried_alignment`], when the drop keeps the world.
     fn reset(&mut self, keep_bias: bool) {
-        self.buffer.clear();
+        // The sample buffer is NOT cleared. Its samples are stamped readings of the sensor, not
+        // of the map, and the task drains the IMU queue BEFORE the frame the next map anchors
+        // on is processed, so the ring already holds that frame's ~60 ms of latency past its
+        // stamp. Cleared, they were gone and the new map's first edge started that far before
+        // the oldest sample left: refused as a gap after every drop (2026-10-09 loop test,
+        // "IMU gap of 52-64 ms"), which left the next local BA window with no IMU tie to the
+        // carried bias. The bootstrap's `arm_inertial_window` prunes everything before its own
+        // stamp, and the drop marks are stamped, so nothing older can bound an interval.
         if !keep_bias {
             self.bias = self.cfg.initial_bias;
         }
@@ -1503,9 +1510,10 @@ impl Tracker {
         self.map_carried = carry;
         self.last_keyframe_timestamp_sec = None;
         self.last_keyframe_stamp_ns = None;
-        // The buffered samples span the OLD map's last keyframe, and `start_kf_idx` names a
-        // keyframe that no longer exists — `ImuInitializer` would silently skip every factor
-        // whose endpoints it cannot find rather than report an empty problem.
+        // `start_kf_idx` names a keyframe that no longer exists — `ImuInitializer` would
+        // silently skip every factor whose endpoints it cannot find rather than report an empty
+        // problem. The buffered SAMPLES survive (see `InertialState::reset`): the next anchor
+        // prunes what is older than itself.
         if let Some(inert) = self.inertial.as_mut() {
             let gravity_world = inert.gravity_world;
             inert.reset(keep_calibration);
@@ -4935,7 +4943,7 @@ mod tests {
     }
 
     #[test]
-    fn test_a_reset_drops_the_buffer_and_the_initialization_window() {
+    fn test_a_reset_drops_the_initialization_window_and_keeps_the_samples() {
         let mut tracker = tracker_with_inertial();
         tracker
             .push_raw_imu(imu_samples(EPOCH_NS, 200), 0, false)
@@ -4951,7 +4959,9 @@ mod tests {
         // endpoints it could not find — a solve over an empty problem, reported as a rejection.
         assert!(inert.start_kf_idx.is_none());
         assert!(inert.last_window_log.is_none());
-        assert_eq!(inert.buffer.stats().buffered, 0);
+        // The samples are the sensor's, not the map's: the next anchor prunes them, and
+        // clearing them here cost every new map its first IMU edge.
+        assert_eq!(inert.buffer.stats().buffered, 200);
         assert!(tracker.last_keyframe_stamp_ns.is_none());
     }
 
@@ -6075,6 +6085,73 @@ mod tests {
             assert_eq!(tracker.ba_updates_refused(), 0, "wheels={wheels}");
         }
     }
+    /// How far the IMU runs ahead of the frame being processed on the robot: the task drains
+    /// the IMU queue right before the solve, by which time the samples of the ~60 ms the frame
+    /// spent in capture, transfer and queueing are already in. 2026-10-09 loop test: every drop
+    /// refused its first edge with an "IMU gap of 52-64 ms".
+    const IMU_LEAD_NS: u64 = 60_000_000;
+
+    /// [`feed_parked`] with the IMU [`IMU_LEAD_NS`] ahead of the frame, as on the robot.
+    /// `pushed_to` is the stamp the previous call pushed samples up to.
+    fn feed_parked_imu_ahead(
+        tracker: &mut Tracker,
+        seq: u32,
+        gyro_extra: &dyn Fn(u64) -> Vec3F64,
+        pushed_to: &mut Option<u64>,
+    ) -> TrackStatus {
+        let stamp = EPOCH_NS + u64::from(seq) * FRAME_NS;
+        let to = stamp + IMU_LEAD_NS;
+        let mut samples = parked_imu(tracker, *pushed_to, to, no_extra);
+        for s in &mut samples {
+            let w = gyro_extra((s.stamp_ns - EPOCH_NS) / IMU_PERIOD_NS);
+            s.gyro = [s.gyro[0] + w.x, s.gyro[1] + w.y, s.gyro[2] + w.z];
+        }
+        *pushed_to = Some(to);
+        tracker.push_raw_imu(samples, 0, false).unwrap();
+        tracker
+            .push_wheel([WheelSample {
+                stamp_ns: stamp,
+                x: 0.0,
+                y: 0.0,
+                theta: 0.0,
+            }])
+            .unwrap();
+        let (left, right, _) = scene_pair(0);
+        tracker
+            .process_stereo(&left, &right, CuTime::from_nanos(stamp))
+            .expect("a valid pair")
+    }
+
+    /// BUG 3 (2026-10-09): a map drop must not lose the IMU samples already buffered past the
+    /// frame the next map anchors on. They were cleared with the dropped map, so the first edge
+    /// of every new map started ~60 ms (the frame's latency) before the oldest sample left and
+    /// was refused as a gap — a new map whose first keyframe pair had no IMU edge, i.e. a local
+    /// BA window whose bias nothing tied to the carried one.
+    ///
+    /// Mutation: restoring `self.buffer.clear()` in `InertialState::reset` turned this red
+    /// (one gap refusal per drop).
+    #[test]
+    fn test_a_map_drop_keeps_the_imu_samples_past_the_new_anchor() {
+        let mut tracker = scene_tracker_with(|c| {
+            c.inertial = Some(static_inertial_config());
+            c.wheel_odom = Some(scene_wheel_config());
+            c.max_keyframes = Some(8);
+        });
+        let mut pushed_to = None;
+        for seq in 0..95 {
+            feed_parked_imu_ahead(&mut tracker, seq, &no_extra, &mut pushed_to);
+        }
+        assert!(
+            tracker.world_generation() >= 2,
+            "init + at least one drop, got generation {}",
+            tracker.world_generation()
+        );
+        let stats = tracker.inertial_stats().unwrap();
+        assert_eq!(stats.refused_gap, 0, "{stats:?}");
+        assert_eq!(stats.refused_total(), 0, "{stats:?}");
+        assert!(tracker.state.imu_initialized);
+    }
+
     /// Runs a parked robot with wheels until the stationary initialization lands, returning the
     /// next frame sequence number.
     fn park_until_static_init(tracker: &mut Tracker) -> u32 {

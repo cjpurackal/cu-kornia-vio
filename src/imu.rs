@@ -429,13 +429,6 @@ impl ImuBuffer {
         self.forget_marks_before(stamp_ns);
     }
 
-    /// Empties the buffer and every drop mark, keeping the lifetime counters.
-    pub fn clear(&mut self) {
-        self.samples.clear();
-        self.drop_marks.clear();
-        self.pending_drop_mark = false;
-    }
-
     /// Counters, plus the current occupancy.
     pub fn stats(&self) -> ImuBufferStats {
         ImuBufferStats {
