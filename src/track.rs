@@ -3162,9 +3162,16 @@ impl Tracker {
                     MotionVerdict::Consistent | MotionVerdict::Inconclusive
                 );
             let moving = motion.wheels_moved();
+            let oop = crate::consistency::OutOfPlane::of(f, &motion.vision);
             if moving {
-                self.last_motion =
-                    motion_check(&motion, verdict, translation, self.last_motion.checks + 1);
+                self.last_motion = motion_check(
+                    &motion,
+                    verdict,
+                    translation,
+                    self.last_motion.checks + 1,
+                    &oop,
+                    *path_m,
+                );
             }
             let speak = moving
                 || (notable
@@ -3199,7 +3206,6 @@ impl Tracker {
                 MotionVerdict::GyroDisagrees => "GYRO disagrees (bias or extrinsic), counted only",
             };
             let c = self.consistency;
-            let oop = crate::consistency::OutOfPlane::of(f, &motion.vision);
             let line = format!(
                 "motion check: {action}: kf {}->{} wheels_deg={:.2} gyro_deg={:.2} \
                  vision_deg={:.2} wheels_mm={:.1} vision_mm={:.1} oop_z_mm={:.2} \
@@ -4813,6 +4819,8 @@ fn motion_check(
     verdict: MotionVerdict,
     translation_disagrees: bool,
     checks: u64,
+    oop: &crate::consistency::OutOfPlane,
+    path_m: f64,
 ) -> MotionCheck {
     let deg = |r: &Mat3F64| crate::consistency::angle(r).to_degrees() as f32;
     MotionCheck {
@@ -4830,6 +4838,10 @@ fn motion_check(
         vision_deg: deg(&motion.vision.rotation),
         wheels_mm: (motion.wheels.translation.length() * 1e3) as f32,
         vision_mm: (motion.vision.translation.length() * 1e3) as f32,
+        oop_z_mm: (oop.z_m * 1e3) as f32,
+        oop_roll_deg: oop.roll_rad.to_degrees() as f32,
+        oop_pitch_deg: oop.pitch_rad.to_degrees() as f32,
+        path_m: path_m as f32,
     }
 }
 

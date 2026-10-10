@@ -198,6 +198,15 @@ pub struct MotionCheck {
     pub wheels_mm: f32,
     /// Vision's translation, millimetres.
     pub vision_mm: f32,
+    /// Vision's base height change over the interval minus the wheels' (zero, planar),
+    /// millimetres: one sample of the out-of-plane error the wheel factor's `z_sigma` covers.
+    pub oop_z_mm: f32,
+    /// Vision's relative base roll over the interval, degrees (`tilt_sigma`'s sample).
+    pub oop_roll_deg: f32,
+    /// Vision's relative base pitch over the interval, degrees (`tilt_sigma`'s sample).
+    pub oop_pitch_deg: f32,
+    /// The path the wheels drove over the interval, metres (what `z_slope` scales with).
+    pub path_m: f32,
 }
 
 /// The per-frame fusion's verdict on one frame: vision's pose against the IMU and wheel
