@@ -903,6 +903,37 @@ pub struct Tracker {
     /// The last tracked frame's PnP pose and the pose it was given (fused, or the same):
     /// `(frame idx, vision, published)`. What the keyframe motion check records as vision's word.
     vision_pose: Option<(usize, Pose3d, Pose3d)>,
+    /// The published pose's hold on the end of a rejection run; see [`PublishHold`].
+    publish_hold: Option<PublishHold>,
+    /// Set by the frame that ends a rejection run: where its coast would have gone. Turned into
+    /// [`PublishHold`] when the frame's pose is published (`held_pose`).
+    publish_hold_target: Option<Pose3d>,
+}
+
+/// How fast the published pose closes on the tracker's after a rejection run, metres and radians
+/// per second of frame time: 2.5 mm and 0.24 deg a frame at the head's 12 Hz. A run that ended
+/// 60 mm off (2026-10-10, the live turns) closes in 2 s instead of in one 67 ms frame.
+pub const PUBLISH_CLOSE_M_PER_S: f64 = 0.03;
+/// See [`PUBLISH_CLOSE_M_PER_S`].
+pub const PUBLISH_CLOSE_RAD_PER_S: f64 = 0.05;
+
+/// A rejection run publishes the motion sensors' coast; the frame that ends it (vision accepted
+/// again, or the run expiring) puts the tracker back on vision, which may be centimetres from
+/// where the coast drifted. Published as is, that difference is one frame's jump. Instead the
+/// published pose is `offset * T_cw`, the offset (camera frame, a left perturbation, so an
+/// inertial re-alignment of the world does not touch it) set so the end frame publishes exactly
+/// where the coast would have, then shrunk at [`PUBLISH_CLOSE_M_PER_S`] /
+/// [`PUBLISH_CLOSE_RAD_PER_S`]. The map, the keyframes and the next frame's prior all use the
+/// tracker's pose; only the output is held. Dropped with the map (a new map generation) and on
+/// a relocalization, both of which are jumps a consumer is told about.
+///
+/// Only the END of a run is held: the frame that starts one publishes the prediction as is,
+/// since holding it would publish the very vision the gate just refused.
+#[derive(Debug, Clone, Copy)]
+struct PublishHold {
+    offset: Pose3d,
+    at_sec: f64,
+    map_generation: u64,
 }
 
 /// Why the current frame was or was not measured, beyond its [`TrackStatus`].
@@ -1086,6 +1117,8 @@ impl Tracker {
             fusion_preint: None,
             fusion_suspended_on: None,
             vision_pose: None,
+            publish_hold: None,
+            publish_hold_target: None,
         }
     }
 
@@ -1328,7 +1361,7 @@ impl Tracker {
 
         let pose = TrackedPose {
             stamp,
-            pose_world_to_cam: self.state.pose_world_to_cam,
+            pose_world_to_cam: self.held_pose(ts_sec),
             keyframe: status == TrackingStatus::KeyframeAccepted,
         };
         match status {
@@ -2131,6 +2164,7 @@ impl Tracker {
                 let mut fused =
                     self.fuse_frame(&frame, &estimate.pose, &matches, &candidate_pose, stamp_ns);
                 fusion_us = self.fusion.last_cost_us;
+                let was_coasting = self.fusion.consecutive_rejects > 0;
                 if fused.is_some_and(|o| o.rejected)
                     && self.fusion.consecutive_rejects >= MAX_CONSECUTIVE_REJECTS
                 {
@@ -2156,10 +2190,19 @@ impl Tracker {
                 if rejected {
                     self.fusion.rejects += 1;
                     self.fusion.consecutive_rejects += 1;
+                    if fused.is_some_and(|o| o.rotation_kept) {
+                        self.fusion.rotation_kept += 1;
+                    }
                 } else {
                     self.fusion.consecutive_rejects = 0;
                 }
                 let pose = fused.map_or(estimate.pose, |o| o.pose);
+                if was_coasting && !rejected {
+                    // Where the coast would have gone on this frame: the last one carried by
+                    // this frame's motion prior (the gyro and the wheels since it), which is
+                    // continuous with what was published whichever predictors the fusion used.
+                    self.publish_hold_target = Some(candidate_pose);
+                }
                 self.vision_pose = Some((frame.idx, estimate.pose, pose));
                 self.state.pose_world_to_cam = pose;
                 self.state.velocity = Some(Pose3d::between(&pose_before, &pose));
@@ -2300,6 +2343,8 @@ impl Tracker {
                 // The last keyframe's prediction does not span the jump: no fusion until the
                 // next keyframe.
                 self.fusion_suspended_on = self.state.last_keyframe_idx;
+                self.publish_hold = None;
+                self.publish_hold_target = None;
                 self.state.lost_since_sec = None;
                 self.state.last_frame_timestamp_sec = timestamp_sec;
                 self.frame_report.relocalized = true;
@@ -2517,7 +2562,8 @@ impl Tracker {
         {
             let m = w.cfg.measurement(&d);
             let (t_from, t_to) = (w.t_cb_at(kf_ns), w.t_cb_at(stamp_ns));
-            if let Some(f) = MotionFactor::wheel(&m, t_from, t_to, &kf_pose) {
+            let extrinsic = [cfg.extrinsic_sigma_m, cfg.extrinsic_sigma_rad];
+            if let Some(f) = MotionFactor::wheel(&m, t_from, t_to, &kf_pose, extrinsic) {
                 let disagree = gyro_cam.is_some_and(|(gyro, gyro_cov)| {
                     let wheels = t_from.compose(&m.delta_pose()).compose(&t_to.inverse());
                     let verdict = IntervalMotion {
@@ -2588,6 +2634,61 @@ impl Tracker {
     /// The per-frame fusion's counters; see [`crate::fusion`]. All zero with it off.
     pub fn fusion_stats(&self) -> FusionStats {
         self.fusion
+    }
+
+    /// The pose to publish for the frame at `now_sec`: the tracker's, behind the hold that is
+    /// still closing ([`PublishHold`]), which this shrinks by the time since it last did.
+    ///
+    /// A frame that ended a rejection run left its coast target in `publish_hold_target`; the
+    /// hold is set HERE, against the tracker's pose as the frame leaves it — a keyframe's local
+    /// BA may have moved the pose after the gate (by centimetres, through the same wheel factor
+    /// that started the run), and that move must be held too. A hold still closing carries on
+    /// from where it is.
+    fn held_pose(&mut self, now_sec: f64) -> Pose3d {
+        let tracker = self.state.pose_world_to_cam;
+        if let Some(target) = self.publish_hold_target.take() {
+            let prior = self
+                .publish_hold
+                .filter(|h| h.map_generation == self.map_generation)
+                .map_or(Pose3d::IDENTITY, |h| h.offset);
+            let offset = prior.compose(&target).compose(&tracker.inverse());
+            self.publish_hold = Some(PublishHold {
+                offset,
+                at_sec: now_sec,
+                map_generation: self.map_generation,
+            });
+            return offset.compose(&tracker);
+        }
+        let Some(hold) = self.publish_hold.as_mut() else {
+            return tracker;
+        };
+        if hold.map_generation != self.map_generation {
+            self.publish_hold = None;
+            return tracker;
+        }
+        let dt = (now_sec - hold.at_sec).max(0.0);
+        let xi = crate::fusion::se3_log(&hold.offset);
+        let rho = (xi[0] * xi[0] + xi[1] * xi[1] + xi[2] * xi[2]).sqrt();
+        let omega = (xi[3] * xi[3] + xi[4] * xi[4] + xi[5] * xi[5]).sqrt();
+        // The fraction to close this frame: whichever of the two rates binds.
+        let frac = |len: f64, rate: f64| {
+            if len > 0.0 {
+                rate * dt / len
+            } else {
+                f64::INFINITY
+            }
+        };
+        let k = frac(rho, PUBLISH_CLOSE_M_PER_S)
+            .min(frac(omega, PUBLISH_CLOSE_RAD_PER_S))
+            .min(1.0);
+        if k >= 1.0 {
+            self.publish_hold = None;
+            return tracker;
+        }
+        let keep = 1.0 - k;
+        hold.offset = crate::fusion::se3_exp(&xi.map(|v| v * keep));
+        hold.at_sec = now_sec;
+        hold.offset.compose(&tracker)
     }
 
     /// Keeps only the correspondences that reproject within PnP's own final
@@ -8217,10 +8318,13 @@ mod tests {
     /// A view that stays displaced (the robot pushed or carried, the prediction wrong) is
     /// outvoted for [`MAX_CONSECUTIVE_REJECTS`] frames, each publishing the prediction in place
     /// as a coast. The next frame's vision is accepted, and it STAYS accepted: the fusion waits
-    /// for a keyframe instead of predicting every later frame from the same stale one.
+    /// for a keyframe instead of predicting every later frame from the same stale one. The
+    /// tracker moves to vision at once; the published pose closes on it at
+    /// [`PUBLISH_CLOSE_M_PER_S`] (the run's end held, not snapped).
     ///
-    /// Mutation: not suspending the fusion on expiry (`fusion_suspended_on` left unset) turned
-    /// this red (rejected again on the frame after the accepted one, a 25 mm flicker per run).
+    /// Mutations: not suspending the fusion on expiry (`fusion_suspended_on` left unset) turned
+    /// this red (rejected again on the frame after the accepted one, a 25 mm flicker per run);
+    /// the hold never set turned it red (the published pose jumped the 25 mm in one frame).
     #[test]
     fn test_a_run_of_rejections_ends_with_vision_accepted_for_good() {
         let mut tracker = fusion_tracker(true);
@@ -8263,6 +8367,8 @@ mod tests {
         }
         assert_eq!(tracker.fusion_stats().reject_runs_expired, 0);
         let first = start + 1 + MAX_CONSECUTIVE_REJECTS;
+        let mut last_mm = 0.0;
+        let frame_s = FRAME_NS as f64 * 1e-9;
         for seq in first..first + 20 {
             let status = feed_moving(&mut tracker, seq, &still, 0.0, &jumped);
             assert!(
@@ -8270,13 +8376,24 @@ mod tests {
                 "frame {seq}: {status:?}"
             );
             assert!(!tracker.frame_report().vision_rejected, "frame {seq}");
-            // Vision's pose (25 mm along), not the old one.
+            // The tracker is on vision's pose (25 mm along) at once, not the old one...
+            let internal_mm =
+                (tracker.last_pose().inverse().translation - before.inverse().translation).length()
+                    * 1e3;
+            assert!(
+                internal_mm > 15.0,
+                "frame {seq}: back at the old pose, {internal_mm} mm from it"
+            );
+            // ...and the published pose closes on it at the hold's rate, not in one jump.
             let mm = moved_mm(&status);
             assert!(
-                mm > 15.0,
-                "frame {seq}: back at the old pose, {mm} mm from it"
+                mm - last_mm <= PUBLISH_CLOSE_M_PER_S * frame_s * 1e3 + 0.1,
+                "frame {seq}: published stepped {} mm",
+                mm - last_mm
             );
+            last_mm = mm;
         }
+        assert!(last_mm > 20.0, "never closed on vision: {last_mm} mm");
         let f = tracker.fusion_stats();
         assert_eq!(f.reject_runs_expired, 1, "{f:?}");
         assert_eq!(f.rejects, u64::from(MAX_CONSECUTIVE_REJECTS), "{f:?}");
@@ -8517,6 +8634,319 @@ mod tests {
         );
         assert!(f.wheel_dropped >= 10, "{f:?}");
         assert_eq!(f.rejects, 0, "{f:?}");
+    }
+
+    /// The robot's head mount (app `head.ron`, `wheel_odom.cam_in_base_*`): the camera 1.17 m up,
+    /// 0.106 m off the base's rotation axis, pitched 22 deg down; the robot's wheel noise.
+    fn robot_cam_in_base() -> Pose3d {
+        Pose3d::new(
+            crate::wheel::mat3_from_rows(&[
+                0.013874125,
+                -0.379527910,
+                0.925076253,
+                -0.999332488,
+                -0.036531869,
+                0.0,
+                0.033794765,
+                -0.924458754,
+                -0.379781418,
+            ]),
+            Vec3F64::new(-0.088381105, 0.058421493, 1.166114481),
+        )
+    }
+
+    fn robot_fusion_tracker(fusion: Option<FusionConfig>) -> Tracker {
+        scene_tracker_with(|c| {
+            c.inertial = Some(static_inertial_config());
+            c.wheel_odom =
+                Some(WheelOdomConfig::new(robot_cam_in_base(), 0.05, 0.01).expect("valid"));
+            c.per_frame_fusion = fusion;
+        })
+    }
+
+    /// The robot's `per_frame_fusion` block (app `head.ron`): the mount's lever arm known only
+    /// to 10 cm until the URDF is corrected.
+    fn robot_fusion_config() -> FusionConfig {
+        FusionConfig {
+            extrinsic_sigma_m: 0.1,
+            ..FusionConfig::default()
+        }
+    }
+
+    /// The model errors of the real rig, which the configured mount and wheel model leave out.
+    #[derive(Debug, Clone, Copy)]
+    struct TurnErrors {
+        /// The camera's true lever arm minus the configured one, base frame, metres.
+        lever_err_m: Vec3F64,
+        /// The head's yaw lag on the mast, ramped in over the turn's first 0.3 s, radians.
+        play_rad: f64,
+        /// The wheels' heading over-read, a fraction of the angle turned.
+        wheel_scale: f64,
+        /// The base origin's sideways scrub per radian turned, metres.
+        scrub_m_per_rad: f64,
+    }
+
+    /// A well calibrated rig: a 1 cm lever-arm error, 2 deg of head play, a 2 % wheel heading
+    /// error and 2.5 cm/rad of scrub.
+    fn calibrated_turn_errors() -> TurnErrors {
+        TurnErrors {
+            lever_err_m: Vec3F64::new(0.007, -0.007, 0.0),
+            play_rad: 0.0349,
+            wheel_scale: 0.02,
+            scrub_m_per_rad: 0.025,
+        }
+    }
+
+    /// The robot as measured on the 2026-10-10 drive: the camera circles a turning axis at base
+    /// `(+0.120, +0.040)` m from it (both 38 deg turns, within 1 mm of each other, from the
+    /// published poses before and after each turn), where the URDF mount puts it at
+    /// `(-0.088, +0.058)`: 21 cm off, ahead of the axle instead of behind it. Plus the head play
+    /// and the wheel heading error of [`calibrated_turn_errors`].
+    fn measured_turn_errors() -> TurnErrors {
+        TurnErrors {
+            lever_err_m: Vec3F64::new(0.1197 + 0.088381105, 0.0402 - 0.058421493, 0.0),
+            scrub_m_per_rad: 0.0,
+            ..calibrated_turn_errors()
+        }
+    }
+
+    /// What a turn on the robot did to the per-frame fusion, frame by frame.
+    #[derive(Debug, Default)]
+    struct TurnRun {
+        rejects: u64,
+        expired: u64,
+        /// Largest frame-to-frame change of the published camera centre's error against the
+        /// truth, mm: a snap shows here, the turn's own motion does not.
+        worst_step_mm: f64,
+        worst_err_mm: f64,
+        wheel_dropped: u64,
+        imu_dropped: u64,
+        chi2: Vec<(f64, u8, bool)>,
+        steps_mm: Vec<f64>,
+        /// The steps on the frames that END a rejection run (the previous frame rejected, this
+        /// one not), mm.
+        end_steps_mm: Vec<f64>,
+    }
+
+    /// A base turning in place at `rate` rad/s for `frames` frames, the robot's mount, and the
+    /// model errors of the real rig: the camera's true lever arm `lever_err_m` off the
+    /// configured one, the head lagging the turn by `play_rad` on its mast (ramped in over the
+    /// first 0.3 s, pivoting on the camera), and the wheels over-reading the angle by
+    /// `wheel_scale`. Vision sees the truth.
+    fn run_robot_turn(
+        rate: f64,
+        frames: u32,
+        e: TurnErrors,
+        fusion: Option<FusionConfig>,
+    ) -> (Tracker, TurnRun) {
+        let TurnErrors {
+            lever_err_m,
+            play_rad,
+            wheel_scale,
+            scrub_m_per_rad,
+        } = e;
+        let mut tracker = robot_fusion_tracker(fusion);
+        let start = park_until_static_init(&mut tracker);
+        // The robot's scene keeps its inliers, so keyframes come at the policy's
+        // `max_frames_between` (8 frames, 0.67 s at 12 Hz), not every 3 as this small scene's.
+        tracker.config.keyframe_policy.min_frames_between = 8;
+        let t_start = f64::from(start) * FRAME_NS as f64 * 1e-9;
+        let theta = move |t: f64| rate * (t - t_start).max(0.0);
+        let cfg_cam_in_base = robot_cam_in_base();
+        let true_cam_in_base = Pose3d::new(
+            cfg_cam_in_base.rotation,
+            cfg_cam_in_base.translation + lever_err_m,
+        );
+        // The head pans on the mast 0.178 m behind the base origin (URDF `head_pan_joint`).
+        let p_pan = Vec3F64::new(-0.178, 0.0, 0.0);
+        let play = move |t: f64| {
+            let s = ((t - t_start) / 0.3).clamp(0.0, 1.0);
+            -play_rad * s * rate.signum()
+        };
+        // The camera in the base at `t`: yawed by the play about the pan axis.
+        let cam_in_base_at = move |t: f64| {
+            let pivot = Pose3d::new(Mat3F64::IDENTITY, p_pan);
+            let yaw = Pose3d::new(
+                SO3F64::exp(Vec3F64::new(0.0, 0.0, play(t))).matrix(),
+                Vec3F64::ZERO,
+            );
+            pivot
+                .compose(&yaw)
+                .compose(&pivot.inverse())
+                .compose(&true_cam_in_base)
+        };
+        // World = the first camera: T_w<-c(t) = T_c0<-b0 * T_b0<-b(t) * T_b<-c(t), the base
+        // turning about its origin while scrubbing sideways (castor drag, wheel slip) by
+        // `scrub_m_per_rad` of turn, which the wheels do not see.
+        let cam_at = move |t: f64| {
+            let rz = Pose3d::new(
+                SO3F64::exp(Vec3F64::new(0.0, 0.0, theta(t))).matrix(),
+                Vec3F64::new(0.0, scrub_m_per_rad * theta(t).abs(), 0.0),
+            );
+            true_cam_in_base
+                .inverse()
+                .compose(&rz)
+                .compose(&cam_in_base_at(t))
+        };
+        let t_of = |seq: u32| f64::from(seq) * FRAME_NS as f64 * 1e-9;
+        let first = published(&feed_moving(
+            &mut tracker,
+            start,
+            &cam_at,
+            0.0,
+            &cam_at(t_of(start)),
+        ));
+        let mut run = TurnRun::default();
+        let mut prev_err: Option<Vec3F64> = None;
+        let mut prev_rejected = false;
+        for seq in start + 1..start + 1 + frames {
+            let truth = cam_at(t_of(seq));
+            let status = feed_moving(
+                &mut tracker,
+                seq,
+                &cam_at,
+                theta(t_of(seq)) * (1.0 + wheel_scale),
+                &truth,
+            );
+            let f = tracker.fusion_stats();
+            run.chi2.push((
+                f.last_chi2,
+                f.last_dof,
+                tracker.frame_report().vision_rejected,
+            ));
+            // The camera centre since the turn started, in the first frame's camera.
+            let rel = first.compose(&published(&status).inverse());
+            let err = rel.translation - truth.translation;
+            let rejected = tracker.frame_report().vision_rejected;
+            if let Some(p) = prev_err {
+                let step = (err - p).length() * 1e3;
+                run.steps_mm.push((step * 10.0).round() / 10.0);
+                run.worst_step_mm = run.worst_step_mm.max(step);
+                if prev_rejected && !rejected {
+                    run.end_steps_mm.push(step);
+                }
+            }
+            prev_rejected = rejected;
+            run.worst_err_mm = run.worst_err_mm.max(err.length() * 1e3);
+            prev_err = Some(err);
+        }
+        let f = tracker.fusion_stats();
+        run.rejects = f.rejects;
+        run.expired = f.reject_runs_expired;
+        run.wheel_dropped = f.wheel_dropped;
+        run.imu_dropped = f.imu_dropped;
+        (tracker, run)
+    }
+
+    /// (a) THE LIVE BUG (2026-10-10, robot on the floor, +-40 deg turns at 0.3 rad/s): vision
+    /// agreed with the gyro within 0.6 deg, yet the gate rejected it for 15 frames in a row
+    /// (chi2 179-259), the prediction coasted, and the published pose snapped 55-65 mm when the
+    /// run expired. The wheel factor predicted the camera's swing through a mount whose lever arm
+    /// is 21 cm off ([`measured_turn_errors`]) with a 1 mm translation sigma, so a few frames into
+    /// any turn vision read as wrong. Here, with the robot's mount, its wheel noise and its
+    /// configured `extrinsic_sigma_m`: vision is kept through the whole turn and the published
+    /// camera never steps. A calibrated rig keeps it at the default sigma too.
+    ///
+    /// Mutations (each turned this red): the extrinsic term left out of `MotionFactor::wheel`,
+    /// i.e. the model before it (14 rejects in the +0.3 rad/s turn, the published camera 69 mm
+    /// off the truth, 14 mm steps); the robot's sigma at the default 0.03 (13 rejects, 18 mm
+    /// steps).
+    #[test]
+    fn test_a_robot_turn_with_the_measured_mount_error_keeps_vision() {
+        for rate in [0.3, -0.3] {
+            // The control: vision alone, the scene's own frame-to-frame noise.
+            let (_, alone) = run_robot_turn(rate, 24, measured_turn_errors(), None);
+            let (_, measured) = run_robot_turn(
+                rate,
+                24,
+                measured_turn_errors(),
+                Some(robot_fusion_config()),
+            );
+            let (_, calibrated) = run_robot_turn(
+                rate,
+                24,
+                calibrated_turn_errors(),
+                Some(FusionConfig::default()),
+            );
+            println!(
+                "rate {rate}\n vision alone {alone:?}\n measured {measured:?}\n calibrated {calibrated:?}"
+            );
+            for run in [&measured, &calibrated] {
+                assert!(run.rejects <= 1, "rate {rate}: {run:?}");
+                assert_eq!(run.expired, 0, "rate {rate}: {run:?}");
+                assert!(
+                    run.worst_step_mm < alone.worst_step_mm + 1.0,
+                    "rate {rate}: steps {} mm against vision alone's {} mm: {run:?}",
+                    run.worst_step_mm,
+                    alone.worst_step_mm
+                );
+            }
+        }
+    }
+
+    /// (b) Parked, the robot's mount and its loose `extrinsic_sigma_m` (10 cm): PnP outliers
+    /// (the scene as seen 12.5 and 25 mm along, a moving object filling the view) are still
+    /// rejected and the published pose does not move. The extrinsic term acts only through the
+    /// motion, so a parked gate is exactly as tight as with no term at all.
+    ///
+    /// Mutation: the term applied whatever the motion (`I - Ad` replaced by `I` in
+    /// `fusion::extrinsic_covariance`) turned this red (both outliers accepted).
+    #[test]
+    fn test_parked_outliers_are_still_rejected_with_the_robot_mount() {
+        let mut tracker = robot_fusion_tracker(Some(robot_fusion_config()));
+        let start = park_until_static_init(&mut tracker);
+        let still = |_t: f64| Pose3d::IDENTITY;
+        let mut seq = start;
+        let mut before = Pose3d::IDENTITY;
+        let mut good = |tracker: &mut Tracker, seq: &mut u32| {
+            for _ in 0..6 {
+                before = published(&feed_moving(tracker, *seq, &still, 0.0, &Pose3d::IDENTITY));
+                *seq += 1;
+            }
+            before
+        };
+        for steps in [1.0, 2.0] {
+            let before = good(&mut tracker, &mut seq);
+            let jumped = Pose3d::new(
+                Mat3F64::IDENTITY,
+                Vec3F64::new(steps * SCENE_STEP_M, 0.0, 0.0),
+            );
+            let rejects = tracker.fusion_stats().rejects;
+            let status = feed_moving(&mut tracker, seq, &still, 0.0, &jumped);
+            seq += 1;
+            let f = tracker.fusion_stats();
+            let moved_mm =
+                (published(&status).inverse().translation - before.inverse().translation).length()
+                    * 1e3;
+            println!("{steps} steps: chi2 {} moved {moved_mm} mm", f.last_chi2);
+            assert_eq!(f.rejects, rejects + 1, "{steps} steps accepted: {f:?}");
+            assert!(moved_mm < 3.0, "{steps} steps: moved {moved_mm} mm");
+        }
+    }
+
+    /// (c) A rejection run that ends does not snap the published pose: the measured 21 cm mount
+    /// error under a sigma far too small for it (the default 3 cm), so runs do start and expire,
+    /// and each end is held and closed at [`PUBLISH_CLOSE_M_PER_S`] instead of jumping.
+    ///
+    /// Mutation: the hold never set (`publish_hold_target` left `None`) turned this red: a 46 mm
+    /// step on the frame the run expired, the live run's 55-65 mm snap.
+    #[test]
+    fn test_the_end_of_a_rejection_run_does_not_snap_the_published_pose() {
+        for rate in [0.3, -0.3] {
+            let (_, run) = run_robot_turn(
+                rate,
+                30,
+                measured_turn_errors(),
+                Some(FusionConfig::default()),
+            );
+            println!("rate {rate}: {run:?}");
+            assert!(run.expired >= 1, "rate {rate}: no run expired: {run:?}");
+            assert!(!run.end_steps_mm.is_empty(), "rate {rate}: {run:?}");
+            assert!(
+                run.end_steps_mm.iter().all(|&s| s < 10.0),
+                "rate {rate}: {run:?}"
+            );
+        }
     }
 
     /// What the fusion costs per frame, against the whole frame, on the parked-then-turning run

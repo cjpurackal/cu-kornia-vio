@@ -38,6 +38,28 @@
 //! [`KF_ACCEL_BIAS_SIGMA`], [`KF_VELOCITY_SIGMA`] and [`GYRO_RELATIVE_SIGMA`]. They decide how far
 //! the motion sensors can outvote vision, and none of them is measured on the robot.
 //!
+//! # The model errors that grow with motion
+//!
+//! The wheels measure the BASE; the camera reaches it through the mount, and the mount is known
+//! only so well: the lever arm from the URDF, a base whose turning centre wanders off its axle
+//! midpoint (castor drag, scrub), a head with a few degrees of play on its mast. A constant
+//! extrinsic error `e` cancels between the two ends of a still interval and does not between
+//! the ends of a turn: the wheel residual moves by `(I - Ad(dT^-1)) e`, `|dtheta| * lever` in
+//! translation (the camera is 0.106 m off the turning axis on the robot). The wheel factor's
+//! covariance therefore carries `(I - Ad) Sigma_e (I - Ad)^T`, with `Sigma_e` from the configured
+//! `extrinsic_sigma_m` / `extrinsic_sigma_rad` ([`FusionConfig`]). Zero for a parked robot, so
+//! the parked gate is exactly as tight as before; ~30 mm (1 sigma) per radian turned at the
+//! default 3 cm. Without it the wheel factor claimed the camera's swing to the 1 mm of its
+//! translation floor, and any lever-arm error read as vision being wrong: 2026-10-10 every
+//! 0.3 rad/s turn rejected vision for 15 frames in a row, then snapped the published pose
+//! 55-65 mm. On that drive the camera circled the turning axis from base `(+0.120, +0.040)` m,
+//! where the URDF mount says `(-0.088, +0.058)`: 21 cm of lever-arm error, which no sigma
+//! should be asked to hide for long — fix the mount, then bring the sigma back down.
+//!
+//! Vision's covariance is its reprojection Hessian's inverse scaled by the solution's own
+//! a-posteriori variance (the inliers' robust cost over its `2n - 6` degrees of freedom, never
+//! below 1), plus the landmark floor.
+//!
 //! # The gate
 //!
 //! Two votes, so that vision is only ever blamed for a disagreement vision is part of.
@@ -51,7 +73,9 @@
 //!    the landmarks' own error), `d = Log(x_v x_p^-1)`: `chi2 = d^T (Sigma_v + H_p^-1)^-1 d`,
 //!    computed as `d^T H_p (H_p + Sigma_v^-1)^-1 Sigma_v^-1 d` so a rank-3 `H_p` (gyro only) is
 //!    fine, with 3 or 6 degrees of freedom. Past the gate, vision is rejected for the frame and
-//!    `x_p` is published instead, as a coast.
+//!    `x_p` is published instead, as a coast — with vision's ROTATION when the rotation block
+//!    alone passes its 3-DOF gate: a rotation that agrees with the gyro is not thrown away for
+//!    a translation disagreement (the coast keeps the predicted camera centre).
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
@@ -97,6 +121,18 @@ pub const VISION_TRANSLATION_SIGMA_FLOOR: f64 = 2e-3;
 /// See [`VISION_TRANSLATION_SIGMA_FLOOR`].
 pub const VISION_ROTATION_SIGMA_FLOOR: f64 = 1e-3;
 
+/// One sigma of the camera's position relative to the base's TURNING centre, metres: the lever
+/// arm's calibration, the turning centre's wander off the axle midpoint (castor drag, scrub) and
+/// the head's play on the mast together. Acts only through the motion
+/// ([`MotionFactor::wheel`]): at 0.37 rad turned (the live run's keyframe interval) it is
+/// 11 mm of wheel translation sigma at the camera. A default for a CALIBRATED mount; a robot
+/// whose mount is known worse sets its own (the XLeRobot's is 21 cm off, see the module doc).
+pub const DEFAULT_EXTRINSIC_SIGMA_M: f64 = 0.03;
+
+/// One sigma of the camera mount's rotation relative to the base, radians (2 deg: the head's
+/// residual yaw play and the mount fit). Also acts only through the motion.
+pub const DEFAULT_EXTRINSIC_SIGMA_RAD: f64 = 0.035;
+
 /// Huber threshold on a reprojection's normalized squared error: the 2-DOF 95 % quantile.
 const HUBER_REPROJECTION_CHI2: f64 = 5.991;
 
@@ -113,24 +149,34 @@ pub struct FusionConfig {
     /// The gate on the vision-vs-prediction Mahalanobis distance, as a 6-DOF chi-square value;
     /// see [`gate_for_dof`].
     pub chi2_gate: f64,
+    /// The camera-to-base lever arm's uncertainty, metres; see [`DEFAULT_EXTRINSIC_SIGMA_M`].
+    pub extrinsic_sigma_m: f64,
+    /// The camera-to-base rotation's uncertainty, radians; see [`DEFAULT_EXTRINSIC_SIGMA_RAD`].
+    pub extrinsic_sigma_rad: f64,
 }
 
 impl Default for FusionConfig {
     fn default() -> Self {
         Self {
             chi2_gate: DEFAULT_CHI2_GATE,
+            extrinsic_sigma_m: DEFAULT_EXTRINSIC_SIGMA_M,
+            extrinsic_sigma_rad: DEFAULT_EXTRINSIC_SIGMA_RAD,
         }
     }
 }
 
 impl FusionConfig {
-    /// Refuses a gate that is not finite and positive.
+    /// Refuses a gate that is not finite and positive, and an extrinsic sigma that is not
+    /// finite and positive.
     pub fn validate(&self) -> Result<(), VioError> {
-        if !self.chi2_gate.is_finite() || self.chi2_gate <= 0.0 {
-            return Err(VioError::FusionParamInvalid {
-                field: "chi2_gate",
-                value: self.chi2_gate,
-            });
+        for (field, value) in [
+            ("chi2_gate", self.chi2_gate),
+            ("extrinsic_sigma_m", self.extrinsic_sigma_m),
+            ("extrinsic_sigma_rad", self.extrinsic_sigma_rad),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(VioError::FusionParamInvalid { field, value });
+            }
         }
         Ok(())
     }
@@ -146,6 +192,9 @@ pub struct FusionStats {
     /// Rejection runs that reached [`MAX_CONSECUTIVE_REJECTS`]: the next frame's vision was
     /// accepted and the fusion suspended until the next keyframe.
     pub reject_runs_expired: u64,
+    /// Rejected frames whose coast kept vision's rotation (its rotation block passed alone),
+    /// lifetime.
+    pub rotation_kept: u64,
     /// Frames whose wheel factor was left out because the wheels disagreed with the gyro (slip,
     /// or the head turned on its mast), lifetime.
     pub wheel_dropped: u64,
@@ -311,15 +360,27 @@ impl MotionFactor {
 
     /// The wheel factor of a keyframe-to-frame interval: kornia-slam's BA factor with the
     /// keyframe end fixed. `None` for a measurement whose information is not positive definite.
+    ///
+    /// `extrinsic_sigma` is `[metres, radians]` of camera-to-base uncertainty; its effect on the
+    /// residual, `(I - Ad(dT^-1)) Sigma_e (I - Ad(dT^-1))^T`, is added to the measurement's
+    /// covariance (see the module doc). Zero for a zero-motion interval.
     pub fn wheel(
         measurement: &WheelOdomMeasurement,
         t_cb_from: Pose3d,
         t_cb_to: Pose3d,
         kf_pose_cw: &Pose3d,
+        extrinsic_sigma: [f64; 2],
     ) -> Option<Self> {
         let info = measurement.information()?;
-        let information: Vec<f64> = info.iter().flatten().copied().collect();
-        let covariance = invert(&information, 6)?;
+        let mut information: Vec<f64> = info.iter().flatten().copied().collect();
+        let mut covariance = invert(&information, 6)?;
+        let extra = extrinsic_covariance(&measurement.delta_pose(), extrinsic_sigma);
+        if extra.iter().any(|&v| v != 0.0) {
+            for (c, e) in covariance.iter_mut().zip(&extra) {
+                *c += e;
+            }
+            information = invert(&covariance, 6)?;
+        }
         Some(Self {
             term: MotionTerm::Wheel {
                 delta_inv: measurement.delta_pose().inverse(),
@@ -396,13 +457,59 @@ impl MotionFactor {
     }
 }
 
+/// `(I - Ad(dT^-1)) Sigma_e (I - Ad(dT^-1))^T`, 6x6 row-major in the residual's `[rho; omega]`
+/// tangent: what a camera-to-base error `e ~ N(0, Sigma_e)`, `Sigma_e = diag(sigma_m^2 I,
+/// sigma_rad^2 I)` (a right perturbation of `T_cb`, base frame) does to the wheel residual
+/// `Log(dT^-1 T_wb_kf^-1 T_wb)` when both ends see the same error: `T_wb` derived through a
+/// wrong mount is `T_wb Exp(e)` at both ends, so `r = Log(Exp(-Ad(dT^-1) e) Exp(e))`.
+pub(crate) fn extrinsic_covariance(delta: &Pose3d, sigma: [f64; 2]) -> [f64; 36] {
+    // Ad(T) = [[R, [t]x R], [0, R]] of T = dT^-1.
+    let inv = delta.inverse();
+    let r = inv.rotation.to_cols_array();
+    let rm = |i: usize, j: usize| r[j * 3 + i];
+    let t = inv.translation;
+    let tx = [[0.0, -t.z, t.y], [t.z, 0.0, -t.x], [-t.y, t.x, 0.0]];
+    let mut a = [[0.0f64; 6]; 6];
+    for i in 0..3 {
+        for j in 0..3 {
+            a[i][j] = rm(i, j);
+            a[i + 3][j + 3] = rm(i, j);
+            a[i][j + 3] = (0..3).map(|k| tx[i][k] * rm(k, j)).sum();
+        }
+    }
+    // A = I - Ad.
+    for (i, row) in a.iter_mut().enumerate() {
+        for (j, v) in row.iter_mut().enumerate() {
+            *v = f64::from(u8::from(i == j)) - *v;
+        }
+    }
+    let var = [
+        sigma[0] * sigma[0],
+        sigma[0] * sigma[0],
+        sigma[0] * sigma[0],
+        sigma[1] * sigma[1],
+        sigma[1] * sigma[1],
+        sigma[1] * sigma[1],
+    ];
+    let mut out = [0.0; 36];
+    for i in 0..6 {
+        for j in 0..6 {
+            out[i * 6 + j] = (0..6).map(|k| a[i][k] * var[k] * a[j][k]).sum();
+        }
+    }
+    out
+}
+
 /// What the gate decided for one frame.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FusionOutcome {
-    /// The pose to publish: fused, or the motion sensors' prediction when vision was rejected.
+    /// The pose to publish: fused, or the motion sensors' prediction when vision was rejected
+    /// (with vision's rotation when `rotation_kept`).
     pub pose: Pose3d,
     /// Whether vision was rejected.
     pub rejected: bool,
+    /// Rejected, but vision's rotation block passed its own 3-DOF gate and `pose` carries it.
+    pub rotation_kept: bool,
     /// The predictor left out because it disagreed with the other and vision sided with the
     /// other; `None` when they agreed (or only one was there).
     pub dropped: Option<Predictor>,
@@ -442,11 +549,25 @@ pub(crate) fn fuse(
         dropped = Some(odd);
     }
     let prediction = solve(camera, &[], &active, prediction_seed);
-    let (chi2, dof) = vision_chi2(&vision_info, &active, vision_pose, &prediction)?;
+    let gate = vision_gate(&vision_info, &active, vision_pose, &prediction)?;
+    let (chi2, dof) = (gate.chi2, gate.dof);
     if chi2 > gate_for_dof(chi2_gate, dof) {
+        // The rotation block alone, when the prediction constrains the whole pose (with a
+        // gyro-only prediction the whole gate already was the rotation's).
+        let rotation_passes = dof == 6
+            && rotation_block_chi2(&vision_info, &gate.h_p, &gate.d)
+                .is_some_and(|c| c <= gate_for_dof(chi2_gate, 3));
+        let coast = if rotation_passes {
+            // `Exp([0; omega]) x_p`: vision's rotation exactly (omega = Log(R_v R_p^T)), turned
+            // about the predicted camera centre, which stays.
+            se3_exp(&[0.0, 0.0, 0.0, gate.d[3], gate.d[4], gate.d[5]]).compose(&prediction)
+        } else {
+            prediction
+        };
         return Some(FusionOutcome {
-            pose: prediction,
+            pose: coast,
             rejected: true,
+            rotation_kept: rotation_passes,
             dropped,
             chi2,
             dof,
@@ -455,6 +576,7 @@ pub(crate) fn fuse(
     Some(FusionOutcome {
         pose: solve(camera, visual, &active, vision_pose),
         rejected: false,
+        rotation_kept: false,
         dropped,
         chi2,
         dof,
@@ -510,7 +632,8 @@ fn solve_motion(factors: &[MotionFactor], seed: &Pose3d) -> Pose3d {
     solve(&camera, &[], factors, seed)
 }
 
-/// Vision's pose information: the reprojections' Hessian at `vision_pose`, inverted, plus the
+/// Vision's pose information: the reprojections' Hessian at `vision_pose`, inverted and scaled
+/// by the solution's a-posteriori variance factor ([`aposteriori_variance_factor`]), plus the
 /// landmark floor ([`VISION_TRANSLATION_SIGMA_FLOOR`]), inverted back. 6x6 row-major. `None` when
 /// vision's Hessian is singular.
 pub(crate) fn vision_information(
@@ -518,14 +641,29 @@ pub(crate) fn vision_information(
     visual: &[VisualObs],
     vision_pose: &Pose3d,
 ) -> Option<Vec<f64>> {
-    let (h_v, _, _) = visual_normal_equations(camera, visual, vision_pose);
+    let (h_v, _, cost) = visual_normal_equations(camera, visual, vision_pose);
     let h_flat: Vec<f64> = h_v.iter().flatten().copied().collect();
     let mut sigma_v = invert(&h_flat, 6)?;
+    let s2 = aposteriori_variance_factor(cost, visual.len());
+    for v in &mut sigma_v {
+        *v *= s2;
+    }
     for i in 0..3 {
         sigma_v[i * 6 + i] += VISION_TRANSLATION_SIGMA_FLOOR.powi(2);
         sigma_v[(i + 3) * 6 + i + 3] += VISION_ROTATION_SIGMA_FLOOR.powi(2);
     }
     invert(&sigma_v, 6)
+}
+
+/// The reprojections' own variance factor: their robust cost over its `2n - 6` degrees of freedom
+/// (the a-posteriori sigma^2 of a least-squares fit), never below 1, so a frame whose inliers fit
+/// worse than the assumed `1.2^octave` px widens its own covariance and a clean one keeps it.
+pub(crate) fn aposteriori_variance_factor(cost: f64, n_obs: usize) -> f64 {
+    let dof = (2 * n_obs).saturating_sub(6);
+    if dof == 0 || !cost.is_finite() {
+        return 1.0;
+    }
+    (cost / dof as f64).max(1.0)
 }
 
 /// The 6-DOF chi-square value `chi2_6` moved to `dof` degrees of freedom at the same tail
@@ -552,6 +690,25 @@ pub(crate) fn vision_chi2(
     vision_pose: &Pose3d,
     prediction: &Pose3d,
 ) -> Option<(f64, usize)> {
+    vision_gate(vision_info, factors, vision_pose, prediction).map(|g| (g.chi2, g.dof))
+}
+
+/// [`vision_chi2`]'s value with what the partial acceptance needs.
+struct VisionGate {
+    chi2: f64,
+    dof: usize,
+    /// `d = Log(x_v x_p^-1)`.
+    d: [f64; 6],
+    /// The prediction's Gauss-Newton information, for [`rotation_block_chi2`].
+    h_p: Mat6,
+}
+
+fn vision_gate(
+    vision_info: &[f64],
+    factors: &[MotionFactor],
+    vision_pose: &Pose3d,
+    prediction: &Pose3d,
+) -> Option<VisionGate> {
     let mut h_p = [[0.0; 6]; 6];
     let mut unused = [0.0; 6];
     for f in factors {
@@ -577,7 +734,33 @@ pub(crate) fn vision_chi2(
     } else {
         3
     };
-    chi2.is_finite().then_some((chi2.max(0.0), dof))
+    chi2.is_finite().then_some(VisionGate {
+        chi2: chi2.max(0.0),
+        dof,
+        d,
+        h_p,
+    })
+}
+
+/// `d_w^T (S_ww)^-1 d_w`, `S = H_v^-1 + H_p^-1`, `d_w` the rotation half of `d`. `None` when
+/// either information is singular (then the rotation is not tested alone).
+fn rotation_block_chi2(vision_info: &[f64], h_p: &Mat6, d: &[f64; 6]) -> Option<f64> {
+    let hp: Vec<f64> = h_p.iter().flatten().copied().collect();
+    let sp = invert(&hp, 6)?;
+    let sv = invert(vision_info, 6)?;
+    let mut s = vec![0.0; 9];
+    for r in 0..3 {
+        for c in 0..3 {
+            let k = (r + 3) * 6 + c + 3;
+            s[r * 3 + c] = sv[k] + sp[k];
+        }
+    }
+    let mut y = vec![d[3], d[4], d[5]];
+    if !cholesky_solve(&mut s, 3, &mut y) {
+        return None;
+    }
+    let c = d[3] * y[0] + d[4] * y[1] + d[5] * y[2];
+    c.is_finite().then_some(c.max(0.0))
 }
 
 /// Levenberg-Marquardt over the pose: robust reprojections plus quadratic motion factors.
@@ -825,7 +1008,7 @@ pub(crate) fn se3_exp(xi: &[f64; 6]) -> Pose3d {
 }
 
 /// The inverse of [`se3_exp`].
-fn se3_log(t: &Pose3d) -> [f64; 6] {
+pub(crate) fn se3_log(t: &Pose3d) -> [f64; 6] {
     let omega = SO3F64::from_matrix(&t.rotation).log();
     let rho = SO3F64::left_jacobian(omega).inverse() * t.translation;
     [rho.x, rho.y, rho.z, omega.x, omega.y, omega.z]
@@ -993,7 +1176,7 @@ mod tests {
             tilt_sigma: sigma_rad,
         };
         // The keyframe placed so that the measurement's prediction is `pose`.
-        MotionFactor::wheel(&m, t_cb, t_cb, pose).expect("positive definite")
+        MotionFactor::wheel(&m, t_cb, t_cb, pose, [0.0; 2]).expect("positive definite")
     }
 
     fn centre(p: &Pose3d) -> Vec3F64 {
@@ -1383,6 +1566,127 @@ mod tests {
             let grew = turning.covariance[i * 3 + i] - still.covariance[i * 3 + i];
             assert!((grew - want).abs() < 1e-12, "{i}: {grew} vs {want}");
         }
+    }
+
+    /// The extrinsic term is `(I - Ad(dT^-1)) Sigma_e (I - Ad)^T`: zero for a still interval,
+    /// and for a yaw of theta `2 (1 - cos theta) sigma^2` (~ `(theta sigma)^2`) on the planar
+    /// translation and on roll and pitch, nothing on z or yaw (a mount error about the turning
+    /// axis commutes with the turn).
+    ///
+    /// Mutation: `I - Ad` replaced by `I` turned this red (non-zero when still).
+    #[test]
+    fn test_the_extrinsic_term_grows_with_the_turn_and_is_zero_parked() {
+        let sigma = [0.03, 0.035];
+        let still = extrinsic_covariance(&Pose3d::IDENTITY, sigma);
+        assert!(still.iter().all(|&v| v.abs() < 1e-18), "{still:?}");
+        let theta: f64 = 0.37;
+        let turn = Pose3d::new(
+            SO3F64::exp(Vec3F64::new(0.0, 0.0, theta)).matrix(),
+            Vec3F64::ZERO,
+        );
+        let c = extrinsic_covariance(&turn, sigma);
+        let k = 2.0 * (1.0 - theta.cos());
+        for (i, s) in [(0, sigma[0]), (1, sigma[0]), (3, sigma[1]), (4, sigma[1])] {
+            assert!(
+                (c[i * 6 + i] - k * s * s).abs() < 1e-12,
+                "{i}: {}",
+                c[i * 6 + i]
+            );
+        }
+        assert!(c[2 * 6 + 2].abs() < 1e-15 && c[5 * 6 + 5].abs() < 1e-15);
+        // 11 mm of translation sigma at the default 3 cm over the live run's 0.37 rad.
+        assert!((c[0].sqrt() - 0.011).abs() < 5e-4, "{}", c[0].sqrt());
+        // ...and the wheel factor carries it.
+        let m = WheelOdomMeasurement {
+            delta: [0.0, 0.0, theta],
+            covariance: [[1e-6, 0.0, 0.0], [0.0, 1e-6, 0.0], [0.0, 0.0, 1e-4]],
+            z_sigma: 0.01,
+            tilt_sigma: 0.01,
+        };
+        let bare =
+            MotionFactor::wheel(&m, Pose3d::IDENTITY, Pose3d::IDENTITY, &turn, [0.0; 2]).unwrap();
+        let with =
+            MotionFactor::wheel(&m, Pose3d::IDENTITY, Pose3d::IDENTITY, &turn, sigma).unwrap();
+        assert!((with.covariance[0] - bare.covariance[0] - c[0]).abs() < 1e-12);
+    }
+
+    /// Vision 5 cm off a stiff prediction in translation but with the right rotation: rejected,
+    /// and the coast keeps vision's rotation about the predicted camera centre. With the
+    /// rotation off too, the coast is the prediction.
+    ///
+    /// Mutation: `rotation_passes` forced false turned this red.
+    #[test]
+    fn test_a_rejected_frame_keeps_a_rotation_that_agrees() {
+        let cam = camera();
+        let truth = se3_exp(&[0.0, 0.0, 0.0, 0.0, 0.2, 0.0]);
+        let f = wheel_factor_at(&truth, 0.001, 0.01);
+        let shifted = se3_exp(&[0.05, 0.0, 0.0, 0.0, 0.0, 0.0]).compose(&truth);
+        let tilted = se3_exp(&[0.0, 0.0, 0.0, 0.0, 0.05, 0.0]).compose(&shifted);
+        // The prediction's own rotation sigma is 10 mrad: the vision rotation 3 mrad off it.
+        let seen = se3_exp(&[0.0, 0.0, 0.0, 0.003, 0.0, 0.0]).compose(&shifted);
+        let out = fuse(
+            &cam,
+            &observations(&seen),
+            std::slice::from_ref(&f),
+            &seen,
+            &seen,
+            DEFAULT_CHI2_GATE,
+        )
+        .unwrap();
+        assert!(out.rejected && out.rotation_kept, "{out:?}");
+        let r = out.pose.rotation * seen.rotation.transpose();
+        assert!(SO3F64::from_matrix(&r).log().length() < 1e-9);
+        assert!((centre(&out.pose) - centre(&truth)).length() < 1e-6);
+        let out = fuse(
+            &cam,
+            &observations(&tilted),
+            std::slice::from_ref(&f),
+            &tilted,
+            &tilted,
+            DEFAULT_CHI2_GATE,
+        )
+        .unwrap();
+        assert!(out.rejected && !out.rotation_kept, "{out:?}");
+        assert!((centre(&out.pose) - centre(&truth)).length() < 1e-6);
+        let r = out.pose.rotation * truth.rotation.transpose();
+        assert!(SO3F64::from_matrix(&r).log().length() < 1e-6);
+    }
+
+    /// Reprojections that fit worse than their assumed sigma widen vision's covariance by their
+    /// own variance factor; exact ones keep it.
+    ///
+    /// Mutation: the factor fixed at 1 turned this red.
+    #[test]
+    fn test_vision_covariance_follows_the_reprojection_fit() {
+        let cam = camera();
+        let truth = se3_exp(&[0.02, 0.0, 0.1, 0.0, 0.05, 0.0]);
+        let exact = observations(&truth);
+        // +-1.5 px of deterministic noise, mean zero over the grid: a variance factor ~2.25.
+        let noisy: Vec<VisualObs> = exact
+            .iter()
+            .enumerate()
+            .map(|(k, o)| {
+                let s = if k % 2 == 0 { 1.5 } else { -1.5 };
+                let t = if (k / 2) % 2 == 0 { 1.5 } else { -1.5 };
+                VisualObs {
+                    pixel: [o.pixel[0] + s, o.pixel[1] + t],
+                    ..*o
+                }
+            })
+            .collect();
+        let cost = |obs: &[VisualObs]| visual_normal_equations(&cam, obs, &truth).2;
+        assert_eq!(aposteriori_variance_factor(cost(&exact), exact.len()), 1.0);
+        let f = aposteriori_variance_factor(cost(&noisy), noisy.len());
+        assert!(f > 2.0 && f < 2.6, "{f}");
+        let (a, b) = (
+            vision_information(&cam, &exact, &truth).unwrap(),
+            vision_information(&cam, &noisy, &truth).unwrap(),
+        );
+        // The Hessian is the same (it does not depend on the residuals); only the scale differs.
+        let (sa, sb) = (invert(&a, 6).unwrap(), invert(&b, 6).unwrap());
+        let floor = VISION_TRANSLATION_SIGMA_FLOOR.powi(2);
+        let ratio = (sb[14] - floor) / (sa[14] - floor);
+        assert!((ratio - f).abs() < 1e-6 * f, "{ratio} vs {f}");
     }
 
     #[test]

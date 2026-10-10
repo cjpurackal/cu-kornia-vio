@@ -410,6 +410,11 @@ pub(crate) fn optional_wheel_odom(
 ///   // Optional: the vision-vs-prediction gate as a 6-DOF chi-square value, scaled to the
 ///   // frame's actual degrees of freedom. Default 22.458, the 99.9 % quantile.
 ///   chi2_gate: 22.458,
+///   // Optional: the camera-to-base mount's uncertainty, metres and radians. Acts only through
+///   // the motion (zero on a parked robot): a turn moves the wheel factor's camera prediction
+///   // by `|dtheta| * sigma`. Defaults 0.03 and 0.035.
+///   extrinsic_sigma_m: 0.03,
+///   extrinsic_sigma_rad: 0.035,
 /// ),
 /// ```
 ///
@@ -427,6 +432,10 @@ pub(crate) struct FusionRon {
     pub enabled: bool,
     #[serde(default)]
     pub chi2_gate: Option<f64>,
+    #[serde(default)]
+    pub extrinsic_sigma_m: Option<f64>,
+    #[serde(default)]
+    pub extrinsic_sigma_rad: Option<f64>,
 }
 
 impl FusionRon {
@@ -435,6 +444,12 @@ impl FusionRon {
         let mut cfg = FusionConfig::default();
         if let Some(g) = self.chi2_gate {
             cfg.chi2_gate = g;
+        }
+        if let Some(v) = self.extrinsic_sigma_m {
+            cfg.extrinsic_sigma_m = v;
+        }
+        if let Some(v) = self.extrinsic_sigma_rad {
+            cfg.extrinsic_sigma_rad = v;
         }
         cfg.validate()?;
         Ok(self.enabled.then_some(cfg))
@@ -876,6 +891,12 @@ mod tests {
             fusion_ron("(enabled: true, chi2: 30.0)").is_err(),
             "unknown field"
         );
+        let c = fusion_ron("(enabled: true, extrinsic_sigma_m: 0.05, extrinsic_sigma_rad: 0.02)")
+            .unwrap()
+            .unwrap();
+        assert_eq!((c.extrinsic_sigma_m, c.extrinsic_sigma_rad), (0.05, 0.02));
+        assert!(fusion_ron("(enabled: true, extrinsic_sigma_m: -0.01)").is_err());
+        assert!(fusion_ron("(enabled: true, extrinsic_sigma_rad: 0.0)").is_err());
     }
 
     fn cfg(keys: &[&str]) -> ComponentConfig {
