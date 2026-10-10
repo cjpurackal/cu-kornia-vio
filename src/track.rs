@@ -849,11 +849,17 @@ pub struct Tracker {
     /// inertial alignment then pivots on the robot, not on the world origin; see
     /// [`Self::apply_inertial_init`].
     map_carried: bool,
-    /// Each recent keyframe's TRACKED pose at insertion, before any BA moved it, with the world
-    /// generation it was tracked in: vision's own word for the motion check
+    /// Each recent keyframe's TRACKED pose at insertion, before any BA moved it, with the map
+    /// state it was tracked against: vision's own word for the motion check
     /// ([`crate::consistency`]). A BA-refined keyframe already leans on the gyro and the wheels
     /// it is being compared with.
-    kf_tracked_poses: std::collections::VecDeque<(usize, u64, Pose3d)>,
+    kf_tracked_poses: std::collections::VecDeque<(usize, TrackedIn, Pose3d)>,
+    /// Whether local BA has solved the current map at least once. Until then the map is YOUNG:
+    /// its keyframes were tracked against the bootstrap's points alone, and the first solve
+    /// re-pivots them (on the parked robot its edges started 0.7-1.3 deg off the gyro,
+    /// 2026-10-10), so a pose tracked before it and one tracked after are not in one frame: the
+    /// interval between them is not checked. Cleared with every new map.
+    map_settled: bool,
     /// Keyframe intervals `(from, to)` vision disagreed with the wheels and the gyro on. Local
     /// BA is skipped while one ends at a free keyframe: it would explain frozen vision with a
     /// gyro bias.
@@ -960,6 +966,15 @@ fn wheel_rotation_cov_in_camera(cov6: &[f64], t_cb_to: &Pose3d) -> Mat3F64 {
 /// factors that can still act (16), with slack.
 const KF_TRACKED_POSES: usize = 32;
 
+/// The map state a keyframe's tracked pose was measured against; two poses are comparable only
+/// when they were measured against the same one, in the current world generation. See
+/// `Tracker::interval_sensors`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TrackedIn {
+    world_generation: u64,
+    map_settled: bool,
+}
+
 impl Tracker {
     /// Creates a tracker for a **rectified, zero-distortion** camera.
     ///
@@ -1051,6 +1066,7 @@ impl Tracker {
             world_anchored: false,
             map_carried: false,
             kf_tracked_poses: std::collections::VecDeque::new(),
+            map_settled: false,
             vision_suspect: std::collections::VecDeque::new(),
             consistency: ConsistencyStats::default(),
             last_consistency_log: None,
@@ -1710,6 +1726,7 @@ impl Tracker {
         }
         // Their keyframe indices name keyframes of the dropped map.
         self.kf_tracked_poses.clear();
+        self.map_settled = false;
         self.vision_suspect.clear();
         self.vision_degraded = false;
         self.bias_refusals_in_a_row = 0;
@@ -2806,8 +2823,12 @@ impl Tracker {
                 }
                 _ => kf_pose,
             };
+            let tracked_in = TrackedIn {
+                world_generation: self.world_generation,
+                map_settled: self.map_settled || !self.config.enable_local_ba,
+            };
             self.kf_tracked_poses
-                .push_back((kf.frame.idx, self.world_generation, vision));
+                .push_back((kf.frame.idx, tracked_in, vision));
             while self.kf_tracked_poses.len() > KF_TRACKED_POSES {
                 self.kf_tracked_poses.pop_front();
             }
@@ -2832,6 +2853,8 @@ impl Tracker {
         }
         let ran_ba = ba_window_ready && !vision_suspect;
         if ran_ba {
+            // Every keyframe tracked from here on is tracked against a map a solve has held.
+            self.map_settled = true;
             // kornia-slam's only BA entry points solve a `BaSnapshot` and hand back an update
             // for `apply_ba_update` to validate and write. `local_window` is the selection
             // kornia-slam's own local mapping captures: the solvers' active keyframes, their
@@ -2988,8 +3011,25 @@ impl Tracker {
     /// throttled.
     fn check_motion(&mut self, factors: &[WheelOdomFactor], timestamp_sec: f64) {
         for f in factors {
-            let Some(motion) = self.interval_motion(f) else {
+            let (wheels, gyro, vision) = self.interval_sensors(f);
+            let Some(vision) = vision else {
+                // No comparable vision, so no verdict. The gyro alone still screens the wheels:
+                // a factor that contradicts it is slip or a head that moved on its joint (the
+                // gyro does not slip), and BA should not see it. Keeping it was the old answer
+                // for every unarbitrated interval.
+                if gyro
+                    .is_some_and(|g| crate::consistency::rotations_disagree(&wheels.rotation, &g))
+                    && let Some(w) = self.wheel.as_mut()
+                    && w.drop_factor(f.from_idx, f.to_idx)
+                {
+                    self.consistency.wheels_dropped_on_gyro += 1;
+                }
                 continue;
+            };
+            let motion = IntervalMotion {
+                wheels,
+                vision,
+                gyro,
             };
             let verdict = motion.verdict();
             let translation = motion.translation_disagrees();
@@ -3190,18 +3230,26 @@ impl Tracker {
         }
     }
 
-    /// The interval a wheel factor spans, as the wheels, vision (the keyframes' tracked poses)
-    /// and the gyro (the interval's IMU edge, at the bias of the last interval all three agreed
-    /// on, else the current one; see `consistent_gyro_bias`) saw it. `None` when either
-    /// tracked pose is gone or from another world.
-    fn interval_motion(&self, f: &WheelOdomFactor) -> Option<IntervalMotion> {
+    /// The interval a wheel factor spans, as `(wheels, gyro, vision)` saw it: the wheels through
+    /// the mount at each end, the gyro (the interval's IMU edge, at the bias of the last interval
+    /// all three agreed on, else the current one; see `consistent_gyro_bias`; `None` without
+    /// one) and vision (the keyframes' tracked poses). Vision is `None` when either tracked pose
+    /// is gone or from another world (a map drop, an inertial alignment or pivot, a re-anchor),
+    /// or the interval straddles the map's first local BA (see `map_settled`): its two poses
+    /// would then be in two frames, and their difference a frame change, not motion.
+    fn interval_sensors(&self, f: &WheelOdomFactor) -> (Pose3d, Option<Mat3F64>, Option<Pose3d>) {
         let tracked = |idx: usize| {
             self.kf_tracked_poses
                 .iter()
-                .find(|(i, g, _)| *i == idx && *g == self.world_generation)
-                .map(|(_, _, p)| *p)
+                .find(|(i, t, _)| *i == idx && t.world_generation == self.world_generation)
+                .map(|(_, t, p)| (*t, *p))
         };
-        let (p0, p1) = (tracked(f.from_idx)?, tracked(f.to_idx)?);
+        let vision = match (tracked(f.from_idx), tracked(f.to_idx)) {
+            (Some((from_in, p0)), Some((to_in, p1))) if from_in == to_in => {
+                Some(p0.compose(&p1.inverse()))
+            }
+            _ => None,
+        };
         let gyro = self.inertial.as_ref().and_then(|inert| {
             let r_bc = inert.cfg.imu_t_bc.rotation;
             self.map
@@ -3217,14 +3265,11 @@ impl Tracker {
                     r_bc.transpose() * r_b * r_bc
                 })
         });
-        Some(IntervalMotion {
-            wheels: f
-                .t_cb_from
-                .compose(&f.measurement.delta_pose())
-                .compose(&f.t_cb_to.inverse()),
-            vision: p0.compose(&p1.inverse()),
-            gyro,
-        })
+        let wheels = f
+            .t_cb_from
+            .compose(&f.measurement.delta_pose())
+            .compose(&f.t_cb_to.inverse());
+        (wheels, gyro, vision)
     }
 
     /// Whether an interval vision disagreed on ends at a keyframe local BA would free. Prunes
@@ -7641,6 +7686,169 @@ mod tests {
         assert!(c.checked >= 3, "{c:?}");
         assert_eq!(c.consistent, c.checked, "{c:?}");
         assert_eq!(c.ba_skipped, 0);
+    }
+
+    /// One frame of a STILL robot (parked IMU) whose camera sees the scene from `view` (camera in
+    /// the scene's world, identity = the parked view), with a wheel reading `(x, theta)` at the
+    /// frame, or none (the stream silent).
+    fn feed_still(tracker: &mut Tracker, seq: u32, view: &Pose3d, wheel: Option<(f64, f64)>) {
+        let stamp = EPOCH_NS + u64::from(seq) * FRAME_NS;
+        let from = seq
+            .checked_sub(1)
+            .map(|p| EPOCH_NS + u64::from(p) * FRAME_NS);
+        let samples = parked_imu(tracker, from, stamp, no_extra);
+        tracker.push_raw_imu(samples, 0, false).unwrap();
+        if let Some((x, theta)) = wheel {
+            tracker
+                .push_wheel([WheelSample {
+                    stamp_ns: stamp,
+                    x,
+                    y: 0.0,
+                    theta,
+                }])
+                .unwrap();
+        }
+        let (left, right) = render_pair(view);
+        tracker
+            .process_stereo(&left, &right, CuTime::from_nanos(stamp))
+            .expect("a valid pair");
+    }
+
+    fn yaw_view(deg: f64) -> Pose3d {
+        Pose3d::new(
+            SO3F64::exp(Vec3F64::new(0.0, deg.to_radians(), 0.0)).matrix(),
+            Vec3F64::ZERO,
+        )
+    }
+
+    /// 2026-10-10, black box on the PARKED robot: every `max_keyframes` drop (~90 s) was followed
+    /// by `vision_degraded` at keyframe 4 of the new map, cleared at keyframe 7, with fusion never
+    /// rejecting and no motion check recorded — a false WARN and a false black-box capture per
+    /// drop. A young map's PnP is noisy (its first solve's edges started 0.7-1.3 deg off the
+    /// gyro), and an interval with the wheels and the gyro at ~0 and vision ~2 deg read as
+    /// "vision disagrees".
+    ///
+    /// Here vision steps 2.5 deg twice with the robot still, once in the young map (before its
+    /// first local BA) and once after it settled. Neither is a frozen view: nothing turned. And
+    /// the interval across the new map's first local BA, which re-pivots it, is not checked.
+    ///
+    /// Red before the fix (degraded). Mutations: dropping the motion-evidence gate in
+    /// `IntervalMotion::verdict` turned it red (degraded); dropping the first-BA gate in
+    /// `interval_sensors` turned the "interval across the first BA was checked" assertion red.
+    #[test]
+    fn test_a_parked_robot_is_never_degraded_across_a_map_drop() {
+        for fusion in [false, true] {
+            let mut tracker = scene_tracker_with(|c| {
+                c.inertial = Some(static_inertial_config());
+                c.wheel_odom = Some(scene_wheel_config());
+                c.per_frame_fusion = fusion.then(FusionConfig::default);
+                c.max_keyframes = Some(8);
+            });
+            let (mut view_deg, mut young_step, mut settled_step) = (0.0, false, false);
+            let mut straddle_seen = false;
+            for seq in 0..200 {
+                let drops = tracker.map_drops();
+                let kfs = tracker.map().keyframes().len();
+                if drops == 1 && !young_step && kfs == 2 {
+                    view_deg += 2.5;
+                    young_step = true;
+                }
+                if drops == 1 && young_step && !settled_step && kfs == 7 {
+                    view_deg += 2.5;
+                    settled_step = true;
+                }
+                let checked = tracker.consistency_stats().checked;
+                feed_still(&mut tracker, seq, &yaw_view(view_deg), Some((0.0, 0.0)));
+                assert!(
+                    !tracker.vision_degraded(),
+                    "fusion={fusion} seq={seq}: a parked robot read as DEGRADED {:?}",
+                    tracker.consistency_stats()
+                );
+                // The new map's first local BA runs as its 4th keyframe is inserted, after that
+                // keyframe's pose was recorded; the 5th is tracked against the map it moved. The
+                // interval between them spans that pivot.
+                let straddles = kfs == BA_ACTIVE_KEYFRAMES + 1
+                    && tracker.map().keyframes().len() == BA_ACTIVE_KEYFRAMES + 2;
+                if drops >= 1 && tracker.map_drops() == drops && straddles {
+                    assert_eq!(
+                        tracker.consistency_stats().checked,
+                        checked,
+                        "fusion={fusion} seq={seq}: the interval across the first BA was checked"
+                    );
+                    straddle_seen = true;
+                }
+            }
+            assert!(
+                young_step && settled_step,
+                "fusion={fusion}: both steps fed"
+            );
+            assert!(tracker.map_drops() >= 2, "fusion={fusion}: across drops");
+            assert!(straddle_seen, "fusion={fusion}: a first BA after a drop");
+            let c = tracker.consistency_stats();
+            assert_eq!(
+                (c.vision_disagrees, c.degraded_entries, c.ba_skipped),
+                (0, 0, 0),
+                "fusion={fusion}: {c:?}"
+            );
+            assert!(c.checked >= 4, "fusion={fusion}: still checked: {c:?}");
+        }
+    }
+
+    /// The other half of that capture: the one motion check recorded spanned a deploy restart, the
+    /// body's odometry starting over at the origin while the robot sat at 5.78 deg. An interval
+    /// spanning an odometry restart, or a silent stretch past `max_gap`, is not integrated, so it
+    /// is never checked (here it would read as slipping wheels and drop a factor) nor handed to
+    /// BA. The intervals on either side are checked as usual.
+    ///
+    /// Red before the fix (the restart interval counted as `wheels_disagree`).
+    #[test]
+    fn test_an_odometry_restart_inside_an_interval_is_not_checked() {
+        const AT: f64 = 0.1;
+        let mut tracker = scene_tracker_with(|c| {
+            c.inertial = Some(static_inertial_config());
+            c.wheel_odom = Some(scene_wheel_config());
+        });
+        let still = Pose3d::IDENTITY;
+        let mut seq = 0;
+        while !tracker.state.imu_initialized {
+            feed_still(&mut tracker, seq, &still, Some((0.3, AT)));
+            seq += 1;
+            assert!(seq < 80, "never initialized");
+        }
+        for _ in 0..30 {
+            feed_still(&mut tracker, seq, &still, Some((0.3, AT)));
+            seq += 1;
+        }
+        let before = tracker.consistency_stats();
+        assert!(before.checked >= 2, "{before:?}");
+        // The body restarts: same clock, the odometry back at the origin, the robot unmoved.
+        for _ in 0..30 {
+            feed_still(&mut tracker, seq, &still, Some((0.0, 0.0)));
+            seq += 1;
+        }
+        let c = tracker.consistency_stats();
+        assert_eq!(c.wheels_disagree, 0, "a restart read as slip: {c:?}");
+        let w = tracker.wheel_stats().unwrap();
+        assert_eq!(w.edges_discontinuous, 1, "{w:?}");
+        // The stream goes silent for 1 s (past the 0.5 s max_gap), then resumes.
+        for _ in 0..15 {
+            feed_still(&mut tracker, seq, &still, None);
+            seq += 1;
+        }
+        let refused = tracker.wheel_stats().unwrap().edges_refused;
+        for _ in 0..30 {
+            feed_still(&mut tracker, seq, &still, Some((0.0, 0.0)));
+            seq += 1;
+        }
+        let w = tracker.wheel_stats().unwrap();
+        assert!(w.edges_refused > refused, "the gap interval refused: {w:?}");
+        let c = tracker.consistency_stats();
+        assert_eq!(c.wheels_disagree, 0, "a restart read as slip: {c:?}");
+        assert_eq!(c.consistent, c.checked, "{c:?}");
+        assert!(
+            c.checked >= before.checked + 4,
+            "checked on both sides: {c:?}"
+        );
     }
 
     /// A gyro bias local BA absorbed UNDER the limit must not flip the check: the gyro is

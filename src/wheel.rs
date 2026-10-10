@@ -71,6 +71,18 @@ const MAX_FACTORS: usize = 16;
 const MIN_TRANSLATION_SIGMA_M: f64 = 1e-3;
 const MIN_ROTATION_SIGMA_RAD: f64 = 1e-3;
 
+/// A reading-to-reading step faster than this is not motion but a discontinuity in the odometry
+/// (an integrator restarted or re-zeroed while the stream kept flowing), m/s. Several times
+/// anything a wheeled base drives.
+const MAX_PLAUSIBLE_SPEED_M_S: f64 = 2.0;
+/// ...or turned faster than this, rad/s.
+const MAX_PLAUSIBLE_RATE_RAD_S: f64 = 2.0 * std::f64::consts::PI;
+/// Slack on those two for stamp jitter between closely spaced readings: a step under this is
+/// never a discontinuity, however close the stamps.
+const STEP_SLACK_M: f64 = 0.02;
+/// See [`STEP_SLACK_M`], radians.
+const STEP_SLACK_RAD: f64 = 0.05;
+
 /// One wheel-odometry reading: the cumulative base pose in the odometry frame.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WheelSample {
@@ -88,6 +100,28 @@ impl WheelSample {
     fn is_finite(&self) -> bool {
         self.x.is_finite() && self.y.is_finite() && self.theta.is_finite()
     }
+
+    /// Exactly the odometry origin: what a freshly started integrator reports first.
+    fn at_origin(&self) -> bool {
+        self.x == 0.0 && self.y == 0.0 && self.theta == 0.0
+    }
+}
+
+/// Whether the step from reading `s0` to the next reading `s1` is a discontinuity in the
+/// odometry rather than motion: the stream jumped, past [`STEP_SLACK_M`] / [`STEP_SLACK_RAD`],
+/// back to exactly the origin (the body, or its odometry, restarted: 2026-10-10 a deploy restart
+/// read as a 5.78 deg wheel turn of a parked robot), or it moved faster than a base can. Integrating across one would hand local BA and
+/// the motion check the jump as if the base had driven it.
+fn is_discontinuity(s0: &WheelSample, s1: &WheelSample) -> bool {
+    let dt = s1.stamp_ns.saturating_sub(s0.stamp_ns) as f64 * 1e-9;
+    let step_m = (s1.x - s0.x).hypot(s1.y - s0.y);
+    let step_rad = wrap(s1.theta - s0.theta).abs();
+    // A step within the slack is harmless whatever caused it, and lets a base driving through
+    // the origin pass.
+    let beyond_slack = step_m > STEP_SLACK_M || step_rad > STEP_SLACK_RAD;
+    (s1.at_origin() && beyond_slack)
+        || step_m > MAX_PLAUSIBLE_SPEED_M_S * dt + STEP_SLACK_M
+        || step_rad > MAX_PLAUSIBLE_RATE_RAD_S * dt + STEP_SLACK_RAD
 }
 
 /// The wheel path's configuration. Build it with [`WheelOdomConfig::new`].
@@ -230,6 +264,9 @@ pub(crate) enum WheelWindowError {
     Pending,
     /// Two consecutive readings inside the interval are further apart than `max_gap`.
     Gap,
+    /// The odometry jumped inside the interval (see [`is_discontinuity`]): restarted, re-zeroed,
+    /// or faster than a base drives. Nothing measured the motion across the jump.
+    Discontinuity,
 }
 
 /// Wheel-path counters. Diagnostics only.
@@ -251,8 +288,11 @@ pub struct WheelStats {
     pub mounts_refused: u64,
     /// Keyframe intervals integrated into a factor.
     pub edges_added: u64,
-    /// Intervals refused: start not covered, a gap, or a bad interval.
+    /// Intervals refused: start not covered, a gap, an odometry discontinuity, or a bad interval.
     pub edges_refused: u64,
+    /// Of [`WheelStats::edges_refused`], the intervals that spanned an odometry discontinuity
+    /// (a restart or re-zero of the odometry).
+    pub edges_discontinuous: u64,
     /// Intervals refused because the readings never caught up.
     pub edges_expired: u64,
     /// Frames whose tracking prior or coast came from the wheels.
@@ -392,8 +432,12 @@ impl WheelState {
         let b = b.min(self.ring.len() - 1);
         let max_gap = self.cfg.max_gap_ns();
         for i in a..b {
-            if self.ring[i + 1].stamp_ns - self.ring[i].stamp_ns > max_gap {
+            let (s0, s1) = (&self.ring[i], &self.ring[i + 1]);
+            if s1.stamp_ns - s0.stamp_ns > max_gap {
                 return Err(WheelWindowError::Gap);
+            }
+            if is_discontinuity(s0, s1) {
+                return Err(WheelWindowError::Discontinuity);
             }
         }
 
@@ -453,8 +497,8 @@ impl WheelState {
     }
 
     /// The reading at `t_ns` at or past the newest one, continued at the last pair's velocity. A
-    /// pair further apart than `max_gap` has no velocity worth trusting (the stream resumed after
-    /// a hole), so the newest reading is held.
+    /// pair further apart than `max_gap`, or one across a discontinuity, has no velocity worth
+    /// trusting (the stream resumed after a hole, or restarted), so the newest reading is held.
     fn extrapolate(&self, t_ns: u64) -> WheelSample {
         let n = self.ring.len();
         let s1 = self.ring[n - 1];
@@ -463,7 +507,7 @@ impl WheelState {
         }
         let s0 = self.ring[n - 2];
         let dt = s1.stamp_ns - s0.stamp_ns;
-        if dt > self.cfg.max_gap_ns() {
+        if dt > self.cfg.max_gap_ns() || is_discontinuity(&s0, &s1) {
             return s1;
         }
         let a = (t_ns - s1.stamp_ns) as f64 / dt as f64;
@@ -553,7 +597,12 @@ impl WheelState {
                     });
                 }
                 Err(WheelWindowError::Pending) => still.push(e),
-                Err(_) => self.stats.edges_refused += 1,
+                Err(err) => {
+                    self.stats.edges_refused += 1;
+                    if err == WheelWindowError::Discontinuity {
+                        self.stats.edges_discontinuous += 1;
+                    }
+                }
             }
         }
         let expired = still.len().saturating_sub(MAX_PENDING_EDGES);
@@ -677,8 +726,8 @@ mod tests {
     #[test]
     fn test_the_delta_is_expressed_in_the_start_base_frame() {
         let h = std::f64::consts::FRAC_PI_2;
-        let w = state(&[(0, 1.0, 1.0, h), (100, 1.0, 1.5, h)]);
-        let d = w.delta(0, 100 * MS, 0).expect("covered");
+        let w = state(&[(0, 1.0, 1.0, h), (400, 1.0, 1.5, h)]);
+        let d = w.delta(0, 400 * MS, 0).expect("covered");
         assert!(close(d.delta, [0.5, 0.0, 0.0]), "{:?}", d.delta);
     }
 
@@ -698,11 +747,11 @@ mod tests {
     #[test]
     fn test_path_length_sums_the_readings_not_the_net_motion() {
         let w = state(&[
-            (0, 0.0, 0.0, 0.0),
-            (100, 0.3, 0.0, 0.0),
-            (200, 0.0, 0.0, 0.0),
+            (0, 1.0, 0.0, 0.0),
+            (200, 1.3, 0.0, 0.0),
+            (400, 1.0, 0.0, 0.0),
         ]);
-        let d = w.delta(0, 200 * MS, 0).expect("covered");
+        let d = w.delta(0, 400 * MS, 0).expect("covered");
         assert!(close(d.delta, [0.0, 0.0, 0.0]));
         assert!((d.path_m - 0.6).abs() < 1e-12);
         let m = w.cfg.measurement(&d);
@@ -741,6 +790,58 @@ mod tests {
         // The prior may hold the newest reading for up to max_gap.
         let held = w.delta(1200 * MS, 1300 * MS, 500 * MS).expect("held");
         assert!(close(held.delta, [0.0; 3]));
+    }
+
+    /// An odometry that restarts (back to exactly the origin) or jumps faster than a base drives
+    /// inside an interval refuses it, with no time gap to give it away; the same motion spread
+    /// over a plausible time, and a robot parked at the origin, integrate as before.
+    #[test]
+    fn test_an_odometry_discontinuity_refuses_the_interval() {
+        // 2026-10-10: parked at 0.1 rad, the body restarts, the next reading is the origin.
+        let restarted = state(&[
+            (0, 0.3, 0.0, 0.1),
+            (100, 0.3, 0.0, 0.1),
+            (200, 0.0, 0.0, 0.0),
+            (300, 0.0, 0.0, 0.0),
+        ]);
+        assert_eq!(
+            restarted.delta(50 * MS, 250 * MS, 0),
+            Err(WheelWindowError::Discontinuity)
+        );
+        // Both ends after the restart: a clean interval again.
+        let after = restarted.delta(210 * MS, 290 * MS, 0).expect("clean");
+        assert!(close(after.delta, [0.0; 3]));
+        // A 1 rad heading jump in 10 ms (100 rad/s), not at the origin.
+        let jumped = state(&[(0, 0.0, 0.0, 0.2), (10, 0.0, 0.0, 1.2), (20, 0.0, 0.0, 1.2)]);
+        assert_eq!(
+            jumped.delta(5 * MS, 15 * MS, 0),
+            Err(WheelWindowError::Discontinuity)
+        );
+        // The prior does not extrapolate the jump's velocity either.
+        let held = jumped.delta(20 * MS, 40 * MS, 500 * MS);
+        assert!(close(held.expect("held").delta, [0.0; 3]));
+        // A real 0.5 rad/s turn and a 0.5 m/s drive at 100 Hz, through the origin, integrate.
+        let real: Vec<_> = (0..20u64)
+            .map(|k| {
+                (
+                    k * 10,
+                    0.005 * k as f64 - 0.05,
+                    0.0,
+                    0.005 * k as f64 - 0.05,
+                )
+            })
+            .collect();
+        assert!(state(&real).delta(0, 190 * MS, 0).is_ok());
+        let parked = state(&[
+            (0, 0.0, 0.0, 0.0),
+            (100, 0.0, 0.0, 0.0),
+            (200, 0.0, 0.0, 0.0),
+        ]);
+        assert!(parked.delta(50 * MS, 150 * MS, 0).is_ok());
+        let mut w = restarted;
+        w.on_keyframe(Some((1, 50 * MS)), 2, 250 * MS);
+        assert!(w.factors().is_empty());
+        assert_eq!((w.stats.edges_refused, w.stats.edges_discontinuous), (1, 1));
     }
 
     /// An interval whose readings arrive after the keyframe that closed it is integrated at a
@@ -810,13 +911,13 @@ mod tests {
         let r_bc = mat3_from_rows(&[0.0, 0.0, 1.0, -1.0, 0.0, 0.0, 0.0, -1.0, 0.0]);
         let cam_in_base = Pose3d::new(r_bc, Vec3F64::new(0.1, 0.0, 0.9));
         let mut w = WheelState::new(WheelOdomConfig::new(cam_in_base, 0.02, 0.05).unwrap());
-        w.push([(0, 0.0), (100, 0.5)].map(|(t, x)| WheelSample {
+        w.push([(0, 0.0), (400, 0.5)].map(|(t, x)| WheelSample {
             stamp_ns: t * MS,
             x,
             y: 0.0,
             theta: 0.0,
         }));
-        let m = w.camera_motion(0, 100 * MS).expect("covered");
+        let m = w.camera_motion(0, 400 * MS).expect("covered");
         let p_cam0 = Vec3F64::new(0.0, 0.0, 2.0);
         let p_cam1 = m.transform_point(&p_cam0);
         assert!(

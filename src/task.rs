@@ -678,13 +678,14 @@ impl CuTask for StereoVio {
         );
         if let Some(w) = self.tracker.as_ref().and_then(|t| t.wheel_stats()) {
             info!(
-                "vio wheel: {} coasting, {} not localized; {} edges ({} refused, {} expired); \
+                "vio wheel: {} coasting, {} not localized; {} edges ({} refused, {} of them discontinuous, {} expired); \
                  prior {} / unavailable {}; {} frames outside the readings; readings {} accepted / {} out-of-order / {} \
                  non-finite / {} evicted / {} queue-evicted; mounts {} / refused {}",
                 self.coasted,
                 self.not_localized,
                 w.edges_added,
                 w.edges_refused,
+                w.edges_discontinuous,
                 w.edges_expired,
                 w.prior_frames,
                 w.prior_unavailable,
@@ -703,7 +704,8 @@ impl CuTask for StereoVio {
             info!(
                 "vio motion check: {} intervals, {} consistent; vision disagreed {} (local BA \
                  skipped {}, tracking DEGRADED {} times), wheels disagreed {} (factor dropped), \
-                 gyro disagreed {}, inconclusive {}, translation disagreed {}",
+                 gyro disagreed {}, inconclusive {}, translation disagreed {}; {} unchecked \
+                 wheel factors dropped against the gyro",
                 c.checked,
                 c.consistent,
                 c.vision_disagrees,
@@ -712,7 +714,8 @@ impl CuTask for StereoVio {
                 c.wheels_disagree,
                 c.gyro_disagrees,
                 c.inconclusive,
-                c.translation_disagrees
+                c.translation_disagrees,
+                c.wheels_dropped_on_gyro
             );
         }
         info!(

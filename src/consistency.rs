@@ -15,7 +15,7 @@
 //! | wheels-gyro | vision-gyro | wheels-vision | verdict                                     |
 //! |-------------|-------------|---------------|---------------------------------------------|
 //! | agree       | agree       | agree         | [`MotionVerdict::Consistent`]               |
-//! | agree       | disagree    | disagree      | [`MotionVerdict::VisionDisagrees`]: frozen or self-tracking vision. Local BA is skipped while the interval is in its window, so it cannot invent a bias to explain it |
+//! | agree       | disagree    | disagree      | [`MotionVerdict::VisionDisagrees`]: frozen or self-tracking vision, ONLY when the wheels and the gyro both turned past the noise floor ([`IntervalMotion::base_turned`]); with both still it is vision noise and [`MotionVerdict::Inconclusive`]. Local BA is skipped while the interval is in its window, so it cannot invent a bias to explain it |
 //! | disagree    | agree       | disagree      | [`MotionVerdict::WheelsDisagree`]: slip, OR the head turned on its joint relative to the base (the IMU is in the OAK head, so the gyro and vision share any head-on-base motion). The interval's wheel factor is dropped either way: it constrains the camera through a fixed mount, which that interval broke |
 //! | disagree    | disagree    | agree         | [`MotionVerdict::GyroDisagrees`]: bias or extrinsic. Counted only |
 //!
@@ -94,6 +94,15 @@ pub fn angle_between(a: &Mat3F64, b: &Mat3F64) -> f64 {
     angle(&(a.transpose() * *b))
 }
 
+/// Whether two sensors' rotations over one interval disagree, by the rule
+/// [`IntervalMotion::verdict`] applies: further apart than [`ROTATION_ABS_TOL_RAD`] and than
+/// [`ROTATION_REL_TOL`] of the larger. What screens a wheel factor against the gyro when vision
+/// cannot be compared over the interval.
+pub fn rotations_disagree(a: &Mat3F64, b: &Mat3F64) -> bool {
+    let tol = ROTATION_ABS_TOL_RAD.max(ROTATION_REL_TOL * angle(a).max(angle(b)));
+    angle_between(a, b) > tol
+}
+
 impl IntervalMotion {
     /// The rotation verdict. See the module table.
     pub fn verdict(&self) -> MotionVerdict {
@@ -106,11 +115,25 @@ impl IntervalMotion {
         let agree = |a: &Mat3F64, b: &Mat3F64| angle_between(a, b) <= tol;
         match (agree(&w, &g), agree(&v, &g), agree(&w, &v)) {
             (true, true, _) | (_, true, true) | (true, _, true) => MotionVerdict::Consistent,
+            // Frozen vision needs a turn to freeze through: the wheels and the gyro must BOTH
+            // have turned past the noise floor. With both still, vision moving alone is vision
+            // noise (a young map's PnP: 1.3 deg per keyframe on the parked robot, 2026-10-10),
+            // never "frozen", and a parked robot can never be DEGRADED.
+            (true, false, false) if !self.base_turned() => MotionVerdict::Inconclusive,
             (true, false, false) => MotionVerdict::VisionDisagrees,
             (false, true, false) => MotionVerdict::WheelsDisagree,
             (false, false, true) => MotionVerdict::GyroDisagrees,
             (false, false, false) => MotionVerdict::Inconclusive,
         }
+    }
+
+    /// Whether the wheels AND the gyro both turned past [`ROTATION_ABS_TOL_RAD`]: the motion
+    /// evidence [`MotionVerdict::VisionDisagrees`] requires.
+    pub fn base_turned(&self) -> bool {
+        self.gyro.is_some_and(|g| {
+            angle(&self.wheels.rotation) >= ROTATION_ABS_TOL_RAD
+                && angle(&g) >= ROTATION_ABS_TOL_RAD
+        })
     }
 
     /// Whether the wheels moved in the interval: [`MOVED_MIN_M`] or [`MOVED_MIN_RAD`].
@@ -149,6 +172,10 @@ pub struct ConsistencyStats {
     pub ba_skipped: u64,
     /// Times tracking turned DEGRADED (a vision-suspect interval entered the BA window).
     pub degraded_entries: u64,
+    /// Wheel factors dropped, outside [`ConsistencyStats::checked`], because they contradicted
+    /// the gyro over an interval vision could not be compared on (a map's first local BA
+    /// between its ends, or an alignment).
+    pub wheels_dropped_on_gyro: u64,
 }
 
 impl ConsistencyStats {
@@ -196,6 +223,27 @@ mod tests {
             motion(8.6, 0.2, gyro(8.4)).verdict(),
             MotionVerdict::VisionDisagrees
         );
+    }
+
+    /// Parked: the wheels and the gyro still, a young map's vision 2.5 deg off. Vision is the odd
+    /// one out but nothing turned, so it cannot be frozen.
+    #[test]
+    fn vision_moving_alone_on_a_still_base_is_not_frozen() {
+        let m = motion(0.0, 2.5, gyro(0.1));
+        assert!(!m.base_turned());
+        assert_eq!(m.verdict(), MotionVerdict::Inconclusive);
+        // The same three with the base turning: vision froze.
+        let turn = motion(8.0, 2.5, gyro(8.1));
+        assert!(turn.base_turned());
+        assert_eq!(turn.verdict(), MotionVerdict::VisionDisagrees);
+    }
+
+    #[test]
+    fn two_rotations_disagree_past_the_same_bands() {
+        let r = |deg: f64| yaw_pose(deg, 0.0).rotation;
+        assert!(rotations_disagree(&r(8.6), &r(0.0)));
+        assert!(!rotations_disagree(&r(0.3), &r(-0.5)));
+        assert!(!rotations_disagree(&r(40.0), &r(34.0)));
     }
 
     #[test]
