@@ -385,6 +385,9 @@ mod tests {
                 delta: [dx, dy, dth],
                 path_m: 0.05,
                 path_rad: 0.0,
+                covariance: [[0.0; 3]; 3],
+                speed_m_s: [0.0; 2],
+                rate_rad_s: [0.0; 2],
             })
         };
         // Path length is jitter-inflated; the net motion is what counts.

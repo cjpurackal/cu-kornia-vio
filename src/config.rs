@@ -334,6 +334,12 @@ pub(crate) fn optional_inertial(config: Option<&ComponentConfig>) -> CuResult<Op
 ///   tilt_sigma: 0.01,          // rad, planar stiffness on roll and pitch
 ///   huber_chi2: 12.59,         // 6-DOF chi-square, 95 %; absent keeps the factor quadratic
 ///   max_gap_s: 0.5,            // longest hole between readings an interval may span
+///   heading_noise_per_m: 0.0,  // rad per sqrt(m) driven: heading drift on a straight run
+///   heading_scale_sigma_per_m: 0.0, // rad/m, systematic (left/right wheel radius mismatch)
+///   z_slope: 0.0,              // m per m driven, added to z_sigma in quadrature
+///   clock_sigma_s: 0.005,      // s, frame-stamp uncertainty: v * sigma at each end
+///   min_translation_sigma_m: 0.001, // m, floor on x/y of every interval
+///   min_heading_sigma_rad: 0.001,   // rad, floor on heading of every interval
 /// ),
 /// ```
 ///
@@ -341,7 +347,9 @@ pub(crate) fn optional_inertial(config: Option<&ComponentConfig>) -> CuResult<Op
 /// block. Present, the mount and the two noise figures are required: there is no defensible
 /// default for where a camera sits or how good a robot's wheels are, and a wrong one is not an
 /// error but a confidently bent trajectory. The planar stiffness defaults to kornia-slam's
-/// (1 cm, 0.01 rad), itself unmeasured.
+/// (1 cm, 0.01 rad), itself unmeasured. The distance terms default to zero, so a block without
+/// them keeps the noise model it had, floors included; only the timing term (on unless
+/// `clock_sigma_s: 0.0`) and the propagated cross-covariance differ.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WheelOdomRon {
@@ -364,6 +372,18 @@ pub(crate) struct WheelOdomRon {
     pub huber_chi2: Option<f64>,
     #[serde(default)]
     pub max_gap_s: Option<f64>,
+    #[serde(default)]
+    pub heading_noise_per_m: Option<f64>,
+    #[serde(default)]
+    pub heading_scale_sigma_per_m: Option<f64>,
+    #[serde(default)]
+    pub z_slope: Option<f64>,
+    #[serde(default)]
+    pub clock_sigma_s: Option<f64>,
+    #[serde(default)]
+    pub min_translation_sigma_m: Option<f64>,
+    #[serde(default)]
+    pub min_heading_sigma_rad: Option<f64>,
 }
 
 impl WheelOdomRon {
@@ -386,6 +406,24 @@ impl WheelOdomRon {
         if let Some(v) = self.max_gap_s {
             // `from_secs_f64` would panic on a negative; `validate` refuses it instead.
             cfg.max_gap = cu29::units::si::f64::Time::new::<cu29::units::si::time::second>(v);
+        }
+        if let Some(v) = self.heading_noise_per_m {
+            cfg.heading_noise_per_m = v;
+        }
+        if let Some(v) = self.heading_scale_sigma_per_m {
+            cfg.heading_scale_sigma_per_m = v;
+        }
+        if let Some(v) = self.z_slope {
+            cfg.z_slope = v;
+        }
+        if let Some(v) = self.clock_sigma_s {
+            cfg.clock_sigma = cu29::units::si::f64::Time::new::<cu29::units::si::time::second>(v);
+        }
+        if let Some(v) = self.min_translation_sigma_m {
+            cfg.min_translation_sigma_m = v;
+        }
+        if let Some(v) = self.min_heading_sigma_rad {
+            cfg.min_heading_sigma_rad = v;
         }
         cfg.validate()?;
         Ok(self.enabled.then_some(cfg))
@@ -843,6 +881,80 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// The noise-model keys sit inside the `wheel_odom` block, read as given, defaulted when
+    /// absent, and refused when negative even while the block is disabled. They are NOT
+    /// task-level keys: `deny_unknown_fields` on the block is what catches a typo in them.
+    #[test]
+    fn test_the_wheel_noise_model_keys_are_read_defaulted_and_validated() {
+        let defaults = wheel_ron(WHEEL_BLOCK)
+            .unwrap()
+            .expect("present")
+            .to_config()
+            .unwrap()
+            .expect("enabled");
+        assert_eq!(defaults.heading_noise_per_m, 0.0);
+        assert_eq!(defaults.heading_scale_sigma_per_m, 0.0);
+        assert_eq!(defaults.z_slope, 0.0);
+        assert_eq!(
+            defaults.clock_sigma.get::<cu29::units::si::time::second>(),
+            crate::wheel::DEFAULT_CLOCK_SIGMA_S
+        );
+        // The floors stay where the factor shipped them unless a robot measures lower ones.
+        assert_eq!(defaults.min_translation_sigma_m, 1e-3);
+        assert_eq!(defaults.min_heading_sigma_rad, 1e-3);
+        let set = WHEEL_BLOCK.replace(
+            ")",
+            ", heading_noise_per_m: 0.01, heading_scale_sigma_per_m: 0.002, z_slope: 0.003, \
+             clock_sigma_s: 0.002, min_translation_sigma_m: 0.0001, min_heading_sigma_rad: 0.0002)",
+        );
+        let cfg = wheel_ron(&set)
+            .unwrap()
+            .expect("present")
+            .to_config()
+            .unwrap()
+            .expect("enabled");
+        assert_eq!(cfg.heading_noise_per_m, 0.01);
+        assert_eq!(cfg.heading_scale_sigma_per_m, 0.002);
+        assert_eq!(cfg.z_slope, 0.003);
+        assert_eq!(
+            cfg.clock_sigma.get::<cu29::units::si::time::second>(),
+            0.002
+        );
+        assert_eq!(cfg.min_translation_sigma_m, 0.0001);
+        assert_eq!(cfg.min_heading_sigma_rad, 0.0002);
+        for key in [
+            "heading_noise_per_m",
+            "heading_scale_sigma_per_m",
+            "z_slope",
+            "clock_sigma_s",
+            "min_translation_sigma_m",
+            "min_heading_sigma_rad",
+        ] {
+            let negative = WHEEL_BLOCK
+                .replace("enabled: true", "enabled: false")
+                .replace(")", &format!(", {key}: -0.1)"));
+            let err = wheel_ron(&negative).unwrap().expect("parses").to_config();
+            assert!(
+                matches!(err, Err(VioError::WheelParamInvalid { field, .. }) if field == key),
+                "{key}: {err:?}"
+            );
+        }
+        // A zero floor would hand a parked interval infinite information.
+        for key in ["min_translation_sigma_m", "min_heading_sigma_rad"] {
+            let zero = WHEEL_BLOCK.replace(")", &format!(", {key}: 0.0)"));
+            let err = wheel_ron(&zero).unwrap().expect("parses").to_config();
+            assert!(
+                matches!(err, Err(VioError::WheelParamInvalid { field, .. }) if field == key),
+                "{key}: {err:?}"
+            );
+        }
+        let typo = WHEEL_BLOCK.replace(")", ", z_slop: 0.01)");
+        assert!(wheel_ron(&typo).is_err(), "a misspelt noise key accepted");
+        for key in ["heading_noise_per_m", "z_slope", "clock_sigma_s"] {
+            assert!(!CONFIG_KEYS.contains(&key), "{key} is a wheel_odom field");
+        }
     }
 
     #[test]

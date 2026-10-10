@@ -65,11 +65,20 @@ const UNCOVERED_WARN_EVERY: u64 = 900;
 /// factor with both ends fixed, so only the last few can act; 16 is slack for a late edge.
 const MAX_FACTORS: usize = 16;
 
-/// Variance floors, so a parked robot's zero-length interval is a stiff but finite constraint.
-/// 1 mm and 1 mrad: unmeasured, chosen below the wheels' measured round-trip error (1 mm /
-/// 0.36 deg over an in-place turn on XLeRobot).
-const MIN_TRANSLATION_SIGMA_M: f64 = 1e-3;
-const MIN_ROTATION_SIGMA_RAD: f64 = 1e-3;
+/// Default variance floors, so a parked robot's zero-length interval is a stiff but finite
+/// constraint: 1 mm and 1 mrad, the values the factor shipped with. They are ten times the
+/// encoders' quantisation (one tick of a 4096-step servo on a 0.060 m wheel is 0.092 mm, and on
+/// one side of a 0.508 m track 0.18 mrad of heading, XLeRobot), deliberately: a floor is also the
+/// whole uncertainty of a parked interval, and what the base-to-camera mount gets wrong (a head
+/// that yaws on its mast) lands there too. Lowering them is a measured decision, per robot, via
+/// [`WheelOdomConfig::min_translation_sigma_m`] and [`WheelOdomConfig::min_heading_sigma_rad`].
+pub const DEFAULT_MIN_TRANSLATION_SIGMA_M: f64 = 1e-3;
+/// The heading counterpart of [`DEFAULT_MIN_TRANSLATION_SIGMA_M`], radians.
+pub const DEFAULT_MIN_HEADING_SIGMA_RAD: f64 = 1e-3;
+
+/// The frame-stamp uncertainty the timing term assumes by default, seconds. See
+/// [`WheelOdomConfig::clock_sigma`].
+pub const DEFAULT_CLOCK_SIGMA_S: f64 = 0.005;
 
 /// A reading-to-reading step faster than this is not motion but a discontinuity in the odometry
 /// (an integrator restarted or re-zeroed while the stream kept flowing), m/s. Several times
@@ -134,6 +143,29 @@ pub struct WheelOdomConfig {
     pub translation_noise: f64,
     /// Heading noise, rad per sqrt(rad) of turning: `rotation_noise^2 * |turned|` on theta.
     pub rotation_noise: f64,
+    /// Heading noise per distance driven, rad per sqrt(m): `heading_noise_per_m^2 * d` on theta.
+    /// A straight run drifts in heading too (uneven floor, tyre deformation), and through the
+    /// compounding that heading error becomes lateral error growing as `d^3`. Zero by default.
+    pub heading_noise_per_m: f64,
+    /// Sigma of a SYSTEMATIC heading error per metre, rad/m: a left/right wheel radius mismatch
+    /// turns every metre by the same unknown amount, so its variance grows as `d^2`, not `d`.
+    /// Zero by default.
+    pub heading_scale_sigma_per_m: f64,
+    /// Out-of-plane translation growth, m per m of path: `z_sigma` of an interval is
+    /// `hypot(z_sigma, z_slope * d)`, since a floor's slope and bumps add height with distance.
+    /// Roll and pitch do not get one: the relative tilt of two base poses is bounded by the
+    /// floor, it does not random-walk. Zero by default.
+    pub z_slope: f64,
+    /// Sigma of the interval ends' stamps against the readings', seconds. An end is interpolated
+    /// at a frame stamp, so a stamp off by `dt` moves it by `v * dt`; zero while parked, it is
+    /// what a fast interval's covariance must carry however short the path.
+    pub clock_sigma: Time,
+    /// Floor on the x and y sigma of every interval, metres. See
+    /// [`DEFAULT_MIN_TRANSLATION_SIGMA_M`].
+    pub min_translation_sigma_m: f64,
+    /// Floor on the heading sigma of every interval, radians. See
+    /// [`DEFAULT_MIN_HEADING_SIGMA_RAD`].
+    pub min_heading_sigma_rad: f64,
     /// Out-of-plane translation sigma, metres: the planar stiffness on z.
     pub z_sigma: f64,
     /// Roll and pitch sigma, radians: the planar stiffness on tilt.
@@ -151,8 +183,10 @@ impl WheelOdomConfig {
     /// Validates the mount and the noise model. `cam_in_base` is the camera's pose in the base
     /// frame (the URDF transform); the factor wants its inverse, taken here once.
     ///
-    /// The out-of-plane sigmas default to kornia-slam's (1 cm, 0.01 rad), the gap to 0.5 s and
-    /// the Huber kernel to off; set the fields afterwards and call [`WheelOdomConfig::validate`].
+    /// The out-of-plane sigmas default to kornia-slam's (1 cm, 0.01 rad), the gap to 0.5 s, the
+    /// Huber kernel to off, the clock sigma to [`DEFAULT_CLOCK_SIGMA_S`] and the distance terms
+    /// (`heading_noise_per_m`, `heading_scale_sigma_per_m`, `z_slope`) to zero; set the fields
+    /// afterwards and call [`WheelOdomConfig::validate`].
     pub fn new(
         cam_in_base: Pose3d,
         translation_noise: f64,
@@ -162,6 +196,12 @@ impl WheelOdomConfig {
             t_cb: cam_in_base.inverse(),
             translation_noise,
             rotation_noise,
+            heading_noise_per_m: 0.0,
+            heading_scale_sigma_per_m: 0.0,
+            z_slope: 0.0,
+            clock_sigma: Time::new::<second>(DEFAULT_CLOCK_SIGMA_S),
+            min_translation_sigma_m: DEFAULT_MIN_TRANSLATION_SIGMA_M,
+            min_heading_sigma_rad: DEFAULT_MIN_HEADING_SIGMA_RAD,
             z_sigma: WheelOdomMeasurement::DEFAULT_Z_SIGMA,
             tilt_sigma: WheelOdomMeasurement::DEFAULT_TILT_SIGMA,
             huber_chi2: None,
@@ -180,10 +220,23 @@ impl WheelOdomConfig {
             ("rotation_noise", self.rotation_noise),
             ("z_sigma", self.z_sigma),
             ("tilt_sigma", self.tilt_sigma),
+            ("min_translation_sigma_m", self.min_translation_sigma_m),
+            ("min_heading_sigma_rad", self.min_heading_sigma_rad),
             ("max_gap_s", self.max_gap.get::<second>()),
             ("huber_chi2", self.huber_chi2.unwrap_or(1.0)),
         ] {
             if !value.is_finite() || value <= 0.0 {
+                return Err(VioError::WheelParamInvalid { field, value });
+            }
+        }
+        // Zero turns these terms off, which is their default.
+        for (field, value) in [
+            ("heading_noise_per_m", self.heading_noise_per_m),
+            ("heading_scale_sigma_per_m", self.heading_scale_sigma_per_m),
+            ("z_slope", self.z_slope),
+            ("clock_sigma_s", self.clock_sigma.get::<second>()),
+        ] {
+            if !value.is_finite() || value < 0.0 {
                 return Err(VioError::WheelParamInvalid { field, value });
             }
         }
@@ -194,16 +247,47 @@ impl WheelOdomConfig {
         (self.max_gap.get::<second>() * 1e9) as u64
     }
 
-    /// The factor measurement for one integrated interval: a random walk in path length and in
-    /// angle turned, floored so a zero-length interval stays finite.
+    /// The factor measurement for one integrated interval.
+    ///
+    /// The planar covariance is the one [`WheelState::delta`] propagated, plus the timing term
+    /// `(v0^2 + v1^2) sigma_t^2` on x and y and `(w0^2 + w1^2) sigma_t^2` on theta (`v`, `w` the
+    /// speeds at the two ends), moved into the frame kornia-slam's residual lives in, and floored
+    /// at the encoders' quantisation so a parked interval stays finite.
+    ///
+    /// The residual is `Log(dT^-1 T_ij)`, a perturbation on the RIGHT of `dT`: its translation is
+    /// in the END base frame, while the propagation runs in the start one. A measured delta off
+    /// by `(dt, dtheta)` in the start frame gives the residual `-(R(dtheta)^T dt, dtheta)`, so the
+    /// covariance is rotated by the interval's own turn. An isotropic x/y block, all the old model
+    /// had, is the same in both frames; the propagated one is not.
     pub(crate) fn measurement(&self, d: &WheelDelta) -> WheelOdomMeasurement {
-        let var_t =
-            (self.translation_noise.powi(2) * d.path_m).max(MIN_TRANSLATION_SIGMA_M.powi(2));
-        let var_r = (self.rotation_noise.powi(2) * d.path_rad).max(MIN_ROTATION_SIGMA_RAD.powi(2));
+        let sigma_t2 = self.clock_sigma.get::<second>().powi(2);
+        let [v0, v1] = d.speed_m_s;
+        let [w0, w1] = d.rate_rad_s;
+        let mut start = d.covariance;
+        start[0][0] += (v0 * v0 + v1 * v1) * sigma_t2;
+        start[1][1] += (v0 * v0 + v1 * v1) * sigma_t2;
+        start[2][2] += (w0 * w0 + w1 * w1) * sigma_t2;
+        let (s, c) = d.delta[2].sin_cos();
+        let j = [[c, s, 0.0], [-s, c, 0.0], [0.0, 0.0, 1.0]];
+        // The upper triangle, mirrored: exactly symmetric, which kornia-slam checks, where the
+        // full product would be symmetric only to rounding.
+        let mut cov = [[0.0; 3]; 3];
+        for (r, k) in [(0, 0), (0, 1), (0, 2), (1, 1), (1, 2), (2, 2)] {
+            let v = (0..3)
+                .map(|a| (0..3).map(|b| j[r][a] * start[a][b] * j[k][b]).sum::<f64>())
+                .sum();
+            cov[r][k] = v;
+            cov[k][r] = v;
+        }
+        // Raising a diagonal adds a positive semi-definite matrix, so a propagated covariance
+        // (positive semi-definite by construction) comes out positive definite.
+        cov[0][0] = cov[0][0].max(self.min_translation_sigma_m.powi(2));
+        cov[1][1] = cov[1][1].max(self.min_translation_sigma_m.powi(2));
+        cov[2][2] = cov[2][2].max(self.min_heading_sigma_rad.powi(2));
         WheelOdomMeasurement {
             delta: d.delta,
-            covariance: [[var_t, 0.0, 0.0], [0.0, var_t, 0.0], [0.0, 0.0, var_r]],
-            z_sigma: self.z_sigma,
+            covariance: cov,
+            z_sigma: self.z_sigma.hypot(self.z_slope * d.path_m),
             tilt_sigma: self.tilt_sigma,
         }
     }
@@ -240,6 +324,16 @@ pub(crate) struct WheelDelta {
     pub path_m: f64,
     /// Angle turned, radians, summed in absolute value for the same reason.
     pub path_rad: f64,
+    /// Covariance of `delta` in the START base frame, row-major (m^2, m rad, rad^2): the noise
+    /// model compounded reading by reading, so it carries the lateral/heading cross terms a
+    /// heading error grows into. Zero for a parked interval; [`WheelOdomConfig::measurement`]
+    /// adds the timing term and the floors.
+    pub covariance: [[f64; 3]; 3],
+    /// Base speed at the start and at the end, m/s, from the readings bracketing each; zero
+    /// where an end is held rather than extrapolated.
+    pub speed_m_s: [f64; 2],
+    /// Yaw rate at the start and at the end, rad/s, likewise.
+    pub rate_rad_s: [f64; 2],
 }
 
 impl WheelDelta {
@@ -451,8 +545,11 @@ impl WheelState {
         } else {
             self.interpolate(b - 1, t1_ns)
         };
-        // Walk start -> readings strictly inside -> end, summing the path and unwrapping theta.
+        // Walk start -> readings strictly inside -> end, summing the path, unwrapping theta and
+        // compounding the covariance.
         let (mut prev, mut turned, mut path_m, mut path_rad) = (start, 0.0, 0.0, 0.0);
+        let (sin, cos) = start.theta.sin_cos();
+        let mut cov = Propagation::new(&self.cfg);
         let inside = self
             .ring
             .range(a + 1..)
@@ -461,18 +558,52 @@ impl WheelState {
             .filter(|s| s.stamp_ns > t0_ns);
         for s in inside.chain(std::iter::once(end)) {
             let dth = wrap(s.theta - prev.theta);
+            let (dxw, dyw) = (s.x - prev.x, s.y - prev.y);
+            let step = [cos * dxw + sin * dyw, -sin * dxw + cos * dyw];
+            cov.step(&self.cfg, step, turned + 0.5 * dth, dth);
             turned += dth;
             path_rad += dth.abs();
-            path_m += (s.x - prev.x).hypot(s.y - prev.y);
+            path_m += dxw.hypot(dyw);
             prev = s;
         }
         let (dxw, dyw) = (end.x - start.x, end.y - start.y);
-        let (sin, cos) = start.theta.sin_cos();
+        // The speeds at the ends: the reading pair each end was interpolated in, or the pair an
+        // extrapolated end was continued from.
+        let last_pair = self.ring.len().checked_sub(2);
+        let start_pair = if a + 1 == self.ring.len() {
+            last_pair
+        } else {
+            Some(a)
+        };
+        let end_pair = if held { last_pair } else { Some(b - 1) };
+        let (v0, w0) = start_pair.map_or((0.0, 0.0), |i| self.pair_rates(i));
+        let (v1, w1) = end_pair.map_or((0.0, 0.0), |i| self.pair_rates(i));
         Ok(WheelDelta {
             delta: [cos * dxw + sin * dyw, -sin * dxw + cos * dyw, turned],
             path_m,
             path_rad,
+            covariance: cov.planar(),
+            speed_m_s: [v0, v1],
+            rate_rad_s: [w0, w1],
         })
+    }
+
+    /// Speed and yaw rate between reading `i` and the next, both non-negative. Zero for a pair
+    /// [`WheelState::extrapolate`] would not continue (further apart than `max_gap`, or across a
+    /// discontinuity): an end held at a reading does not move with its stamp.
+    fn pair_rates(&self, i: usize) -> (f64, f64) {
+        let (Some(s0), Some(s1)) = (self.ring.get(i), self.ring.get(i + 1)) else {
+            return (0.0, 0.0);
+        };
+        let dt_ns = s1.stamp_ns - s0.stamp_ns;
+        if dt_ns > self.cfg.max_gap_ns() || is_discontinuity(s0, s1) {
+            return (0.0, 0.0);
+        }
+        let dt = dt_ns as f64 * 1e-9;
+        (
+            (s1.x - s0.x).hypot(s1.y - s0.y) / dt,
+            wrap(s1.theta - s0.theta).abs() / dt,
+        )
     }
 
     /// The reading at `t_ns`, linearly interpolated between reading `i` and the next one.
@@ -564,15 +695,15 @@ impl WheelState {
     }
 
     /// Queues the interval a keyframe insertion closed, then integrates every queued interval
-    /// whose readings have arrived. Returns the factors integrated by this call, for the motion
-    /// consistency check ([`crate::consistency`]), which may [`drop_factor`](Self::drop_factor)
-    /// one before any solve sees it.
+    /// whose readings have arrived. Returns the factors integrated by this call, each with its
+    /// path length in metres, for the motion consistency check ([`crate::consistency`]), which
+    /// may [`drop_factor`](Self::drop_factor) one before any solve sees it.
     pub fn on_keyframe(
         &mut self,
         prev: Option<(usize, u64)>,
         to_idx: usize,
         to_ns: u64,
-    ) -> Vec<WheelOdomFactor> {
+    ) -> Vec<(WheelOdomFactor, f64)> {
         if let Some((from_idx, from_ns)) = prev {
             self.pending.push(PendingEdge {
                 from_idx,
@@ -582,19 +713,21 @@ impl WheelState {
             });
         }
         let mut still = Vec::new();
-        let first_new = self.factors.len();
+        let mut added = Vec::new();
         for e in std::mem::take(&mut self.pending) {
             match self.delta(e.from_ns, e.to_ns, 0) {
                 Ok(d) => {
                     self.stats.edges_added += 1;
-                    self.factors.push(WheelOdomFactor {
+                    let factor = WheelOdomFactor {
                         from_idx: e.from_idx,
                         to_idx: e.to_idx,
                         measurement: self.cfg.measurement(&d),
                         t_cb_from: self.t_cb_at(e.from_ns),
                         t_cb_to: self.t_cb_at(e.to_ns),
                         huber_chi2: self.cfg.huber_chi2,
-                    });
+                    };
+                    self.factors.push(factor);
+                    added.push((factor, d.path_m));
                 }
                 Err(WheelWindowError::Pending) => still.push(e),
                 Err(err) => {
@@ -609,7 +742,6 @@ impl WheelState {
         self.stats.edges_expired += expired as u64;
         still.drain(..expired);
         self.pending = still;
-        let added = self.factors[first_new..].to_vec();
         let excess = self.factors.len().saturating_sub(MAX_FACTORS);
         self.factors.drain(..excess);
         added
@@ -656,6 +788,75 @@ impl WheelState {
     pub fn reset_map(&mut self) {
         self.pending.clear();
         self.factors.clear();
+    }
+}
+
+/// The unicycle error propagation behind [`WheelDelta::covariance`], in the start base frame.
+///
+/// The state is `(x, y, theta, e)`: the pose relative to the start, and `e`, the systematic
+/// heading error per metre, drawn once per interval with variance `ks^2`. Per reading-to-reading
+/// step `u` (the step vector in the start frame, `ds` its signed length along the mid heading):
+///
+/// ```text
+///     P <- F P F^T + Q,    F = [[1, 0, -u_y, 0],      Q = diag(kt^2 |u|, kt^2 |u|,
+///                               [0, 1,  u_x, 0],               kr^2 |dtheta| + kh^2 |u|, 0)
+///                               [0, 0,  1,  ds],
+///                               [0, 0,  0,   1]]
+/// ```
+///
+/// `(-u_y, u_x)` is how the step moves when the heading it was driven at is off, which is what
+/// turns a heading error into lateral error (`var_y ~ kh^2 d^3 / 3`, `cov(y, theta) ~ kh^2 d^2 / 2`
+/// on a straight run). `e` is a state rather than a per-step `(ks ds)^2`, because summed over N
+/// steps that would be `ks^2 d^2 / N`: a systematic error that shrank with the reading rate.
+struct Propagation {
+    p: [[f64; 4]; 4],
+}
+
+impl Propagation {
+    fn new(cfg: &WheelOdomConfig) -> Self {
+        let mut p = [[0.0; 4]; 4];
+        p[3][3] = cfg.heading_scale_sigma_per_m.powi(2);
+        Self { p }
+    }
+
+    /// One step `u` (start frame, metres) driven at `mid_heading` (relative to the start)
+    /// while turning `dtheta`.
+    fn step(&mut self, cfg: &WheelOdomConfig, u: [f64; 2], mid_heading: f64, dtheta: f64) {
+        let len = u[0].hypot(u[1]);
+        let (sin, cos) = mid_heading.sin_cos();
+        let ds = u[0] * cos + u[1] * sin;
+        let f = [
+            [1.0, 0.0, -u[1], 0.0],
+            [0.0, 1.0, u[0], 0.0],
+            [0.0, 0.0, 1.0, ds],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let mut fp = [[0.0; 4]; 4];
+        for (r, row) in fp.iter_mut().enumerate() {
+            for (c, x) in row.iter_mut().enumerate() {
+                *x = (0..4).map(|k| f[r][k] * self.p[k][c]).sum();
+            }
+        }
+        for (r, row) in self.p.iter_mut().enumerate() {
+            for (c, x) in row.iter_mut().enumerate() {
+                *x = (0..4).map(|k| fp[r][k] * f[c][k]).sum();
+            }
+        }
+        let var_t = cfg.translation_noise.powi(2) * len;
+        self.p[0][0] += var_t;
+        self.p[1][1] += var_t;
+        self.p[2][2] +=
+            cfg.rotation_noise.powi(2) * dtheta.abs() + cfg.heading_noise_per_m.powi(2) * len;
+    }
+
+    /// The `(x, y, theta)` block: `e` marginalised out.
+    fn planar(&self) -> [[f64; 3]; 3] {
+        let p = &self.p;
+        [
+            [p[0][0], p[0][1], p[0][2]],
+            [p[1][0], p[1][1], p[1][2]],
+            [p[2][0], p[2][1], p[2][2]],
+        ]
     }
 }
 
@@ -754,16 +955,310 @@ mod tests {
         let d = w.delta(0, 400 * MS, 0).expect("covered");
         assert!(close(d.delta, [0.0, 0.0, 0.0]));
         assert!((d.path_m - 0.6).abs() < 1e-12);
-        let m = w.cfg.measurement(&d);
-        assert!((m.covariance[0][0] - 0.02f64.powi(2) * 0.6).abs() < 1e-15);
+        assert!((d.covariance[0][0] - 0.02f64.powi(2) * 0.6).abs() < 1e-15);
         // Parked: floored, not infinite information.
-        let parked = w.cfg.measurement(&WheelDelta {
+        let parked = w.cfg.measurement(&parked_delta());
+        assert_eq!(
+            parked.covariance[0][0],
+            DEFAULT_MIN_TRANSLATION_SIGMA_M.powi(2)
+        );
+        assert!(parked.information().is_some());
+    }
+
+    fn parked_delta() -> WheelDelta {
+        WheelDelta {
             delta: [0.0; 3],
             path_m: 0.0,
             path_rad: 0.0,
-        });
-        assert_eq!(parked.covariance[0][0], MIN_TRANSLATION_SIGMA_M.powi(2));
-        assert!(parked.information().is_some());
+            covariance: [[0.0; 3]; 3],
+            speed_m_s: [0.0; 2],
+            rate_rad_s: [0.0; 2],
+        }
+    }
+
+    /// Deterministic standard normals: SplitMix64 into Box-Muller, so the Monte Carlo tests
+    /// below draw the same paths on every run and need no RNG dependency.
+    struct Normal(u64);
+    impl Normal {
+        fn uniform(&mut self) -> f64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^= z >> 31;
+            // (0, 1]: never 0, which the log below cannot take.
+            ((z >> 11) as f64 + 1.0) / (1u64 << 53) as f64
+        }
+        fn sample(&mut self) -> f64 {
+            let (u1, u2) = (self.uniform(), self.uniform());
+            (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+        }
+    }
+
+    /// A 1 m drive at 1 m/s read at 100 Hz, curving at `curvature` rad/m, from the origin.
+    fn drive(curvature: f64) -> Vec<(u64, f64, f64, f64)> {
+        (0..=100u64)
+            .map(|k| {
+                let s = k as f64 * 0.01;
+                let th = curvature * s;
+                let (x, y) = if curvature == 0.0 {
+                    (s, 0.0)
+                } else {
+                    (th.sin() / curvature, (1.0 - th.cos()) / curvature)
+                };
+                (k * 10, x, y, th)
+            })
+            .collect()
+    }
+
+    fn noisy_cfg() -> WheelOdomConfig {
+        let mut c = cfg();
+        c.translation_noise = 0.01;
+        c.rotation_noise = 0.05;
+        c.heading_noise_per_m = 0.03;
+        c.heading_scale_sigma_per_m = 0.02;
+        c
+    }
+
+    fn state_with(cfg: WheelOdomConfig, samples: &[(u64, f64, f64, f64)]) -> WheelState {
+        let mut w = WheelState::new(cfg);
+        w.push(samples.iter().map(|&(t, x, y, theta)| WheelSample {
+            stamp_ns: t * MS,
+            x,
+            y,
+            theta,
+        }));
+        w
+    }
+
+    /// The empirical covariance of the end pose over `n` paths driven with the noise model
+    /// itself: per step, isotropic translation noise, heading noise from turning and from
+    /// distance, and one systematic heading error per metre for the whole path.
+    fn monte_carlo(
+        cfg: &WheelOdomConfig,
+        path: &[(u64, f64, f64, f64)],
+        n: usize,
+    ) -> [[f64; 3]; 3] {
+        let mut rng = Normal(0x5eed_f00d);
+        let mut ends = Vec::with_capacity(n);
+        for _ in 0..n {
+            let e = cfg.heading_scale_sigma_per_m * rng.sample();
+            let (mut x, mut y, mut th) = (path[0].1, path[0].2, path[0].3);
+            for pair in path.windows(2) {
+                let ((_, x0, y0, t0), (_, x1, y1, t1)) = (pair[0], pair[1]);
+                let dth = t1 - t0;
+                // The nominal step in the body frame at its mid heading, re-driven at the noisy
+                // heading.
+                let mid = t0 + 0.5 * dth;
+                let (s, c) = mid.sin_cos();
+                let (bx, by) = (
+                    c * (x1 - x0) + s * (y1 - y0),
+                    -s * (x1 - x0) + c * (y1 - y0),
+                );
+                let len = bx.hypot(by);
+                let (sn, cn) = (th + 0.5 * dth).sin_cos();
+                let sig_t = cfg.translation_noise * len.sqrt();
+                x += cn * bx - sn * by + sig_t * rng.sample();
+                y += sn * bx + cn * by + sig_t * rng.sample();
+                let sig_r = (cfg.rotation_noise.powi(2) * dth.abs()
+                    + cfg.heading_noise_per_m.powi(2) * len)
+                    .sqrt();
+                th += dth + e * bx + sig_r * rng.sample();
+            }
+            ends.push([x, y, th]);
+        }
+        let mean: Vec<f64> = (0..3)
+            .map(|i| ends.iter().map(|p| p[i]).sum::<f64>() / n as f64)
+            .collect();
+        let mut cov = [[0.0; 3]; 3];
+        for p in &ends {
+            for i in 0..3 {
+                for j in 0..3 {
+                    cov[i][j] += (p[i] - mean[i]) * (p[j] - mean[j]) / (n - 1) as f64;
+                }
+            }
+        }
+        cov
+    }
+
+    /// Every entry within `tol` of the propagated one, relative to `sqrt(P_ii P_jj)`: a cross
+    /// term is judged against the variances it couples, so a zero one cannot pass by being small.
+    fn assert_cov_close(propagated: &[[f64; 3]; 3], empirical: &[[f64; 3]; 3], tol: f64) {
+        for i in 0..3 {
+            for j in 0..3 {
+                let scale = (propagated[i][i] * propagated[j][j]).sqrt();
+                let err = (propagated[i][j] - empirical[i][j]).abs() / scale;
+                assert!(
+                    err < tol,
+                    "[{i}][{j}]: propagated {:e}, empirical {:e} ({:.1} %)\n{propagated:?}\n{empirical:?}",
+                    propagated[i][j],
+                    empirical[i][j],
+                    err * 100.0
+                );
+            }
+        }
+    }
+
+    /// The propagated covariance is what 8000 paths driven with the same noise actually spread
+    /// to, on a straight metre (where the heading-to-lateral cross term is the whole point) and
+    /// on a 90 deg arc (where the heading error rotates into both axes).
+    ///
+    /// 8000, not 2000: a sample variance's relative error is `sqrt(2 / n)`, 3.2 % at 2000, so a
+    /// 5 % bound there is 1.6 sigma per entry and one of nine fails on noise alone (5.3 % on
+    /// `var_y` did). At 8000 it is 3 sigma; at 40000 every entry agreed within 1.3 %.
+    ///
+    /// Mutation: dropping F (adding Q only, no compounding) turned this red: lateral variance
+    /// at a quarter of the truth and every cross term zero.
+    #[test]
+    fn delta_covariance_matches_monte_carlo_on_a_straight_metre() {
+        let cfg = noisy_cfg();
+        for curvature in [0.0, std::f64::consts::FRAC_PI_2] {
+            let path = drive(curvature);
+            let w = state_with(cfg.clone(), &path);
+            let d = w.delta(0, 1000 * MS, 0).expect("covered");
+            let p = d.covariance;
+            if curvature == 0.0 {
+                // The case the test exists for: a heading error grows into strongly
+                // correlated lateral error, which a diagonal model has no room for.
+                assert!(p[1][2] / (p[1][1] * p[2][2]).sqrt() > 0.5, "{p:?}");
+            }
+            assert_cov_close(&p, &monte_carlo(&cfg, &path, 8000), 0.05);
+        }
+    }
+
+    /// With no turning at all, heading still drifts with distance: linearly from the random
+    /// walk, quadratically from the systematic term.
+    ///
+    /// Mutation: dropping `heading_noise_per_m` from Q turned this red (theta held at the floor).
+    #[test]
+    fn heading_variance_grows_with_distance_on_a_straight_run() {
+        let mut cfg = noisy_cfg();
+        cfg.heading_scale_sigma_per_m = 0.0;
+        let w = state_with(cfg.clone(), &drive(0.0));
+        let var = |t_ms: u64| w.delta(0, t_ms * MS, 0).expect("covered").covariance[2][2];
+        let kh2 = cfg.heading_noise_per_m.powi(2);
+        assert!((var(500) - kh2 * 0.5).abs() < 1e-12, "{}", var(500));
+        assert!((var(1000) - kh2 * 1.0).abs() < 1e-12, "{}", var(1000));
+        let m = cfg.measurement(&w.delta(0, 1000 * MS, 0).unwrap());
+        assert!(m.covariance[2][2] > DEFAULT_MIN_HEADING_SIGMA_RAD.powi(2) * 10.0);
+        // The systematic term adds ks^2 d^2 on top.
+        cfg.heading_scale_sigma_per_m = 0.02;
+        let w = state_with(cfg, &drive(0.0));
+        let v = w.delta(0, 1000 * MS, 0).unwrap().covariance[2][2];
+        assert!((v - (kh2 + 0.02f64.powi(2))).abs() < 1e-12, "{v}");
+    }
+
+    /// The timing term: nothing on a parked interval (the floors alone), and `2 v^2 sigma_t^2`
+    /// (`2 w^2 sigma_t^2` on theta) on one driven at a constant `v` (`w`).
+    ///
+    /// Mutation: a constant `2 sigma_t^2` floor regardless of speed turned this red.
+    #[test]
+    fn timing_floor_is_zero_parked_and_v_sigma_t_moving() {
+        let c = cfg();
+        let sigma = DEFAULT_CLOCK_SIGMA_S;
+        let parked = state(&[
+            (0, 1.0, 2.0, 0.3),
+            (100, 1.0, 2.0, 0.3),
+            (200, 1.0, 2.0, 0.3),
+        ]);
+        let m = c.measurement(&parked.delta(50 * MS, 150 * MS, 0).unwrap());
+        assert_eq!(m.covariance[0][0], DEFAULT_MIN_TRANSLATION_SIGMA_M.powi(2));
+        assert_eq!(m.covariance[1][1], DEFAULT_MIN_TRANSLATION_SIGMA_M.powi(2));
+        assert_eq!(m.covariance[2][2], DEFAULT_MIN_HEADING_SIGMA_RAD.powi(2));
+        // 0.5 m/s straight; both ends between readings.
+        let moving = state(&[
+            (0, 0.0, 0.0, 0.0),
+            (100, 0.05, 0.0, 0.0),
+            (200, 0.1, 0.0, 0.0),
+        ]);
+        let d = moving.delta(50 * MS, 150 * MS, 0).unwrap();
+        assert!((d.speed_m_s[0] - 0.5).abs() < 1e-9 && (d.speed_m_s[1] - 0.5).abs() < 1e-9);
+        let m = c.measurement(&d);
+        let want = 2.0 * 0.25 * sigma * sigma;
+        assert!((m.covariance[1][1] - d.covariance[1][1] - want).abs() < 1e-15);
+        // 0.5 rad/s on the spot.
+        let turning = state(&[
+            (0, 0.0, 0.0, 0.0),
+            (100, 0.0, 0.0, 0.05),
+            (200, 0.0, 0.0, 0.1),
+        ]);
+        let d = turning.delta(50 * MS, 150 * MS, 0).unwrap();
+        let m = c.measurement(&d);
+        assert!((m.covariance[2][2] - d.covariance[2][2] - want).abs() < 1e-15);
+    }
+
+    #[test]
+    fn z_sigma_grows_with_path() {
+        let mut c = cfg();
+        c.z_slope = 0.01;
+        let mut d = parked_delta();
+        assert_eq!(c.measurement(&d).z_sigma, c.z_sigma);
+        d.path_m = 2.0;
+        let m = c.measurement(&d);
+        assert!(
+            (m.z_sigma - 0.01f64.hypot(0.02)).abs() < 1e-15,
+            "{}",
+            m.z_sigma
+        );
+        assert_eq!(m.tilt_sigma, c.tilt_sigma, "tilt does not random-walk");
+        // Off by default: the constant z_sigma of before.
+        d.path_m = 5.0;
+        assert_eq!(cfg().measurement(&d).z_sigma, cfg().z_sigma);
+    }
+
+    /// On a turning interval the measurement has real cross terms; it is exactly symmetric and
+    /// kornia-slam turns it into a symmetric positive definite 6x6 information.
+    #[test]
+    fn the_measurement_is_symmetric_and_its_information_positive_definite() {
+        let w = state_with(noisy_cfg(), &drive(std::f64::consts::FRAC_PI_2));
+        let m = w.cfg.measurement(&w.delta(0, 1000 * MS, 0).unwrap());
+        let c = m.covariance;
+        assert!(c[0][1] != 0.0 && c[0][2] != 0.0 && c[1][2] != 0.0, "{c:?}");
+        for (i, row) in c.iter().enumerate() {
+            for (j, x) in row.iter().enumerate() {
+                assert_eq!(*x, c[j][i]);
+            }
+        }
+        let info = m.information().expect("positive definite");
+        // Cholesky succeeds only on a symmetric positive definite matrix.
+        let mut l = [[0.0f64; 6]; 6];
+        for i in 0..6 {
+            for j in 0..6 {
+                assert!((info[i][j] - info[j][i]).abs() <= 1e-9 * info[i][i].abs().max(1.0));
+            }
+            for j in 0..=i {
+                let s: f64 = info[i][j] - (0..j).map(|k| l[i][k] * l[j][k]).sum::<f64>();
+                if i == j {
+                    assert!(s > 0.0, "not positive definite at {i}");
+                    l[i][i] = s.sqrt();
+                } else {
+                    l[i][j] = s / l[j][j];
+                }
+            }
+        }
+    }
+
+    /// The covariance is handed over in the END base frame, where kornia-slam's right-side
+    /// residual lives: after a 90 deg turn the start frame's forward variance is the end
+    /// frame's lateral one, and the heading cross terms follow.
+    ///
+    /// Mutation: passing the start-frame covariance through unrotated turned this red.
+    #[test]
+    fn the_covariance_is_rotated_into_the_residual_frame() {
+        let mut c = noisy_cfg();
+        c.clock_sigma = Time::new::<second>(0.0);
+        let w = state_with(c.clone(), &drive(std::f64::consts::FRAC_PI_2));
+        let d = w.delta(0, 1000 * MS, 0).unwrap();
+        let (p, m) = (d.covariance, c.measurement(&d).covariance);
+        // R(90 deg)^T maps start x to end -y and start y to end x.
+        assert!((m[0][0] - p[1][1]).abs() < 1e-12 * p[1][1].max(1.0));
+        assert!((m[1][1] - p[0][0]).abs() < 1e-12 * p[0][0].max(1.0));
+        assert!((m[0][2] - p[1][2]).abs() < 1e-12);
+        assert!((m[1][2] + p[0][2]).abs() < 1e-12);
+        assert!(
+            (m[0][0] - p[0][0]).abs() > 1e-6,
+            "the test needs anisotropy: {p:?}"
+        );
     }
 
     #[test]

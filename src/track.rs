@@ -3109,9 +3109,11 @@ impl Tracker {
     ///
     /// Every interval the wheels MOVED in is logged with all three sensors' numbers, whatever
     /// the verdict (an on-robot drive is read off these lines); a notable verdict while parked is
-    /// throttled.
-    fn check_motion(&mut self, factors: &[WheelOdomFactor], timestamp_sec: f64) {
-        for f in factors {
+    /// throttled. Each line also carries the interval's out-of-plane sample and path length
+    /// ([`crate::consistency::OutOfPlane`]), the data the factor's `z_sigma`, `z_slope` and
+    /// `tilt_sigma` are fitted from.
+    fn check_motion(&mut self, factors: &[(WheelOdomFactor, f64)], timestamp_sec: f64) {
+        for (f, path_m) in factors {
             let (wheels, gyro, vision) = self.interval_sensors(f);
             let Some(vision) = vision else {
                 // No comparable vision, so no verdict. The gyro alone still screens the wheels:
@@ -3197,9 +3199,11 @@ impl Tracker {
                 MotionVerdict::GyroDisagrees => "GYRO disagrees (bias or extrinsic), counted only",
             };
             let c = self.consistency;
+            let oop = crate::consistency::OutOfPlane::of(f, &motion.vision);
             let line = format!(
                 "motion check: {action}: kf {}->{} wheels_deg={:.2} gyro_deg={:.2} \
-                 vision_deg={:.2} wheels_mm={:.1} vision_mm={:.1} (checked={} vision={} \
+                 vision_deg={:.2} wheels_mm={:.1} vision_mm={:.1} oop_z_mm={:.2} \
+                 oop_roll_deg={:.3} oop_pitch_deg={:.3} path_m={:.4} (checked={} vision={} \
                  wheels={} gyro={} translation={})",
                 f.from_idx,
                 f.to_idx,
@@ -3208,6 +3212,10 @@ impl Tracker {
                 deg(&motion.vision.rotation),
                 motion.wheels.translation.length() * 1e3,
                 motion.vision.translation.length() * 1e3,
+                oop.z_m * 1e3,
+                oop.roll_rad.to_degrees(),
+                oop.pitch_rad.to_degrees(),
+                path_m,
                 c.checked,
                 c.vision_disagrees,
                 c.wheels_disagree,
@@ -6557,6 +6565,11 @@ mod tests {
     /// The factors must actually reach the solve, not just be counted: wheels that over-read
     /// by 30 % pull the BA-refined keyframes off the vision-only answer, which a tracking prior
     /// alone (PnP converges onto vision from any nearby seed) cannot do.
+    ///
+    /// At the default floors (1 mm / 1 mrad) the pull at 30 % is ~6.5 mm. Dropping the heading
+    /// floor to the encoders' quantisation (0.2 mrad) cut it to 1.2 mm on this turn-free scene,
+    /// next to 0.9 mm with the factors withheld: a robot that lowers the floors should check its
+    /// solve still converges onto the wheels before trusting them.
     #[test]
     fn test_biased_wheels_pull_the_ba_keyframes() {
         let keyframe_error = |scale: f64| {

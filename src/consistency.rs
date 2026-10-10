@@ -32,9 +32,15 @@
 //! Every interval the wheels moved in ([`IntervalMotion::wheels_moved`]), with all three
 //! sensors' rotations and both translations, whatever the verdict: a watched drive is read off
 //! these `motion check:` lines. Parked intervals speak only when notable, throttled.
+//!
+//! Each line also carries the interval's OUT-OF-PLANE sample ([`OutOfPlane`]): what vision says
+//! the base did in z, roll and pitch, which the planar wheels cannot see and the factor holds at
+//! zero with `z_sigma` / `tilt_sigma`. Binned by `path_m`, these are the data those two sigmas
+//! (and `z_slope`) are fitted from, instead of guessed.
 
 use kornia_3d::pose::Pose3d;
-use kornia_algebra::Mat3F64;
+use kornia_algebra::{Mat3F64, SO3F64};
+use kornia_slam::mapping::wheel_odom::WheelOdomFactor;
 
 /// Rotations closer than this always agree: the noise floor of a keyframe-interval rotation
 /// (vision ~0.3 deg, the wheels' 0.36 deg round trip, the gyro far below either), with margin.
@@ -148,6 +154,41 @@ impl IntervalMotion {
         let w = self.wheels.translation.length();
         let v = self.vision.translation.length();
         w >= TRANSLATION_MIN_M && (v - w).abs() > TRANSLATION_REL_TOL * w
+    }
+}
+
+/// Vision's base motion over one keyframe interval in the components the wheel factor holds
+/// stiff: one sample of the factor's out-of-plane residual.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OutOfPlane {
+    /// Base z change, metres, in the start base frame.
+    pub z_m: f64,
+    /// Relative base roll and pitch, radians: the x and y of the rotation vector.
+    pub roll_rad: f64,
+    /// See [`OutOfPlane::roll_rad`].
+    pub pitch_rad: f64,
+}
+
+impl OutOfPlane {
+    /// The sample for `factor`'s interval given vision's camera motion `T_c0c1` over it.
+    ///
+    /// Vision's base motion is `T_b0b1 = T_cb0^-1 T_c0c1 T_cb1` through the mount at each end,
+    /// and the sample is `dT^-1 T_b0b1` against the wheels' planar `dT`, the same composition
+    /// the factor's residual takes: so its tilt is the tilt the factor's `tilt_sigma` weighs,
+    /// expressed after the wheels' own turn is taken out.
+    pub fn of(factor: &WheelOdomFactor, vision: &Pose3d) -> Self {
+        let base = factor
+            .t_cb_from
+            .inverse()
+            .compose(vision)
+            .compose(&factor.t_cb_to);
+        let r = factor.measurement.delta_pose().inverse().compose(&base);
+        let w = SO3F64::from_matrix(&r.rotation).log();
+        Self {
+            z_m: r.translation.z,
+            roll_rad: w.x,
+            pitch_rad: w.y,
+        }
     }
 }
 
@@ -293,6 +334,39 @@ mod tests {
             motion(8.6, 0.0, None).verdict(),
             MotionVerdict::Inconclusive
         );
+    }
+
+    /// Vision that agrees with the wheels in the plane leaves only its out-of-plane part, read
+    /// in the base frame through a camera mounted along base +x.
+    #[test]
+    fn the_out_of_plane_sample_is_vision_minus_the_planar_wheels_in_the_base() {
+        use kornia_slam::mapping::wheel_odom::WheelOdomMeasurement;
+        // OpenCV camera looking along base +x: camera x = base -y, y = base -z, z = base +x.
+        let r_bc = Mat3F64::from_cols_array(&[0.0, -1.0, 0.0, 0.0, 0.0, -1.0, 1.0, 0.0, 0.0]);
+        let cam_in_base = Pose3d::new(r_bc, Vec3F64::new(0.1, 0.0, 0.9));
+        let t_cb = cam_in_base.inverse();
+        let wheels = WheelOdomMeasurement::new(
+            [0.3, 0.0, 0.2],
+            [[1e-4, 0.0, 0.0], [0.0, 1e-4, 0.0], [0.0, 0.0, 1e-4]],
+        );
+        // The true base motion: the wheels' plus 5 mm up and 0.01 rad of pitch.
+        let truth = wheels.delta_pose().compose(&Pose3d::new(
+            SO3F64::exp(Vec3F64::new(0.0, 0.01, 0.0)).matrix(),
+            Vec3F64::new(0.0, 0.0, 0.005),
+        ));
+        let vision = t_cb.compose(&truth).compose(&t_cb.inverse());
+        let factor = WheelOdomFactor {
+            from_idx: 0,
+            to_idx: 1,
+            measurement: wheels,
+            t_cb_from: t_cb,
+            t_cb_to: t_cb,
+            huber_chi2: None,
+        };
+        let o = OutOfPlane::of(&factor, &vision);
+        assert!((o.z_m - 0.005).abs() < 1e-12, "{o:?}");
+        assert!((o.pitch_rad - 0.01).abs() < 1e-12, "{o:?}");
+        assert!(o.roll_rad.abs() < 1e-12, "{o:?}");
     }
 
     /// Translation is only counted, past the wheels' minimum.
