@@ -40,12 +40,18 @@
 //!
 //! # The gate
 //!
-//! Every motion factor is a measurement of the current pose. At the vision-only pose their
-//! stacked residual `r` has the innovation covariance `S = C + J Sigma_v J^T` (`C` the factors'
-//! covariance, `Sigma_v` vision's from its Hessian): `chi2 = r^T S^-1 r` is the Mahalanobis
-//! distance between what vision placed and what the motion sensors predicted, with as many degrees
-//! of freedom as there are residual rows. Past the gate, vision is rejected for the frame and the
-//! motion sensors' own optimum is published instead.
+//! Two votes, so that vision is only ever blamed for a disagreement vision is part of.
+//!
+//! 1. **The predictors against each other.** With both an IMU and a wheel factor, their joint
+//!    optimum's residual is chi-square with `rows - 6` degrees of freedom whatever vision says.
+//!    Past the gate one of them is wrong (a stale keyframe velocity, a gyro off its bias, slip on
+//!    a straight run), and the one vision agrees with less is dropped for the frame.
+//! 2. **Vision against the prediction.** The predictors' joint optimum `x_p` with information
+//!    `H_p`, vision's pose `x_v` with covariance `Sigma_v` (its Hessian's inverse plus a floor for
+//!    the landmarks' own error), `d = Log(x_v x_p^-1)`: `chi2 = d^T (Sigma_v + H_p^-1)^-1 d`,
+//!    computed as `d^T H_p (H_p + Sigma_v^-1)^-1 Sigma_v^-1 d` so a rank-3 `H_p` (gyro only) is
+//!    fine, with 3 or 6 degrees of freedom. Past the gate, vision is rejected for the frame and
+//!    `x_p` is published instead, as a coast.
 
 use kornia_3d::camera::PinholeCamera;
 use kornia_3d::pose::Pose3d;
@@ -78,6 +84,18 @@ pub const KF_VELOCITY_SIGMA: f64 = 0.05;
 /// One sigma of the gyro's rotation as a fraction of the angle turned: the extrinsic (a 2 deg fit
 /// residual on the robot), the gyro scale and the camera-IMU time offset all grow with the turn.
 pub const GYRO_RELATIVE_SIGMA: f64 = 0.05;
+
+/// One sigma of the camera-IMU time offset, seconds. A rotation error of `|omega| * dt_offset`
+/// whatever the angle turned since the keyframe, so it is added on the angular RATE, not on the
+/// angle ([`GYRO_RELATIVE_SIGMA`] covers the scale and the extrinsic). Not measured on the robot.
+pub const TIME_OFFSET_SIGMA: f64 = 5e-3;
+
+/// A floor under vision's pose covariance, metres and radians, camera frame. `H_v^-1` assumes
+/// 1 px noise on exact landmarks; the landmarks carry their own stereo depth error, which the
+/// Hessian does not see. Not measured on the robot: read `fusion_chi2` parked to set it.
+pub const VISION_TRANSLATION_SIGMA_FLOOR: f64 = 2e-3;
+/// See [`VISION_TRANSLATION_SIGMA_FLOOR`].
+pub const VISION_ROTATION_SIGMA_FLOOR: f64 = 1e-3;
 
 /// Huber threshold on a reprojection's normalized squared error: the 2-DOF 95 % quantile.
 const HUBER_REPROJECTION_CHI2: f64 = 5.991;
@@ -125,11 +143,15 @@ pub struct FusionStats {
     pub frames: u64,
     /// Frames whose vision the gate rejected, lifetime.
     pub rejects: u64,
-    /// Rejections that ran past [`MAX_CONSECUTIVE_REJECTS`] and were handed to the loss path.
+    /// Rejection runs that reached [`MAX_CONSECUTIVE_REJECTS`]: the next frame's vision was
+    /// accepted and the fusion suspended until the next keyframe.
     pub reject_runs_expired: u64,
     /// Frames whose wheel factor was left out because the wheels disagreed with the gyro (slip,
     /// or the head turned on its mast), lifetime.
     pub wheel_dropped: u64,
+    /// Frames whose IMU factor was left out because the IMU disagreed with the wheels and vision
+    /// sided with the wheels (a stale keyframe velocity, a gyro off its bias), lifetime.
+    pub imu_dropped: u64,
     /// Rejections in a row, now.
     pub consecutive_rejects: u32,
     /// The last frame's chi2; NaN when the fusion did not run on it.
@@ -140,10 +162,11 @@ pub struct FusionStats {
     pub last_cost_us: u32,
 }
 
-/// Rejections in a row before the frame is handed to the loss path instead. A prediction that has
-/// coasted this long (~1.2 s at the head's 12 Hz) is the likelier one to be wrong (wheels slipping
-/// straight, a bias walking): vision that stays self-consistent against it gets the relocalization
-/// and re-anchor machinery rather than being outvoted forever.
+/// Rejections in a row before vision is accepted again. A prediction that has coasted this long
+/// (~1.2 s at the head's 12 Hz) is the likelier one to be wrong (wheels slipping straight, a bias
+/// walking, the robot carried): the next frame keeps vision's pose and matches, so it can become
+/// a keyframe, and the fusion stays off until one is inserted, because every later frame would
+/// otherwise be predicted from the same stale keyframe and rejected again.
 pub const MAX_CONSECUTIVE_REJECTS: u32 = 15;
 
 /// 6x6 row-major.
@@ -189,11 +212,27 @@ pub(crate) struct MotionFactor {
     pub information: Vec<f64>,
 }
 
+/// Which sensor a motion factor came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Predictor {
+    Imu,
+    Wheel,
+}
+
 impl MotionFactor {
+    /// Which sensor this factor came from.
+    pub fn predictor(&self) -> Predictor {
+        match self.term {
+            MotionTerm::Imu { .. } => Predictor::Imu,
+            MotionTerm::Wheel { .. } => Predictor::Wheel,
+        }
+    }
+
     /// The IMU factor of a keyframe-to-frame preintegration, integrated at the keyframe's bias.
     ///
     /// `gyro_bias_sigma` is the keyframe bias's uncertainty ([`KF_GYRO_BIAS_SIGMA`] or
-    /// [`UNINITIALIZED_GYRO_BIAS_SIGMA`]). `None` for a singular covariance.
+    /// [`UNINITIALIZED_GYRO_BIAS_SIGMA`]); `angular_rate` the gyro's rate at the frame, rad/s,
+    /// for the time-offset term ([`TIME_OFFSET_SIGMA`]). `None` for a singular covariance.
     #[allow(clippy::too_many_arguments)]
     pub fn imu(
         pim: &PreintegratedImu,
@@ -203,6 +242,7 @@ impl MotionFactor {
         gravity: Vec3F64,
         position: bool,
         gyro_bias_sigma: f64,
+        angular_rate: f64,
     ) -> Option<Self> {
         let kf_t_bw = imu_t_bc.compose(kf_pose_cw);
         let dim = if position { 6 } else { 3 };
@@ -222,7 +262,8 @@ impl MotionFactor {
         let jpg = pim.d_position_d_bias_gyro;
         let jpa = pim.d_position_d_bias_accel;
         let theta = SO3F64::from_matrix(&pim.delta_rotation).log().length();
-        let rel = (GYRO_RELATIVE_SIGMA * theta).powi(2);
+        let rel =
+            (GYRO_RELATIVE_SIGMA * theta).powi(2) + (TIME_OFFSET_SIGMA * angular_rate).powi(2);
         let add = |cov: &mut Vec<f64>, r0: usize, c0: usize, m: Mat3F64| {
             let a = m.to_cols_array();
             for c in 0..3 {
@@ -238,7 +279,8 @@ impl MotionFactor {
             jrg * jrg.transpose() * sg2 + Mat3F64::IDENTITY * rel,
         );
         if position {
-            let vel = (KF_VELOCITY_SIGMA * pim.dt).powi(2);
+            let vel = (KF_VELOCITY_SIGMA * pim.dt).powi(2)
+                + (TIME_OFFSET_SIGMA * kf_velocity.length()).powi(2);
             add(&mut cov, 0, 3, jrg * jpg.transpose() * sg2);
             add(&mut cov, 3, 0, jpg * jrg.transpose() * sg2);
             add(
@@ -361,7 +403,10 @@ pub(crate) struct FusionOutcome {
     pub pose: Pose3d,
     /// Whether vision was rejected.
     pub rejected: bool,
-    /// The innovation's Mahalanobis distance, and its degrees of freedom.
+    /// The predictor left out because it disagreed with the other and vision sided with the
+    /// other; `None` when they agreed (or only one was there).
+    pub dropped: Option<Predictor>,
+    /// Vision's Mahalanobis distance from the prediction, and its degrees of freedom (3 or 6).
     pub chi2: f64,
     pub dof: usize,
 }
@@ -370,8 +415,8 @@ pub(crate) struct FusionOutcome {
 /// or vision's own information is singular (too few matches to say anything about the pose).
 ///
 /// `vision_pose` is PnP's optimum, the start of the fused solve; `prediction_seed` is where the
-/// prediction solve starts when vision is rejected (the tracker's motion prior), which also fixes
-/// any direction the motion factors leave unconstrained.
+/// prediction solve starts (the tracker's motion prior), which also fixes any direction the
+/// motion factors leave unconstrained.
 pub(crate) fn fuse(
     camera: &PinholeCamera,
     visual: &[VisualObs],
@@ -383,22 +428,104 @@ pub(crate) fn fuse(
     if factors.is_empty() {
         return None;
     }
-    let (chi2, dof) = innovation_chi2(camera, visual, factors, vision_pose)?;
+    let vision_info = vision_information(camera, visual, vision_pose)?;
+    let mut active: Vec<MotionFactor> = factors.to_vec();
+    let mut dropped = None;
+    if let Some(odd) = outlying_predictor(
+        &vision_info,
+        factors,
+        vision_pose,
+        prediction_seed,
+        chi2_gate,
+    ) {
+        active.retain(|f| f.predictor() != odd);
+        dropped = Some(odd);
+    }
+    let prediction = solve(camera, &[], &active, prediction_seed);
+    let (chi2, dof) = vision_chi2(&vision_info, &active, vision_pose, &prediction)?;
     if chi2 > gate_for_dof(chi2_gate, dof) {
-        let pose = solve(camera, &[], factors, prediction_seed);
         return Some(FusionOutcome {
-            pose,
+            pose: prediction,
             rejected: true,
+            dropped,
             chi2,
             dof,
         });
     }
     Some(FusionOutcome {
-        pose: solve(camera, visual, factors, vision_pose),
+        pose: solve(camera, visual, &active, vision_pose),
         rejected: false,
+        dropped,
         chi2,
         dof,
     })
+}
+
+/// The predictor to leave out, when there are two and they disagree past the gate at their joint
+/// optimum (a residual vision plays no part in): the one whose own vote against vision is the
+/// worse, relative to its gate. `None` when they agree or only one is there.
+fn outlying_predictor(
+    vision_info: &[f64],
+    factors: &[MotionFactor],
+    vision_pose: &Pose3d,
+    seed: &Pose3d,
+    chi2_gate: f64,
+) -> Option<Predictor> {
+    if factors.len() < 2 {
+        return None;
+    }
+    let joint = solve_motion(factors, seed);
+    let rows: usize = factors.iter().map(|f| f.dim).sum();
+    let dof = rows.checked_sub(6).filter(|&d| d > 0)?;
+    let residual: f64 = factors.iter().map(|f| f.chi2(&joint)).sum();
+    if residual <= gate_for_dof(chi2_gate, dof) {
+        return None;
+    }
+    // Each predictor alone against vision; the worse one (relative to its gate) goes.
+    let score = |f: &MotionFactor| {
+        let alone = std::slice::from_ref(f);
+        let x = solve_motion(alone, seed);
+        vision_chi2(vision_info, alone, vision_pose, &x)
+            .map_or(f64::INFINITY, |(c, d)| c / gate_for_dof(chi2_gate, d))
+    };
+    factors
+        .iter()
+        .map(|f| (f.predictor(), score(f)))
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(p, _)| p)
+}
+
+/// The motion factors' joint optimum alone, started at `seed`.
+fn solve_motion(factors: &[MotionFactor], seed: &Pose3d) -> Pose3d {
+    let camera = PinholeCamera {
+        fx: 1.0,
+        fy: 1.0,
+        cx: 0.0,
+        cy: 0.0,
+        k1: 0.0,
+        k2: 0.0,
+        p1: 0.0,
+        p2: 0.0,
+    };
+    solve(&camera, &[], factors, seed)
+}
+
+/// Vision's pose information: the reprojections' Hessian at `vision_pose`, inverted, plus the
+/// landmark floor ([`VISION_TRANSLATION_SIGMA_FLOOR`]), inverted back. 6x6 row-major. `None` when
+/// vision's Hessian is singular.
+pub(crate) fn vision_information(
+    camera: &PinholeCamera,
+    visual: &[VisualObs],
+    vision_pose: &Pose3d,
+) -> Option<Vec<f64>> {
+    let (h_v, _, _) = visual_normal_equations(camera, visual, vision_pose);
+    let h_flat: Vec<f64> = h_v.iter().flatten().copied().collect();
+    let mut sigma_v = invert(&h_flat, 6)?;
+    for i in 0..3 {
+        sigma_v[i * 6 + i] += VISION_TRANSLATION_SIGMA_FLOOR.powi(2);
+        sigma_v[(i + 3) * 6 + i + 3] += VISION_ROTATION_SIGMA_FLOOR.powi(2);
+    }
+    invert(&sigma_v, 6)
 }
 
 /// The 6-DOF chi-square value `chi2_6` moved to `dof` degrees of freedom at the same tail
@@ -411,52 +538,46 @@ pub fn gate_for_dof(chi2_6: f64, dof: usize) -> f64 {
     m * (1.0 - wh(m) + z * wh(m).sqrt()).powi(3)
 }
 
-/// The Mahalanobis distance between the vision-only pose and the motion factors, and its DOF.
-pub(crate) fn innovation_chi2(
-    camera: &PinholeCamera,
-    visual: &[VisualObs],
+/// The Mahalanobis distance between vision's pose and the prediction `prediction` (the motion
+/// factors' joint optimum), and its degrees of freedom: 6 when a factor constrains the whole pose,
+/// 3 when only the gyro's rotation does.
+///
+/// `chi2 = d^T (Sigma_v + H_p^-1)^-1 d = d^T H_p (H_p + H_v)^-1 H_v d`, `d = Log(x_v x_p^-1)`
+/// (the left perturbation the Jacobians use), `H_v = vision_info`, `H_p` the factors' Gauss-Newton
+/// information at the prediction. The second form needs no inverse of a rank-3 `H_p` and has no
+/// cancellation.
+pub(crate) fn vision_chi2(
+    vision_info: &[f64],
     factors: &[MotionFactor],
     vision_pose: &Pose3d,
+    prediction: &Pose3d,
 ) -> Option<(f64, usize)> {
-    let (h_v, _, _) = visual_normal_equations(camera, visual, vision_pose);
-    let h_flat: Vec<f64> = h_v.iter().flatten().copied().collect();
-    let sigma_v = invert(&h_flat, 6)?;
-    let m: usize = factors.iter().map(|f| f.dim).sum();
-    let mut r = vec![0.0; m];
-    let mut j = vec![[0.0; 6]; m];
-    let mut s = vec![0.0; m * m];
-    let mut row = 0;
+    let mut h_p = [[0.0; 6]; 6];
+    let mut unused = [0.0; 6];
     for f in factors {
-        let (rf, jf) = f.linearize(vision_pose);
-        for a in 0..f.dim {
-            r[row + a] = rf[a];
-            j[row + a] = jf[a];
-            for b in 0..f.dim {
-                s[(row + a) * m + row + b] = f.covariance[a * f.dim + b];
-            }
-        }
-        row += f.dim;
+        let (r, j) = f.linearize(prediction);
+        accumulate(&mut h_p, &mut unused, &j, &f.information, &r, f.dim);
     }
-    // S += J Sigma_v J^T
-    for a in 0..m {
-        for b in 0..m {
-            let mut acc = 0.0;
-            for p in 0..6 {
-                let mut jp = 0.0;
-                for q in 0..6 {
-                    jp += sigma_v[p * 6 + q] * j[b][q];
-                }
-                acc += j[a][p] * jp;
-            }
-            s[a * m + b] += acc;
-        }
-    }
-    let mut x = r.clone();
-    if !cholesky_solve(&mut s, m, &mut x) {
+    let d = se3_log(&vision_pose.compose(&prediction.inverse()));
+    let mv = |m: &dyn Fn(usize, usize) -> f64, v: &[f64; 6]| -> [f64; 6] {
+        std::array::from_fn(|a| (0..6).map(|b| m(a, b) * v[b]).sum())
+    };
+    let hv_d = mv(&|a, b| vision_info[a * 6 + b], &d);
+    let hp_d = mv(&|a, b| h_p[a][b], &d);
+    let mut sum: Vec<f64> = (0..36)
+        .map(|k| h_p[k / 6][k % 6] + vision_info[k])
+        .collect();
+    let mut y = hv_d.to_vec();
+    if !cholesky_solve(&mut sum, 6, &mut y) {
         return None;
     }
-    let chi2: f64 = r.iter().zip(&x).map(|(a, b)| a * b).sum();
-    chi2.is_finite().then_some((chi2, m))
+    let chi2: f64 = hp_d.iter().zip(&y).map(|(a, b)| a * b).sum();
+    let dof = if factors.iter().any(|f| f.dim == 6) {
+        6
+    } else {
+        3
+    };
+    chi2.is_finite().then_some((chi2.max(0.0), dof))
 }
 
 /// Levenberg-Marquardt over the pose: robust reprojections plus quadratic motion factors.
@@ -730,6 +851,11 @@ pub(crate) struct IncrementalPreintegration {
 }
 
 impl IncrementalPreintegration {
+    /// The gyro's rate at the newest integrated sample, bias removed, rad/s; 0 before one.
+    pub fn last_rate(&self, bias: ImuBias) -> f64 {
+        self.last.map_or(0.0, |m| (m.gyro - bias.gyro).length())
+    }
+
     /// The preintegration over `[t0, t1]` from `samples` (any superset of the interval's, stamp
     /// sorted), reusing `cache` when it was built for the same keyframe, world and bias.
     #[allow(clippy::too_many_arguments)]
@@ -1074,6 +1200,189 @@ mod tests {
             t1,
         );
         assert_eq!(bits(&inc), bits(&full));
+    }
+
+    /// An IMU factor whose prediction is `pose` turned by `rot_offset` (rad, camera frame), with
+    /// isotropic sigmas: body == camera, the keyframe at the identity, no gravity or velocity.
+    fn imu_factor_at(
+        pose: &Pose3d,
+        rot_offset: Vec3F64,
+        sigma_m: f64,
+        sigma_rad: f64,
+    ) -> MotionFactor {
+        let r_wb = pose.rotation.transpose();
+        let mut covariance = vec![0.0; 36];
+        for i in 0..3 {
+            covariance[i * 6 + i] = sigma_rad * sigma_rad;
+            covariance[(i + 3) * 6 + i + 3] = sigma_m * sigma_m;
+        }
+        let information = invert(&covariance, 6).unwrap();
+        MotionFactor {
+            term: MotionTerm::Imu {
+                imu_t_bc: Pose3d::IDENTITY,
+                kf_r_bw: Mat3F64::IDENTITY,
+                kf_p_wb: Vec3F64::ZERO,
+                kf_velocity: Vec3F64::ZERO,
+                gravity: Vec3F64::ZERO,
+                dt: 1.0,
+                delta_rotation: r_wb * SO3F64::exp(rot_offset).matrix(),
+                delta_position: pose.inverse().translation,
+                position: true,
+            },
+            dim: 6,
+            covariance,
+            information,
+        }
+    }
+
+    /// The gate's closed form, `d^T H_p (H_p + H_v)^-1 H_v d`, is the textbook
+    /// `d^T (Sigma_v + H_p^-1)^-1 d` when the prediction constrains the whole pose.
+    #[test]
+    fn test_the_vision_gate_is_the_mahalanobis_distance_between_the_two_poses() {
+        let cam = camera();
+        let truth = se3_exp(&[0.02, 0.01, 0.1, 0.01, 0.03, 0.0]);
+        let vision = se3_exp(&[0.004, -0.003, 0.002, 0.001, -0.002, 0.0015]).compose(&truth);
+        let obs = observations(&vision);
+        let f = wheel_factor_at(&truth, 0.003, 0.002);
+        let h_v = vision_information(&cam, &obs, &vision).unwrap();
+        let (chi2, dof) = vision_chi2(&h_v, std::slice::from_ref(&f), &vision, &truth).unwrap();
+        assert_eq!(dof, 6);
+        // Direct: S = Sigma_v + P, P = (J^T Omega J)^-1 at the truth.
+        let (r, j) = f.linearize(&truth);
+        let mut h_p = [[0.0; 6]; 6];
+        let mut b = [0.0; 6];
+        accumulate(&mut h_p, &mut b, &j, &f.information, &r, 6);
+        let p = invert(&h_p.iter().flatten().copied().collect::<Vec<_>>(), 6).unwrap();
+        let sv = invert(&h_v, 6).unwrap();
+        let mut s: Vec<f64> = (0..36).map(|k| sv[k] + p[k]).collect();
+        let d = se3_log(&vision.compose(&truth.inverse()));
+        let mut x = d.to_vec();
+        assert!(cholesky_solve(&mut s, 6, &mut x));
+        let direct: f64 = d.iter().zip(&x).map(|(a, b)| a * b).sum();
+        assert!(
+            (chi2 - direct).abs() < 1e-6 * direct.max(1.0),
+            "{chi2} vs {direct}"
+        );
+        assert!(chi2 > 1.0);
+    }
+
+    /// The IMU and the wheels disagree (a gyro 20 mrad off, both stiff) while vision agrees with
+    /// the wheels: the IMU is dropped and vision is accepted, rather than vision being judged
+    /// against a compromise neither sensor believes.
+    ///
+    /// Mutation: `outlying_predictor` returning `None` turned this red (vision rejected).
+    #[test]
+    fn test_predictors_that_disagree_lose_the_one_vision_does_not_back() {
+        let cam = camera();
+        let truth = se3_exp(&[0.02, 0.0, 0.1, 0.0, 0.05, 0.0]);
+        let obs = observations(&truth);
+        let wheels = wheel_factor_at(&truth, 0.001, 0.001);
+        let imu = imu_factor_at(&truth, Vec3F64::new(0.0, 0.02, 0.0), 0.001, 0.001);
+        let out = fuse(
+            &cam,
+            &obs,
+            &[imu.clone(), wheels.clone()],
+            &truth,
+            &truth,
+            DEFAULT_CHI2_GATE,
+        )
+        .expect("fused");
+        assert_eq!(out.dropped, Some(Predictor::Imu), "{out:?}");
+        assert!(!out.rejected, "chi2 {}", out.chi2);
+        assert!((centre(&out.pose) - centre(&truth)).length() < 1e-4);
+        // Agreeing predictors drop nothing.
+        let imu_ok = imu_factor_at(&truth, Vec3F64::ZERO, 0.001, 0.001);
+        let out = fuse(
+            &cam,
+            &obs,
+            &[imu_ok, wheels],
+            &truth,
+            &truth,
+            DEFAULT_CHI2_GATE,
+        )
+        .unwrap();
+        assert_eq!(out.dropped, None);
+        assert!(!out.rejected);
+    }
+
+    /// The IMU position row at a pose that moved with the keyframe's velocity under gravity is
+    /// zero: `p = p_kf + v dt + g dt^2 / 2 + R_wb_kf dp`. The tests' keyframes are all at rest, so
+    /// this is the only check of the velocity and gravity terms' signs.
+    ///
+    /// Mutation: `- kf_velocity * dt` flipped to `+` turned this red.
+    #[test]
+    fn test_the_imu_position_row_follows_velocity_and_gravity() {
+        let kf_r_wb = SO3F64::exp(Vec3F64::new(0.1, -0.2, 0.3)).matrix();
+        let kf_p = Vec3F64::new(1.0, 2.0, 0.5);
+        let v = Vec3F64::new(0.3, -0.1, 0.05);
+        let g = Vec3F64::new(0.0, 0.0, -9.81);
+        let dt = 0.4;
+        let dp = Vec3F64::new(0.05, 0.8, -0.02);
+        let dr = SO3F64::exp(Vec3F64::new(0.0, 0.0, 0.2)).matrix();
+        let p = kf_p + v * dt + g * (0.5 * dt * dt) + kf_r_wb * dp;
+        let r_wb = kf_r_wb * dr;
+        // body == camera: T_cw = T_bw = (R_wb, p)^-1.
+        let pose_cw = Pose3d::new(r_wb, p).inverse();
+        let f = MotionFactor {
+            term: MotionTerm::Imu {
+                imu_t_bc: Pose3d::IDENTITY,
+                kf_r_bw: kf_r_wb.transpose(),
+                kf_p_wb: kf_p,
+                kf_velocity: v,
+                gravity: g,
+                dt,
+                delta_rotation: dr,
+                delta_position: dp,
+                position: true,
+            },
+            dim: 6,
+            covariance: vec![0.0; 36],
+            information: vec![0.0; 36],
+        };
+        let r = f.residual(&pose_cw);
+        assert!(r.iter().all(|x| x.abs() < 1e-9), "{r:?}");
+    }
+
+    /// The camera-IMU time offset is a rotation error of `|omega| * dt`, so the gyro's sigma grows
+    /// with the rate at the frame even right after a keyframe.
+    ///
+    /// Mutation: the `TIME_OFFSET_SIGMA * angular_rate` term removed turned this red.
+    #[test]
+    fn test_the_gyro_sigma_grows_with_the_angular_rate() {
+        let calib = ImuCalib {
+            gyro_noise: 1.7e-4,
+            accel_noise: 2e-3,
+            gyro_bias_noise: 2e-5,
+            accel_bias_noise: 3e-3,
+        };
+        let samples: Vec<ImuMeasurement> = (0..10)
+            .map(|k| ImuMeasurement {
+                timestamp: 0.005 * f64::from(k),
+                gyro: Vec3F64::ZERO,
+                accel: Vec3F64::new(0.0, 0.0, 9.81),
+            })
+            .collect();
+        let pim =
+            PreintegratedImu::from_measurements(ImuBias::default(), calib, &samples, 0.0, 0.04);
+        let build = |rate: f64| {
+            MotionFactor::imu(
+                &pim,
+                Pose3d::IDENTITY,
+                &Pose3d::IDENTITY,
+                Vec3F64::ZERO,
+                Vec3F64::new(0.0, 0.0, -9.81),
+                false,
+                KF_GYRO_BIAS_SIGMA,
+                rate,
+            )
+            .unwrap()
+        };
+        let (still, turning) = (build(0.0), build(0.5));
+        let want = (TIME_OFFSET_SIGMA * 0.5).powi(2);
+        for i in 0..3 {
+            let grew = turning.covariance[i * 3 + i] - still.covariance[i * 3 + i];
+            assert!((grew - want).abs() < 1e-12, "{i}: {grew} vs {want}");
+        }
     }
 
     #[test]

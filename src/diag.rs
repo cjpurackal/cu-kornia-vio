@@ -133,6 +133,8 @@ fn fusion_check(tracker: &Tracker) -> FusionCheck {
         dof,
         rejected: report.vision_rejected,
         cost_us: if report.fused { f.last_cost_us } else { 0 },
+        reject_runs_expired: f.reject_runs_expired,
+        imu_dropped: f.imu_dropped,
     }
 }
 

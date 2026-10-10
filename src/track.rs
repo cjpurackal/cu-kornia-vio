@@ -113,7 +113,7 @@ use crate::consistency::{ConsistencyStats, IntervalMotion, MotionVerdict};
 use crate::error::VioError;
 use crate::fusion::{
     FusionConfig, FusionOutcome, FusionStats, IncrementalPreintegration, KF_GYRO_BIAS_SIGMA,
-    MAX_CONSECUTIVE_REJECTS, MotionFactor, UNINITIALIZED_GYRO_BIAS_SIGMA, VisualObs,
+    MAX_CONSECUTIVE_REJECTS, MotionFactor, Predictor, UNINITIALIZED_GYRO_BIAS_SIGMA, VisualObs,
 };
 use crate::imu::{
     ImuBuffer, ImuWindowError, InertialConfig, InertialStats, RawImuSample, WindowExcitation,
@@ -355,7 +355,8 @@ pub enum TrackStatus {
     Untracked,
     /// Wheel odometry only: vision did not place the frame, and the pose is the last one
     /// propagated on the wheels (and the gyro, with the inertial path on). Also the frame a map
-    /// drop re-anchored on, whose pose is the same propagation.
+    /// drop re-anchored on, whose pose is the same propagation, and a frame whose vision the
+    /// per-frame fusion rejected ([`crate::fusion`]), whose pose is the IMU and wheel prediction.
     Coasting(TrackedPose),
     /// Wheel odometry only: vision did not place the frame and no wheel reading covered it. The
     /// pose is the tracker's extrapolation, carried so a consumer can see the state, not use it.
@@ -889,6 +890,13 @@ pub struct Tracker {
     fusion: FusionStats,
     /// The keyframe-to-frame preintegration the per-frame fusion extends frame by frame.
     fusion_preint: Option<IncrementalPreintegration>,
+    /// The keyframe the per-frame fusion is suspended on: set when a rejection run expires or a
+    /// relocalization moves the pose, since every frame predicted from that keyframe would carry
+    /// the same stale prediction. Frame indices only grow, so the next keyframe ends it.
+    fusion_suspended_on: Option<usize>,
+    /// The last tracked frame's PnP pose and the pose it was given (fused, or the same):
+    /// `(frame idx, vision, published)`. What the keyframe motion check records as vision's word.
+    vision_pose: Option<(usize, Pose3d, Pose3d)>,
 }
 
 /// Why the current frame was or was not measured, beyond its [`TrackStatus`].
@@ -913,6 +921,40 @@ pub struct FrameReport {
 /// drop BA stays off until `max_keyframes` (75-140 s on the robot). The drop keeps the plausible
 /// bias and re-initializes.
 const BIAS_REFUSALS_BEFORE_DROP: u32 = 3;
+
+/// Whether two poses differ in any bit.
+fn pose_differs(a: &Pose3d, b: &Pose3d) -> bool {
+    a.rotation != b.rotation || a.translation != b.translation
+}
+
+/// Whether the IMU's position rows may enter the per-frame fusion at this inertial stage. They
+/// predict from the gravity direction, which a motion initialization only gets to within ~1 deg
+/// at its second refinement (23 deg at the initial solve on EuRoC V101); the rows' sigma has no
+/// gravity term, so before that they would reject every frame and starve the keyframes the
+/// refinements need. A still window measures gravity directly.
+fn imu_position_trusted(stage: InertialStage) -> bool {
+    matches!(stage, InertialStage::Static | InertialStage::Refine2)
+}
+
+/// The wheels' rotation covariance (the `[roll, pitch, yaw]` block of a 6x6 row-major base-frame
+/// covariance) in the camera at the interval's END, `t_cb_to`: the wheel factor's error is a
+/// right-side perturbation there, as is the gyro's it is voted against.
+fn wheel_rotation_cov_in_camera(cov6: &[f64], t_cb_to: &Pose3d) -> Mat3F64 {
+    let c = |r: usize, k: usize| cov6[(3 + r) * 6 + 3 + k];
+    let cov_base = Mat3F64::from_cols_array(&[
+        c(0, 0),
+        c(1, 0),
+        c(2, 0),
+        c(0, 1),
+        c(1, 1),
+        c(2, 1),
+        c(0, 2),
+        c(1, 2),
+        c(2, 2),
+    ]);
+    let r_cb = t_cb_to.rotation;
+    r_cb * cov_base * r_cb.transpose()
+}
 
 /// Keyframe tracked poses kept for the motion check: the pending wheel intervals (8) plus the
 /// factors that can still act (16), with slack.
@@ -1026,6 +1068,8 @@ impl Tracker {
                 ..FusionStats::default()
             },
             fusion_preint: None,
+            fusion_suspended_on: None,
+            vision_pose: None,
         }
     }
 
@@ -1293,6 +1337,17 @@ impl Tracker {
                 )
             }
             TrackingStatus::Tracked | TrackingStatus::KeyframeAccepted => {
+                // A frame whose vision the fusion rejected is the IMU and wheel prediction: a
+                // coast, not a measurement, so it neither clears the failure count nor leaves
+                // as Tracked.
+                if self.frame_report.vision_rejected {
+                    self.stats.consecutive_failures =
+                        self.stats.consecutive_failures.saturating_add(1);
+                    return Ok(TrackStatus::Coasting(TrackedPose {
+                        keyframe: false,
+                        ..pose
+                    }));
+                }
                 self.stats.consecutive_failures = 0;
                 Ok(if coast_anchor {
                     TrackStatus::Coasting(pose)
@@ -2056,9 +2111,30 @@ impl Tracker {
 
                 // PER-FRAME FUSION: the pose re-solved with the IMU and the wheels from the last
                 // keyframe, or their prediction when vision disagrees with them past the gate.
-                let fused =
+                let mut fused =
                     self.fuse_frame(&frame, &estimate.pose, &matches, &candidate_pose, stamp_ns);
                 fusion_us = self.fusion.last_cost_us;
+                if fused.is_some_and(|o| o.rejected)
+                    && self.fusion.consecutive_rejects >= MAX_CONSECUTIVE_REJECTS
+                {
+                    // Vision has stayed self-consistent against the prediction for longer than a
+                    // coast should be trusted: keep vision's pose and matches (so this frame can
+                    // become the keyframe the next predictions start from), and suspend the
+                    // fusion until a keyframe is inserted. Every frame until then would be
+                    // predicted from the same stale keyframe and rejected again.
+                    self.fusion.consecutive_rejects = 0;
+                    self.fusion.reject_runs_expired += 1;
+                    self.fusion_suspended_on = self.state.last_keyframe_idx;
+                    warning!(
+                        "per-frame fusion: vision rejected for {} frames in a row; accepting \
+                         frame {} and suspending the fusion until the next keyframe chi2={} dof={}",
+                        MAX_CONSECUTIVE_REJECTS,
+                        frame.idx,
+                        self.fusion.last_chi2,
+                        self.fusion.last_dof
+                    );
+                    fused = None;
+                }
                 let rejected = fused.is_some_and(|o| o.rejected);
                 if rejected {
                     self.fusion.rejects += 1;
@@ -2066,50 +2142,32 @@ impl Tracker {
                 } else {
                     self.fusion.consecutive_rejects = 0;
                 }
-                if rejected && self.fusion.consecutive_rejects > MAX_CONSECUTIVE_REJECTS {
-                    // Vision has stayed self-consistent against the prediction for longer than a
-                    // coast should be trusted: hand the frame to the loss path (coast, then
-                    // relocalization, then a re-anchor) rather than outvoting vision forever.
-                    self.fusion.consecutive_rejects = 0;
-                    self.fusion.reject_runs_expired += 1;
-                    warning!(
-                        "per-frame fusion: vision rejected for {} frames in a row; handing frame {} \
-                         to the loss path chi2={} dof={}",
-                        MAX_CONSECUTIVE_REJECTS + 1,
-                        frame.idx,
-                        self.fusion.last_chi2,
-                        self.fusion.last_dof
-                    );
-                    self.state.pose_world_to_cam = candidate_pose;
-                    self.classify_matches(&estimate.matches, &[]);
+                let pose = fused.map_or(estimate.pose, |o| o.pose);
+                self.vision_pose = Some((frame.idx, estimate.pose, pose));
+                self.state.pose_world_to_cam = pose;
+                self.state.velocity = Some(Pose3d::between(&pose_before, &pose));
+                if rejected {
+                    // The IMU and the wheels outvoted this frame's matches: published as a coast
+                    // (process_frame), and none of the matches reaches the map, so a bad frame
+                    // cannot become a keyframe or a landmark observation.
+                    self.frame_report.vision_rejected = true;
                     self.note_failure(FailureReason::VisionRejected);
-                    (TrackingStatus::Skipped, Vec::new(), 0, false)
+                    self.classify_matches(&estimate.matches, &[]);
+                    debug!(
+                        "track: vision rejected by per-frame fusion frame={} chi2={} dof={}",
+                        frame.idx, self.fusion.last_chi2, self.fusion.last_dof
+                    );
+                    (TrackingStatus::Tracked, Vec::new(), estimate.inliers, true)
                 } else {
-                    let pose = fused.map_or(estimate.pose, |o| o.pose);
-                    self.state.pose_world_to_cam = pose;
-                    self.state.velocity = Some(Pose3d::between(&pose_before, &pose));
-                    if rejected {
-                        // Published as tracked: it is the estimator's output, the IMU and the
-                        // wheels having outvoted this frame's matches. None of them reaches the
-                        // map, so a bad frame cannot become a keyframe or a landmark observation.
-                        self.frame_report.vision_rejected = true;
-                        self.classify_matches(&estimate.matches, &[]);
-                        debug!(
-                            "track: vision rejected by per-frame fusion frame={} chi2={} dof={}",
-                            frame.idx, self.fusion.last_chi2, self.fusion.last_dof
-                        );
-                        (TrackingStatus::Tracked, Vec::new(), estimate.inliers, true)
-                    } else {
-                        self.classify_matches(&estimate.matches, &matches);
-                        debug!(
-                            "track: ok frame={} matches={} kept={} inliers={}",
-                            frame.idx,
-                            estimate.matches.len(),
-                            matches.len(),
-                            estimate.inliers
-                        );
-                        (TrackingStatus::Tracked, matches, estimate.inliers, false)
-                    }
+                    self.classify_matches(&estimate.matches, &matches);
+                    debug!(
+                        "track: ok frame={} matches={} kept={} inliers={}",
+                        frame.idx,
+                        estimate.matches.len(),
+                        matches.len(),
+                        estimate.inliers
+                    );
+                    (TrackingStatus::Tracked, matches, estimate.inliers, false)
                 }
             }
             Err(reason) => {
@@ -2222,6 +2280,9 @@ impl Tracker {
                 // next tracked pair.
                 self.state.velocity = None;
                 self.state.current_keyframe_idx = Some(kf_idx);
+                // The last keyframe's prediction does not span the jump: no fusion until the
+                // next keyframe.
+                self.fusion_suspended_on = self.state.last_keyframe_idx;
                 self.state.lost_since_sec = None;
                 self.state.last_frame_timestamp_sec = timestamp_sec;
                 self.frame_report.relocalized = true;
@@ -2330,7 +2391,8 @@ impl Tracker {
                 // it silently if a reader is ever added.
                 return TrackingStatus::Skipped;
             }
-        } else {
+        } else if !vision_rejected {
+            // A rejected frame is a coast: it neither starts nor ends a loss.
             self.state.lost_since_sec = None;
         }
         self.state.last_frame_timestamp_sec = timestamp_sec;
@@ -2364,6 +2426,10 @@ impl Tracker {
         let t0 = std::time::Instant::now();
         let kf_ns = self.last_keyframe_stamp_ns.filter(|&t| t < stamp_ns)?;
         let kf_idx = self.state.last_keyframe_idx?;
+        if self.fusion_suspended_on == Some(kf_idx) {
+            return None;
+        }
+        let position_rows = imu_position_trusted(self.inertial_diag().0);
         let kf = self.map.get_keyframe(kf_idx)?;
         let kf_pose = kf.frame.pose_world_to_cam;
         let (kf_bias, kf_velocity) = (kf.imu_bias, kf.velocity_world);
@@ -2386,6 +2452,10 @@ impl Tracker {
                 ts_sec(stamp_ns, epoch),
             );
             let initialized = self.state.imu_initialized;
+            let rate = self
+                .fusion_preint
+                .as_ref()
+                .map_or(0.0, |c| c.last_rate(kf_bias));
             let bias_sigma = if initialized {
                 KF_GYRO_BIAS_SIGMA
             } else {
@@ -2399,8 +2469,9 @@ impl Tracker {
                     &kf_pose,
                     kf_velocity,
                     inert.gravity_world,
-                    initialized,
+                    initialized && position_rows,
                     bias_sigma,
+                    rate,
                 )
             {
                 let r_bc = inert.cfg.imu_t_bc.rotation;
@@ -2438,21 +2509,7 @@ impl Tracker {
                         gyro: Some(gyro),
                     }
                     .verdict();
-                    // The wheels' [roll, pitch, yaw] block, base frame, rotated into the camera.
-                    let c = &f.covariance;
-                    let cov_base = Mat3F64::from_cols_array(&[
-                        c[3 * 6 + 3],
-                        c[4 * 6 + 3],
-                        c[5 * 6 + 3],
-                        c[3 * 6 + 4],
-                        c[4 * 6 + 4],
-                        c[5 * 6 + 4],
-                        c[3 * 6 + 5],
-                        c[4 * 6 + 5],
-                        c[5 * 6 + 5],
-                    ]);
-                    let r_cb = t_from.rotation;
-                    let cov_cam = r_cb * cov_base * r_cb.transpose();
+                    let cov_cam = wheel_rotation_cov_in_camera(&f.covariance, &t_to);
                     verdict == MotionVerdict::WheelsDisagree
                         || !crate::fusion::wheels_agree_with_gyro(
                             &wheels.rotation,
@@ -2499,6 +2556,11 @@ impl Tracker {
         self.fusion.last_cost_us = u32::try_from(t0.elapsed().as_micros()).unwrap_or(u32::MAX);
         if let Some(o) = &out {
             self.fusion.frames += 1;
+            match o.dropped {
+                Some(Predictor::Imu) => self.fusion.imu_dropped += 1,
+                Some(Predictor::Wheel) => self.fusion.wheel_dropped += 1,
+                None => {}
+            }
             self.fusion.last_chi2 = o.chi2;
             self.fusion.last_dof = u8::try_from(o.dof).unwrap_or(u8::MAX);
             self.frame_report.fused = true;
@@ -2726,13 +2788,26 @@ impl Tracker {
         // older keyframe for the same reason.
         // The wheel interval this keyframe closes, queued even when BA does not run: a factor
         // is keyed by `Frame::idx` and acts in every later solve whose window holds both ends.
-        // Vision's word for this keyframe, before BA leans it on the gyro and the wheels.
+        // Vision's word for this keyframe, before BA (or the per-frame fusion) leans it on the
+        // gyro and the wheels: PnP's pose when this frame was tracked, else the keyframe's own
+        // (a bootstrap keyframe, which no fusion touched).
         if let Some(kf) = self.map.keyframes().last() {
-            self.kf_tracked_poses.push_back((
-                kf.frame.idx,
-                self.world_generation,
-                kf.frame.pose_world_to_cam,
-            ));
+            //
+            // The inertial ladder above may have moved the keyframe since (an alignment rotates
+            // the world), so the fusion's offset is carried onto the keyframe as it stands:
+            // `vision * published^-1 * kf`. Bit for bit the keyframe's own pose when the fusion
+            // did not move it.
+            let kf_pose = kf.frame.pose_world_to_cam;
+            let vision = match self.vision_pose {
+                Some((idx, vision, published))
+                    if idx == kf.frame.idx && pose_differs(&vision, &published) =>
+                {
+                    vision.compose(&published.inverse()).compose(&kf_pose)
+                }
+                _ => kf_pose,
+            };
+            self.kf_tracked_poses
+                .push_back((kf.frame.idx, self.world_generation, vision));
             while self.kf_tracked_poses.len() > KF_TRACKED_POSES {
                 self.kf_tracked_poses.pop_front();
             }
@@ -7827,6 +7902,34 @@ mod tests {
             .expect("a valid pair")
     }
 
+    /// [`feed_moving`] with the wheels reading `[x, y, theta]`.
+    fn feed_moving_xy(
+        tracker: &mut Tracker,
+        seq: u32,
+        cam_at: &dyn Fn(f64) -> Pose3d,
+        wheel: [f64; 3],
+        view: &Pose3d,
+    ) -> TrackStatus {
+        let stamp = EPOCH_NS + u64::from(seq) * FRAME_NS;
+        let from = seq
+            .checked_sub(1)
+            .map(|p| EPOCH_NS + u64::from(p) * FRAME_NS);
+        let samples = moving_imu(tracker, cam_at, from, stamp);
+        tracker.push_raw_imu(samples, 0, false).unwrap();
+        tracker
+            .push_wheel([WheelSample {
+                stamp_ns: stamp,
+                x: wheel[0],
+                y: wheel[1],
+                theta: wheel[2],
+            }])
+            .unwrap();
+        let (left, right) = render_pair(view);
+        tracker
+            .process_stereo(&left, &right, CuTime::from_nanos(stamp))
+            .expect("a valid pair")
+    }
+
     fn published(status: &TrackStatus) -> Pose3d {
         match status {
             TrackStatus::Tracked(p) | TrackStatus::Coasting(p) | TrackStatus::NotLocalized(p) => {
@@ -7874,7 +7977,9 @@ mod tests {
             let report = tracker.frame_report();
             if fusion {
                 assert!(moved_mm < 3.0, "fused pose moved {moved_mm} mm");
-                assert!(matches!(status, TrackStatus::Tracked(_)), "{status:?}");
+                // The prediction is a coast, not a measurement.
+                assert!(matches!(status, TrackStatus::Coasting(_)), "{status:?}");
+                assert_eq!(report.failure, FailureReason::VisionRejected);
                 assert!(report.vision_rejected && report.fused, "{report:?}");
                 assert_eq!(tracker.fusion_stats().rejects, 1);
                 assert!(tracker.fusion_stats().last_chi2 > 100.0);
@@ -7901,13 +8006,22 @@ mod tests {
         }
     }
 
-    /// A view that stays displaced is outvoted for [`MAX_CONSECUTIVE_REJECTS`] frames, each
-    /// publishing the prediction in place; the next goes to the loss path instead of being
-    /// outvoted forever (where relocalization may then accept it).
+    /// A view that stays displaced (the robot pushed or carried, the prediction wrong) is
+    /// outvoted for [`MAX_CONSECUTIVE_REJECTS`] frames, each publishing the prediction in place
+    /// as a coast. The next frame's vision is accepted, and it STAYS accepted: the fusion waits
+    /// for a keyframe instead of predicting every later frame from the same stale one.
+    ///
+    /// Mutation: not suspending the fusion on expiry (`fusion_suspended_on` left unset) turned
+    /// this red (rejected again on the frame after the accepted one, a 25 mm flicker per run).
     #[test]
-    fn test_a_run_of_rejections_ends_in_the_loss_path() {
+    fn test_a_run_of_rejections_ends_with_vision_accepted_for_good() {
         let mut tracker = fusion_tracker(true);
         let start = park_until_static_init(&mut tracker);
+        // No keyframe from here on: the default policy would make the accepted frame one at once
+        // (8 frames since the last), which re-anchors the prediction by itself and hides whether
+        // the fusion waits. A map whose insertion is refused, or a laxer policy, does not.
+        tracker.config.keyframe_policy.max_frames_between = usize::MAX;
+        tracker.config.keyframe_policy.ref_ratio = 0.0;
         let still = |_t: f64| Pose3d::IDENTITY;
         let before = published(&feed_moving(
             &mut tracker,
@@ -7920,23 +8034,192 @@ mod tests {
             Mat3F64::IDENTITY,
             Vec3F64::new(2.0 * SCENE_STEP_M, 0.0, 0.0),
         );
+        let moved_mm = |status: &TrackStatus| {
+            (published(status).inverse().translation - before.inverse().translation).length() * 1e3
+        };
         for (i, seq) in (start + 1..)
             .take(MAX_CONSECUTIVE_REJECTS as usize)
             .enumerate()
         {
             let status = feed_moving(&mut tracker, seq, &still, 0.0, &jumped);
-            let moved_mm =
-                (published(&status).inverse().translation - before.inverse().translation).length()
-                    * 1e3;
             assert!(tracker.frame_report().vision_rejected, "frame {i}");
-            assert!(moved_mm < 3.0, "frame {i}: {moved_mm} mm");
+            assert!(
+                matches!(status, TrackStatus::Coasting(_)),
+                "frame {i}: {status:?}"
+            );
+            assert!(
+                moved_mm(&status) < 3.0,
+                "frame {i}: {} mm",
+                moved_mm(&status)
+            );
         }
         assert_eq!(tracker.fusion_stats().reject_runs_expired, 0);
-        let seq = start + 1 + MAX_CONSECUTIVE_REJECTS;
-        feed_moving(&mut tracker, seq, &still, 0.0, &jumped);
+        let first = start + 1 + MAX_CONSECUTIVE_REJECTS;
+        for seq in first..first + 20 {
+            let status = feed_moving(&mut tracker, seq, &still, 0.0, &jumped);
+            assert!(
+                matches!(status, TrackStatus::Tracked(_)),
+                "frame {seq}: {status:?}"
+            );
+            assert!(!tracker.frame_report().vision_rejected, "frame {seq}");
+            // Vision's pose (25 mm along), not the old one.
+            let mm = moved_mm(&status);
+            assert!(
+                mm > 15.0,
+                "frame {seq}: back at the old pose, {mm} mm from it"
+            );
+        }
         let f = tracker.fusion_stats();
         assert_eq!(f.reject_runs_expired, 1, "{f:?}");
-        assert!(!tracker.frame_report().vision_rejected);
+        assert_eq!(f.rejects, u64::from(MAX_CONSECUTIVE_REJECTS), "{f:?}");
+        // ...and the expiry reaches the status topic.
+        let diag = crate::diag::frame_diagnostics(
+            &tracker,
+            &TrackStatus::Untracked,
+            crate::diag::StreamCounters::default(),
+        );
+        assert_eq!(diag.fusion.reject_runs_expired, 1);
+    }
+
+    /// A straight drive at 0.15 m/s, gravity settled by the still window so the IMU's position
+    /// rows are in: vision, the IMU and the wheels agree, nothing is rejected, and the published
+    /// motion follows the truth. The keyframes' velocities are whatever the tracker gave them,
+    /// which is what a stale one on the robot would test.
+    #[test]
+    fn test_a_straight_drive_with_good_vision_is_followed_not_rejected() {
+        const SPEED: f64 = 0.15;
+        let mut tracker = fusion_tracker(true);
+        let start = park_until_static_init(&mut tracker);
+        assert!(imu_position_trusted(tracker.inertial_diag().0));
+        let t_start = f64::from(start) * FRAME_NS as f64 * 1e-9;
+        let dist = move |t: f64| SPEED * (t - t_start).max(0.0);
+        let t_cb = tracker.wheel.as_ref().unwrap().cfg.t_cb;
+        let cam_at = move |t: f64| {
+            let fwd = Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(dist(t), 0.0, 0.0));
+            t_cb.compose(&fwd).compose(&t_cb.inverse())
+        };
+        let t_of = |seq: u32| f64::from(seq) * FRAME_NS as f64 * 1e-9;
+        let first = published(&feed_moving_xy(
+            &mut tracker,
+            start,
+            &cam_at,
+            [0.0, 0.0, 0.0],
+            &Pose3d::IDENTITY,
+        ));
+        let mut worst_mm = 0.0f64;
+        for seq in start + 1..start + 17 {
+            let truth = cam_at(t_of(seq)).inverse();
+            let status = feed_moving_xy(
+                &mut tracker,
+                seq,
+                &cam_at,
+                [dist(t_of(seq)), 0.0, 0.0],
+                &cam_at(t_of(seq)),
+            );
+            assert!(
+                matches!(status, TrackStatus::Tracked(_)),
+                "frame {seq}: {status:?}"
+            );
+            assert!(
+                !tracker.frame_report().vision_rejected,
+                "frame {seq} rejected"
+            );
+            let rel = first.compose(&published(&status).inverse());
+            let err = truth.compose(&rel);
+            worst_mm = worst_mm.max(err.translation.length() * 1e3);
+        }
+        let f = tracker.fusion_stats();
+        assert!(f.frames >= 16, "{f:?}");
+        assert_eq!(f.rejects, 0, "{f:?}");
+        assert!(
+            worst_mm < 8.0,
+            "worst translation error {worst_mm} mm over 160 mm ({f:?})"
+        );
+    }
+
+    /// The keyframe motion check records PnP's pose, not the fused one: it is vision's word,
+    /// compared against the gyro and the wheels, so it must not already lean on them.
+    ///
+    /// Mutation: recording `kf.frame.pose_world_to_cam` again turned this red.
+    #[test]
+    fn test_the_keyframe_motion_check_records_vision_not_the_fusion() {
+        const RATE: f64 = 0.3;
+        let mut tracker = fusion_tracker(true);
+        let start = park_until_static_init(&mut tracker);
+        let t_start = f64::from(start) * FRAME_NS as f64 * 1e-9;
+        let theta = move |t: f64| RATE * (t - t_start).max(0.0);
+        let t_cb = tracker.wheel.as_ref().unwrap().cfg.t_cb;
+        let cam_at = move |t: f64| {
+            let rz = Pose3d::new(
+                SO3F64::exp(Vec3F64::new(0.0, 0.0, theta(t))).matrix(),
+                Vec3F64::ZERO,
+            );
+            t_cb.compose(&rz).compose(&t_cb.inverse())
+        };
+        let t_of = |seq: u32| f64::from(seq) * FRAME_NS as f64 * 1e-9;
+        let mut checked = 0;
+        for seq in start..start + 24 {
+            let truth = cam_at(t_of(seq));
+            let status = feed_moving(&mut tracker, seq, &cam_at, theta(t_of(seq)), &truth);
+            let TrackStatus::Tracked(p) = status else {
+                continue;
+            };
+            if !p.keyframe || !tracker.frame_report().fused {
+                continue;
+            }
+            let (idx, vision, published) = tracker.vision_pose.expect("tracked by PnP");
+            let &(kf_idx, _, recorded) = tracker.kf_tracked_poses.back().unwrap();
+            assert_eq!(kf_idx, idx);
+            // No alignment on these keyframes (the world was aligned while parked), so the
+            // recorded pose is PnP's, up to the noise of `vision * published^-1 * kf` (the
+            // keyframe as stored is not bit for bit the published pose): far below what the
+            // fusion moved it by, which is what recording the fused pose would leave.
+            let d = recorded.compose(&vision.inverse());
+            let moved = published.compose(&vision.inverse());
+            let (d_m, moved_m) = (d.translation.length(), moved.translation.length());
+            assert!(
+                moved_m > 1e-6,
+                "frame {seq}: the fusion moved it {moved_m} m"
+            );
+            assert!(
+                d_m < moved_m * 1e-2,
+                "frame {seq}: {d_m} m off vision, fusion {moved_m}"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 1, "no fused keyframe in the run");
+    }
+
+    #[test]
+    fn test_imu_position_rows_wait_for_settled_gravity() {
+        for (stage, want) in [
+            (InertialStage::Off, false),
+            (InertialStage::Uninitialized, false),
+            (InertialStage::Initial, false),
+            (InertialStage::Refine1, false),
+            (InertialStage::Refine2, true),
+            (InertialStage::Static, true),
+        ] {
+            assert_eq!(imu_position_trusted(stage), want, "{stage:?}");
+        }
+    }
+
+    /// The wheels' rotation covariance is rotated into the camera at the interval's end.
+    #[test]
+    fn test_the_wheel_vote_uses_the_mount_at_the_interval_end() {
+        let mut cov6 = vec![0.0; 36];
+        cov6[3 * 6 + 3] = 1e-6; // roll
+        cov6[4 * 6 + 4] = 4e-6; // pitch
+        cov6[5 * 6 + 5] = 9e-6; // yaw
+        let end = Pose3d::new(
+            SO3F64::exp(Vec3F64::new(0.0, 0.0, std::f64::consts::FRAC_PI_2)).matrix(),
+            Vec3F64::ZERO,
+        );
+        let c = wheel_rotation_cov_in_camera(&cov6, &end);
+        // A quarter turn about z swaps the roll and pitch variances.
+        assert!((c.x_axis.x - 4e-6).abs() < 1e-15, "{c:?}");
+        assert!((c.y_axis.y - 1e-6).abs() < 1e-15, "{c:?}");
+        assert!((c.z_axis.z - 9e-6).abs() < 1e-15, "{c:?}");
     }
 
     /// (b) A real turn with good vision: the base turns at 0.3 rad/s about its z for 16 frames

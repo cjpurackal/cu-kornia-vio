@@ -236,13 +236,23 @@ is used until the first `CameraMount` arrives.
 Off by default. Without it the IMU and the wheels only seed each frame's PnP and meet vision in
 keyframe local BA; the published pose is PnP's. With `"per_frame_fusion": (enabled: true)` each
 tracked frame's pose is optimized against its map matches (Huber), the IMU preintegrated from the
-last keyframe at its bias and velocity (rotation; position once initialized) and the wheels from
-the last keyframe (the BA factor and noise model), weighted by the configured noise figures. A
-frame whose vision lies past the chi-square gate (`chi2_gate`, a 6-DOF value scaled to the frame's
-degrees of freedom; default 22.458, 99.9 %) from that prediction publishes the prediction instead
-and leaves the map untouched; a run of 16 goes to the loss path. The wheel term is dropped when
-the wheels disagree with the gyro. `VioDiagnostics::fusion` carries the counts, this frame's chi2
-and whether it was rejected. See the `fusion` module docs for the model and its assumptions.
+last keyframe at its bias and velocity (rotation; position once gravity is settled: a still-window
+initialization or the second refinement) and the wheels from the last keyframe (the BA factor and
+noise model), weighted by the configured noise figures.
+
+Two gates, at `chi2_gate` (a 6-DOF value scaled to each test's degrees of freedom; default
+22.458, 99.9 %):
+
+- the IMU against the wheels, at their joint optimum: when they disagree, the one vision agrees
+  with less is dropped for the frame (and the wheels are also dropped when their rotation
+  disagrees with the gyro's);
+- vision against the remaining prediction: past the gate the frame publishes the prediction as
+  `Coasting` (`FailureReason::VisionRejected`) and leaves the map untouched. After 15 rejections
+  in a row the next frame's vision is accepted and the fusion waits for the next keyframe.
+
+`VioDiagnostics::fusion` carries the counts (frames, rejects, expired runs, wheel and IMU drops),
+this frame's chi2 and whether it was rejected. See the `fusion` module docs for the model and its
+assumptions, none of which is measured on the robot yet.
 
 ## Documentation and development
 

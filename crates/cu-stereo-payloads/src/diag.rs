@@ -73,8 +73,8 @@ pub enum FailureReason {
     LowReferenceCorrespondences,
     /// A map was anchored at a dead-reckoned pose after a loss: a coast, reported unmeasured.
     DeadReckonedAnchor,
-    /// Per-frame fusion: vision disagreed with the IMU and wheel prediction past the gate for
-    /// longer than the rejection run allows, and the frame went to the loss path.
+    /// Per-frame fusion: vision disagreed with the IMU and wheel prediction past the gate, and
+    /// the frame published the prediction as a coast.
     VisionRejected,
 }
 
@@ -216,12 +216,20 @@ pub struct FusionCheck {
     /// This frame's Mahalanobis distance between vision and the prediction; 0 with `dof` 0 when
     /// the fusion did not run on it.
     pub chi2: f32,
-    /// Its degrees of freedom: the motion factors' residual rows (3 gyro, 6 IMU, 6 wheels).
+    /// Its degrees of freedom: 6 when a motion factor constrains the whole pose, 3 when only the
+    /// gyro's rotation does.
     pub dof: u8,
     /// This frame's vision was rejected and the prediction published.
     pub rejected: bool,
     /// The fusion's cost on this frame, microseconds.
     pub cost_us: u32,
+    /// Rejection runs that reached their limit, after which vision was accepted and the fusion
+    /// suspended until the next keyframe, lifetime. A count that keeps climbing means the
+    /// prediction is wrong, not vision.
+    pub reject_runs_expired: u64,
+    /// Frames whose IMU factor was left out because the IMU disagreed with the wheels and vision
+    /// sided with the wheels, lifetime.
+    pub imu_dropped: u64,
 }
 
 /// What the tracker knew about one processed frame. The time of validity is the frame's capture
