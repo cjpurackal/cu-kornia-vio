@@ -111,6 +111,10 @@ use kornia_slam::tracking::{
 
 use crate::consistency::{ConsistencyStats, IntervalMotion, MotionVerdict};
 use crate::error::VioError;
+use crate::fusion::{
+    FusionConfig, FusionOutcome, FusionStats, IncrementalPreintegration, KF_GYRO_BIAS_SIGMA,
+    MAX_CONSECUTIVE_REJECTS, MotionFactor, UNINITIALIZED_GYRO_BIAS_SIGMA, VisualObs,
+};
 use crate::imu::{
     ImuBuffer, ImuWindowError, InertialConfig, InertialStats, RawImuSample, WindowExcitation,
     preintegration_is_finite, ts_sec, window_excitation,
@@ -278,6 +282,10 @@ pub struct TrackerConfig {
     /// was: no wheel factor, the constant-velocity prior, no published coast, and a map drop
     /// that restarts the world at identity. See [`crate::wheel`] for what `Some` changes.
     pub wheel_odom: Option<WheelOdomConfig>,
+    /// Per-frame fused tracking ([`crate::fusion`]). `None` — what [`TrackerConfig::new`] sets —
+    /// publishes PnP's pose, the IMU and the wheels seeding it only. It fuses whatever of
+    /// [`Self::inertial`] and [`Self::wheel_odom`] is on, and with neither it changes nothing.
+    pub per_frame_fusion: Option<FusionConfig>,
 }
 
 impl TrackerConfig {
@@ -327,6 +335,7 @@ impl TrackerConfig {
             max_covisible_keyframes: DEFAULT_MAX_COVISIBLE_KEYFRAMES,
             inertial: None,
             wheel_odom: None,
+            per_frame_fusion: None,
         }
     }
 }
@@ -876,6 +885,10 @@ pub struct Tracker {
     last_motion: MotionCheck,
     /// The last frame's left keypoints, classified. Reused: cleared and refilled per frame.
     features: Vec<FeaturePoint>,
+    /// Per-frame fusion counters; see [`crate::fusion`].
+    fusion: FusionStats,
+    /// The keyframe-to-frame preintegration the per-frame fusion extends frame by frame.
+    fusion_preint: Option<IncrementalPreintegration>,
 }
 
 /// Why the current frame was or was not measured, beyond its [`TrackStatus`].
@@ -887,6 +900,11 @@ pub struct FrameReport {
     pub relocalized: bool,
     /// A map was anchored on this frame at a dead-reckoned pose (a loss re-bootstrap).
     pub reanchored: bool,
+    /// Per-frame fusion rejected this frame's vision: the pose is the IMU and wheel prediction
+    /// from the last keyframe, and the frame left the map untouched.
+    pub vision_rejected: bool,
+    /// Per-frame fusion ran on this frame (it had a motion factor to fuse with).
+    pub fused: bool,
 }
 
 /// Consecutive local BA updates refused for an implausible bias (`BiasLimit`) before the map is
@@ -1003,6 +1021,11 @@ impl Tracker {
             anchored_since_reset: false,
             last_motion: MotionCheck::default(),
             features: Vec::new(),
+            fusion: FusionStats {
+                last_chi2: f64::NAN,
+                ..FusionStats::default()
+            },
+            fusion_preint: None,
         }
     }
 
@@ -1991,7 +2014,8 @@ impl Tracker {
         let est_ms = t_est.elapsed().as_secs_f64() * 1e3;
         let t_rest = std::time::Instant::now();
 
-        let (mut status, matches, tracked_inliers) = match result {
+        let mut fusion_us = 0u32;
+        let (mut status, matches, tracked_inliers, vision_rejected) = match result {
             Ok(estimate) => {
                 // GYRO vs VISION, over the same interval. The transposes in
                 // `gyro_camera_delta` cannot be checked by inspection — a wrong one yields a
@@ -2014,8 +2038,6 @@ impl Tracker {
                         gyro_vs_visual_deg
                     );
                 }
-                self.state.pose_world_to_cam = estimate.pose;
-                self.state.velocity = Some(Pose3d::between(&pose_before, &estimate.pose));
                 // `Estimate::matches` is the FULL correspondence set, not the
                 // inlier set — `solve_pnp` returns `(Pose3d, usize)` and throws
                 // the mask away. Everything downstream of here writes those
@@ -2031,15 +2053,64 @@ impl Tracker {
                 // those writes, so a rejected correspondence never reaches
                 // the map's bookkeeping.
                 let matches = self.reject_pnp_outliers(&frame, &estimate.pose, &estimate.matches);
-                self.classify_matches(&estimate.matches, &matches);
-                debug!(
-                    "track: ok frame={} matches={} kept={} inliers={}",
-                    frame.idx,
-                    estimate.matches.len(),
-                    matches.len(),
-                    estimate.inliers
-                );
-                (TrackingStatus::Tracked, matches, estimate.inliers)
+
+                // PER-FRAME FUSION: the pose re-solved with the IMU and the wheels from the last
+                // keyframe, or their prediction when vision disagrees with them past the gate.
+                let fused =
+                    self.fuse_frame(&frame, &estimate.pose, &matches, &candidate_pose, stamp_ns);
+                fusion_us = self.fusion.last_cost_us;
+                let rejected = fused.is_some_and(|o| o.rejected);
+                if rejected {
+                    self.fusion.rejects += 1;
+                    self.fusion.consecutive_rejects += 1;
+                } else {
+                    self.fusion.consecutive_rejects = 0;
+                }
+                if rejected && self.fusion.consecutive_rejects > MAX_CONSECUTIVE_REJECTS {
+                    // Vision has stayed self-consistent against the prediction for longer than a
+                    // coast should be trusted: hand the frame to the loss path (coast, then
+                    // relocalization, then a re-anchor) rather than outvoting vision forever.
+                    self.fusion.consecutive_rejects = 0;
+                    self.fusion.reject_runs_expired += 1;
+                    warning!(
+                        "per-frame fusion: vision rejected for {} frames in a row; handing frame {} \
+                         to the loss path chi2={} dof={}",
+                        MAX_CONSECUTIVE_REJECTS + 1,
+                        frame.idx,
+                        self.fusion.last_chi2,
+                        self.fusion.last_dof
+                    );
+                    self.state.pose_world_to_cam = candidate_pose;
+                    self.classify_matches(&estimate.matches, &[]);
+                    self.note_failure(FailureReason::VisionRejected);
+                    (TrackingStatus::Skipped, Vec::new(), 0, false)
+                } else {
+                    let pose = fused.map_or(estimate.pose, |o| o.pose);
+                    self.state.pose_world_to_cam = pose;
+                    self.state.velocity = Some(Pose3d::between(&pose_before, &pose));
+                    if rejected {
+                        // Published as tracked: it is the estimator's output, the IMU and the
+                        // wheels having outvoted this frame's matches. None of them reaches the
+                        // map, so a bad frame cannot become a keyframe or a landmark observation.
+                        self.frame_report.vision_rejected = true;
+                        self.classify_matches(&estimate.matches, &[]);
+                        debug!(
+                            "track: vision rejected by per-frame fusion frame={} chi2={} dof={}",
+                            frame.idx, self.fusion.last_chi2, self.fusion.last_dof
+                        );
+                        (TrackingStatus::Tracked, Vec::new(), estimate.inliers, true)
+                    } else {
+                        self.classify_matches(&estimate.matches, &matches);
+                        debug!(
+                            "track: ok frame={} matches={} kept={} inliers={}",
+                            frame.idx,
+                            estimate.matches.len(),
+                            matches.len(),
+                            estimate.inliers
+                        );
+                        (TrackingStatus::Tracked, matches, estimate.inliers, false)
+                    }
+                }
             }
             Err(reason) => {
                 // Carry the *predicted* pose forward instead of freezing at
@@ -2054,12 +2125,12 @@ impl Tracker {
                     reject_reason_str(reason)
                 );
                 self.note_failure(failure_reason(reason));
-                (TrackingStatus::Skipped, Vec::new(), 0)
+                (TrackingStatus::Skipped, Vec::new(), 0, false)
             }
         };
         self.stats.inliers = tracked_inliers;
 
-        if status == TrackingStatus::Tracked {
+        if status == TrackingStatus::Tracked && !vision_rejected {
             // Visibility bookkeeping over the local map only; a full-map scan
             // here would grow with trajectory length.
             let current_kf = self
@@ -2103,8 +2174,8 @@ impl Tracker {
             // `estimate_pose` is projection matching + PnP; `bookkeep` is the local-map
             // visibility accounting that feeds culling; `kf` is insertion (grow/fuse/BA).
             debug!(
-                "tracking_step split: est_ms={} bookkeep_ms={} kf_ms={}",
-                est_ms, bookkeep_ms, kf_ms
+                "tracking_step split: est_ms={} fusion_us={} bookkeep_ms={} kf_ms={}",
+                est_ms, fusion_us, bookkeep_ms, kf_ms
             );
 
             // MAP GROWTH, at info so it survives a production log filter that drops debug.
@@ -2264,6 +2335,180 @@ impl Tracker {
         }
         self.state.last_frame_timestamp_sec = timestamp_sec;
         status
+    }
+
+    /// Per-frame fused tracking ([`crate::fusion`]) for a frame vision placed at `vision_pose`.
+    ///
+    /// Builds the motion factors from the last keyframe — the IMU preintegrated at the keyframe's
+    /// bias (position rows once the inertial path is initialized), and the wheels through the
+    /// mount at each end — and hands them with the kept matches to the gate and the solve.
+    /// `None` when the fusion is off, there is no keyframe to anchor on, or no factor could be
+    /// built (no IMU coverage, no wheel reading): the frame keeps vision's pose.
+    ///
+    /// The wheel factor is left out when the wheels disagree with the gyro over the interval:
+    /// [`crate::consistency`]'s verdict (vision and the gyro outvote the wheels), or the two
+    /// predictors' own Mahalanobis vote ([`crate::fusion::wheels_agree_with_gyro`]), which also
+    /// catches the head turning on its mast by less than the verdict's 1.5 deg floor.
+    fn fuse_frame(
+        &mut self,
+        frame: &Frame,
+        vision_pose: &Pose3d,
+        matches: &[(usize, usize)],
+        prediction_seed: &Pose3d,
+        stamp_ns: u64,
+    ) -> Option<FusionOutcome> {
+        let cfg = self.config.per_frame_fusion?;
+        self.fusion.last_chi2 = f64::NAN;
+        self.fusion.last_dof = 0;
+        self.fusion.last_cost_us = 0;
+        let t0 = std::time::Instant::now();
+        let kf_ns = self.last_keyframe_stamp_ns.filter(|&t| t < stamp_ns)?;
+        let kf_idx = self.state.last_keyframe_idx?;
+        let kf = self.map.get_keyframe(kf_idx)?;
+        let kf_pose = kf.frame.pose_world_to_cam;
+        let (kf_bias, kf_velocity) = (kf.imu_bias, kf.velocity_world);
+
+        let mut factors: Vec<MotionFactor> = Vec::with_capacity(2);
+        // The gyro's camera rotation over the interval and its camera-frame covariance, for the
+        // wheels' vote below.
+        let mut gyro_cam: Option<(Mat3F64, Mat3F64)> = None;
+        if let (Some(inert), Some(epoch)) = (self.inertial.as_ref(), self.epoch_ns)
+            && let Ok(window) = inert.buffer.window(kf_ns, stamp_ns, &inert.cfg.gates)
+        {
+            let pim = IncrementalPreintegration::extend(
+                &mut self.fusion_preint,
+                kf_idx,
+                self.world_generation,
+                kf_bias,
+                inert.cfg.calib,
+                window.map(|s| s.to_measurement(epoch)),
+                ts_sec(kf_ns, epoch),
+                ts_sec(stamp_ns, epoch),
+            );
+            let initialized = self.state.imu_initialized;
+            let bias_sigma = if initialized {
+                KF_GYRO_BIAS_SIGMA
+            } else {
+                UNINITIALIZED_GYRO_BIAS_SIGMA
+            };
+            if pim.dt > 0.0
+                && preintegration_is_finite(&pim)
+                && let Some(f) = MotionFactor::imu(
+                    &pim,
+                    inert.cfg.imu_t_bc,
+                    &kf_pose,
+                    kf_velocity,
+                    inert.gravity_world,
+                    initialized,
+                    bias_sigma,
+                )
+            {
+                let r_bc = inert.cfg.imu_t_bc.rotation;
+                let d = f.dim;
+                let c = &f.covariance;
+                let cov_b = Mat3F64::from_cols_array(&[
+                    c[0],
+                    c[d],
+                    c[2 * d],
+                    c[1],
+                    c[d + 1],
+                    c[2 * d + 1],
+                    c[2],
+                    c[d + 2],
+                    c[2 * d + 2],
+                ]);
+                gyro_cam = Some((
+                    r_bc.transpose() * pim.delta_rotation * r_bc,
+                    r_bc.transpose() * cov_b * r_bc,
+                ));
+                factors.push(f);
+            }
+        }
+        if let Some(w) = self.wheel.as_ref()
+            && let Ok(d) = w.delta(kf_ns, stamp_ns, w.cfg.max_gap_ns())
+        {
+            let m = w.cfg.measurement(&d);
+            let (t_from, t_to) = (w.t_cb_at(kf_ns), w.t_cb_at(stamp_ns));
+            if let Some(f) = MotionFactor::wheel(&m, t_from, t_to, &kf_pose) {
+                let disagree = gyro_cam.is_some_and(|(gyro, gyro_cov)| {
+                    let wheels = t_from.compose(&m.delta_pose()).compose(&t_to.inverse());
+                    let verdict = IntervalMotion {
+                        wheels,
+                        vision: kf_pose.compose(&vision_pose.inverse()),
+                        gyro: Some(gyro),
+                    }
+                    .verdict();
+                    // The wheels' [roll, pitch, yaw] block, base frame, rotated into the camera.
+                    let c = &f.covariance;
+                    let cov_base = Mat3F64::from_cols_array(&[
+                        c[3 * 6 + 3],
+                        c[4 * 6 + 3],
+                        c[5 * 6 + 3],
+                        c[3 * 6 + 4],
+                        c[4 * 6 + 4],
+                        c[5 * 6 + 4],
+                        c[3 * 6 + 5],
+                        c[4 * 6 + 5],
+                        c[5 * 6 + 5],
+                    ]);
+                    let r_cb = t_from.rotation;
+                    let cov_cam = r_cb * cov_base * r_cb.transpose();
+                    verdict == MotionVerdict::WheelsDisagree
+                        || !crate::fusion::wheels_agree_with_gyro(
+                            &wheels.rotation,
+                            &cov_cam,
+                            &gyro,
+                            &gyro_cov,
+                            cfg.chi2_gate,
+                        )
+                });
+                if disagree {
+                    self.fusion.wheel_dropped += 1;
+                } else {
+                    factors.push(f);
+                }
+            }
+        }
+        if factors.is_empty() {
+            return None;
+        }
+
+        let inv_scale = 1.0 / ORB_SCALE_FACTOR;
+        let mps = self.map.map_points();
+        let visual: Vec<VisualObs> = matches
+            .iter()
+            .filter_map(|&(mp_idx, kp_idx)| {
+                let mp = mps.get(mp_idx).filter(|mp| !mp.culled)?;
+                let xy = frame.undistorted_xy(kp_idx, &self.camera)?;
+                let octave = frame.features.octaves.get(kp_idx).copied().unwrap_or(0);
+                Some(VisualObs {
+                    point_world: mp.position,
+                    pixel: [f64::from(xy[0]), f64::from(xy[1])],
+                    inv_sigma: inv_scale.powi(i32::from(octave)),
+                })
+            })
+            .collect();
+        let out = crate::fusion::fuse(
+            &self.camera,
+            &visual,
+            &factors,
+            vision_pose,
+            prediction_seed,
+            cfg.chi2_gate,
+        );
+        self.fusion.last_cost_us = u32::try_from(t0.elapsed().as_micros()).unwrap_or(u32::MAX);
+        if let Some(o) = &out {
+            self.fusion.frames += 1;
+            self.fusion.last_chi2 = o.chi2;
+            self.fusion.last_dof = u8::try_from(o.dof).unwrap_or(u8::MAX);
+            self.frame_report.fused = true;
+        }
+        out
+    }
+
+    /// The per-frame fusion's counters; see [`crate::fusion`]. All zero with it off.
+    pub fn fusion_stats(&self) -> FusionStats {
+        self.fusion
     }
 
     /// Keeps only the correspondences that reproject within PnP's own final
@@ -4515,6 +4760,7 @@ fn sample_keypoint_colors(gray: &Image<u8, 1>, keypoints_xy: &[[f32; 2]]) -> Vec
 mod tests {
     use super::*;
     use cu29::units::si::f64::Frequency;
+    use kornia_algebra::SO3F64;
 
     fn rectified_camera() -> PinholeCamera {
         PinholeCamera {
@@ -7425,5 +7671,397 @@ mod tests {
             );
         }
         assert!(limit.admits(&tracker.inertial.as_ref().unwrap().bias));
+    }
+
+    // ── Per-frame fusion ─────────────────────────────────────────────────────
+
+    /// A camera ANYWHERE in the scene of [`scene_pair`], ray-cast: the three bands are planes at
+    /// `Z = fx * B / disparity` in the first camera's frame, each carrying its texture where the
+    /// first camera saw it. Pure translation along x reproduces `scene_pair` exactly (pinned by a
+    /// test), so the moving tests below see the scene every other test tracks.
+    fn render_pair(cam_in_world: &Pose3d) -> (Image<u8, 1>, Image<u8, 1>) {
+        const BANDS: [u32; 3] = [16, 24, 32];
+        const W: usize = 320;
+        const H: usize = 240;
+        const ROWS: f64 = (H / 3) as f64;
+        let (f, cx, cy, baseline) = (300.0f64, 160.0f64, 120.0f64, 0.1f64);
+        let texture = |x: u32, y: u32| {
+            let h = (x / 2).wrapping_mul(73_856_093) ^ (y / 2).wrapping_mul(19_349_663);
+            (h.wrapping_mul(2_654_435_761) >> 24) as u8
+        };
+        let eye = |pose: Pose3d| {
+            let mut out = vec![0u8; W * H];
+            // Nearest plane first.
+            let planes: Vec<(usize, f64)> = (0..3)
+                .rev()
+                .map(|i| (i, f * baseline / f64::from(BANDS[i])))
+                .collect();
+            for y in 0..H {
+                for x in 0..W {
+                    let d_c = Vec3F64::new((x as f64 - cx) / f, (y as f64 - cy) / f, 1.0);
+                    let d_w = pose.rotation * d_c;
+                    let c = pose.translation;
+                    for &(band, z) in &planes {
+                        if d_w.z <= 0.0 {
+                            break;
+                        }
+                        let t = (z - c.z) / d_w.z;
+                        if t <= 0.0 {
+                            continue;
+                        }
+                        let p = c + d_w * t;
+                        let v = f * p.y / z + cy + 1e-6;
+                        if v < 0.0 || ((v / ROWS) as usize).min(2) != band || v >= H as f64 {
+                            continue;
+                        }
+                        let u = f * p.x / z + cx + 1e-6;
+                        out[y * W + x] = texture(u.floor() as i64 as u32, v.floor() as u32);
+                        break;
+                    }
+                }
+            }
+            Image::new(
+                ImageSize {
+                    width: W,
+                    height: H,
+                },
+                out,
+            )
+            .expect("sized")
+        };
+        let right = cam_in_world.compose(&Pose3d::new(
+            Mat3F64::IDENTITY,
+            Vec3F64::new(baseline, 0.0, 0.0),
+        ));
+        (eye(*cam_in_world), eye(right))
+    }
+
+    #[test]
+    fn test_the_ray_cast_scene_is_the_translating_scene() {
+        for seq in [0u32, 3, 8] {
+            let pose = Pose3d::new(
+                Mat3F64::IDENTITY,
+                Vec3F64::new(SCENE_STEP_M * f64::from(seq), 0.0, 0.0),
+            );
+            let (l, r) = render_pair(&pose);
+            let (sl, sr, _) = scene_pair(seq);
+            assert_eq!(l.as_slice(), sl.as_slice(), "left {seq}");
+            assert_eq!(r.as_slice(), sr.as_slice(), "right {seq}");
+        }
+    }
+
+    /// The parked, inertial, wheeled tracker of the consistency tests, with per-frame fusion
+    /// on or off.
+    fn fusion_tracker(fusion: bool) -> Tracker {
+        scene_tracker_with(|c| {
+            c.inertial = Some(static_inertial_config());
+            c.wheel_odom = Some(scene_wheel_config());
+            c.per_frame_fusion = fusion.then(FusionConfig::default);
+        })
+    }
+
+    /// The IMU of a rig whose camera follows `cam_at(t)` (seconds since `EPOCH_NS`, world = the
+    /// first camera), over `(from_ns, to_ns]` on the 5 ms grid: kinematics by central
+    /// differences, gravity [`parked_gravity_vis`], the parked gyro bias and jitter.
+    fn moving_imu(
+        tracker: &Tracker,
+        cam_at: &dyn Fn(f64) -> Pose3d,
+        from_ns: Option<u64>,
+        to_ns: u64,
+    ) -> Vec<RawImuSample> {
+        let t_cb = tracker.inertial.as_ref().unwrap().cfg.imu_t_bc.inverse();
+        let body = |t: f64| cam_at(t).compose(&t_cb);
+        let g = parked_gravity_vis();
+        let bg = Vec3F64::from_array(PARKED_GYRO_BIAS);
+        let h = 1e-3;
+        let first = from_ns.map_or(0, |t| (t - EPOCH_NS) / IMU_PERIOD_NS + 2);
+        let last = (to_ns - EPOCH_NS) / IMU_PERIOD_NS + 1;
+        (first..=last)
+            .map(|k| {
+                let t = (k * IMU_PERIOD_NS) as f64 * 1e-9;
+                let (b0, b, b1) = (body(t - h), body(t), body(t + h));
+                let a_w = (b1.translation - b.translation * 2.0 + b0.translation) * (1.0 / (h * h));
+                let r_bw = b.rotation.transpose();
+                let jf = k as f64;
+                let jitter = Vec3F64::new((1.7 * jf).sin(), (2.9 * jf).sin(), (4.3 * jf).sin());
+                let f_b = r_bw * (a_w - g) + jitter * 0.02;
+                let w_b = SO3F64::from_matrix(&(b0.rotation.transpose() * b1.rotation)).log()
+                    * (1.0 / (2.0 * h))
+                    + bg
+                    + jitter * 0.002;
+                RawImuSample {
+                    stamp_ns: EPOCH_NS + k * IMU_PERIOD_NS,
+                    gyro: [w_b.x, w_b.y, w_b.z],
+                    accel: [f_b.x, f_b.y, f_b.z],
+                }
+            })
+            .collect()
+    }
+
+    /// One frame of a rig following `cam_at`, the wheels reading heading `wheel_theta`, the
+    /// pair rendered at `view` (the truth unless a test corrupts it).
+    fn feed_moving(
+        tracker: &mut Tracker,
+        seq: u32,
+        cam_at: &dyn Fn(f64) -> Pose3d,
+        wheel_theta: f64,
+        view: &Pose3d,
+    ) -> TrackStatus {
+        let stamp = EPOCH_NS + u64::from(seq) * FRAME_NS;
+        let from = seq
+            .checked_sub(1)
+            .map(|p| EPOCH_NS + u64::from(p) * FRAME_NS);
+        let samples = moving_imu(tracker, cam_at, from, stamp);
+        tracker.push_raw_imu(samples, 0, false).unwrap();
+        tracker
+            .push_wheel([WheelSample {
+                stamp_ns: stamp,
+                x: 0.0,
+                y: 0.0,
+                theta: wheel_theta,
+            }])
+            .unwrap();
+        let (left, right) = render_pair(view);
+        tracker
+            .process_stereo(&left, &right, CuTime::from_nanos(stamp))
+            .expect("a valid pair")
+    }
+
+    fn published(status: &TrackStatus) -> Pose3d {
+        match status {
+            TrackStatus::Tracked(p) | TrackStatus::Coasting(p) | TrackStatus::NotLocalized(p) => {
+                p.pose_world_to_cam
+            }
+            TrackStatus::Untracked => panic!("nothing published"),
+        }
+    }
+
+    /// (a) THE BEHAVIOUR: parked, the gyro and the wheels say nothing moved, and one frame's
+    /// features say the camera jumped 25 mm (the scene as seen two steps along; a moving object
+    /// filling the view looks the same to PnP). With per-frame fusion the gate rejects that
+    /// frame's vision and the published pose stays within a few millimetres; without it, the
+    /// pose jumps by the full 25 mm. The frames after it are accepted again.
+    ///
+    /// Mutations (each turned this red): fusion off (the `fusion = false` arm is the control);
+    /// the gate never rejecting (`chi2 > gate` replaced by `false` in `fusion::fuse`).
+    #[test]
+    fn test_a_corrupted_frame_while_parked_does_not_move_the_pose() {
+        for fusion in [false, true] {
+            let mut tracker = fusion_tracker(fusion);
+            let start = park_until_static_init(&mut tracker);
+            let still = |_t: f64| Pose3d::IDENTITY;
+            let mut seq = start;
+            let mut before = Pose3d::IDENTITY;
+            for _ in 0..6 {
+                before = published(&feed_moving(
+                    &mut tracker,
+                    seq,
+                    &still,
+                    0.0,
+                    &Pose3d::IDENTITY,
+                ));
+                seq += 1;
+            }
+            let jumped = Pose3d::new(
+                Mat3F64::IDENTITY,
+                Vec3F64::new(2.0 * SCENE_STEP_M, 0.0, 0.0),
+            );
+            let status = feed_moving(&mut tracker, seq, &still, 0.0, &jumped);
+            seq += 1;
+            let moved_mm =
+                (published(&status).inverse().translation - before.inverse().translation).length()
+                    * 1e3;
+            let report = tracker.frame_report();
+            if fusion {
+                assert!(moved_mm < 3.0, "fused pose moved {moved_mm} mm");
+                assert!(matches!(status, TrackStatus::Tracked(_)), "{status:?}");
+                assert!(report.vision_rejected && report.fused, "{report:?}");
+                assert_eq!(tracker.fusion_stats().rejects, 1);
+                assert!(tracker.fusion_stats().last_chi2 > 100.0);
+            } else {
+                assert!(
+                    moved_mm > 20.0,
+                    "control: vision alone moved only {moved_mm} mm"
+                );
+            }
+            // Back to the true view: accepted again (with fusion) and in place.
+            for _ in 0..4 {
+                let status = feed_moving(&mut tracker, seq, &still, 0.0, &Pose3d::IDENTITY);
+                seq += 1;
+                assert!(matches!(status, TrackStatus::Tracked(_)), "{status:?}");
+            }
+            if fusion {
+                assert!(!tracker.frame_report().vision_rejected);
+                let back_mm = (tracker.last_pose().inverse().translation
+                    - before.inverse().translation)
+                    .length()
+                    * 1e3;
+                assert!(back_mm < 3.0, "{back_mm} mm after the bad frame");
+            }
+        }
+    }
+
+    /// A view that stays displaced is outvoted for [`MAX_CONSECUTIVE_REJECTS`] frames, each
+    /// publishing the prediction in place; the next goes to the loss path instead of being
+    /// outvoted forever (where relocalization may then accept it).
+    #[test]
+    fn test_a_run_of_rejections_ends_in_the_loss_path() {
+        let mut tracker = fusion_tracker(true);
+        let start = park_until_static_init(&mut tracker);
+        let still = |_t: f64| Pose3d::IDENTITY;
+        let before = published(&feed_moving(
+            &mut tracker,
+            start,
+            &still,
+            0.0,
+            &Pose3d::IDENTITY,
+        ));
+        let jumped = Pose3d::new(
+            Mat3F64::IDENTITY,
+            Vec3F64::new(2.0 * SCENE_STEP_M, 0.0, 0.0),
+        );
+        for (i, seq) in (start + 1..)
+            .take(MAX_CONSECUTIVE_REJECTS as usize)
+            .enumerate()
+        {
+            let status = feed_moving(&mut tracker, seq, &still, 0.0, &jumped);
+            let moved_mm =
+                (published(&status).inverse().translation - before.inverse().translation).length()
+                    * 1e3;
+            assert!(tracker.frame_report().vision_rejected, "frame {i}");
+            assert!(moved_mm < 3.0, "frame {i}: {moved_mm} mm");
+        }
+        assert_eq!(tracker.fusion_stats().reject_runs_expired, 0);
+        let seq = start + 1 + MAX_CONSECUTIVE_REJECTS;
+        feed_moving(&mut tracker, seq, &still, 0.0, &jumped);
+        let f = tracker.fusion_stats();
+        assert_eq!(f.reject_runs_expired, 1, "{f:?}");
+        assert!(!tracker.frame_report().vision_rejected);
+    }
+
+    /// (b) A real turn with good vision: the base turns at 0.3 rad/s about its z for 16 frames
+    /// (~17 deg, the camera swinging on its 0.1 m lever arm), and the gyro, the wheels and
+    /// vision all see it. The gate rejects nothing, no wheel factor is dropped, and the published
+    /// motion follows the truth.
+    #[test]
+    fn test_a_real_turn_with_good_vision_is_followed_not_rejected() {
+        const RATE: f64 = 0.3;
+        let mut tracker = fusion_tracker(true);
+        let start = park_until_static_init(&mut tracker);
+        let t_start = f64::from(start) * FRAME_NS as f64 * 1e-9;
+        let theta = |t: f64| RATE * (t - t_start).max(0.0);
+        let t_cb = tracker.wheel.as_ref().unwrap().cfg.t_cb;
+        let cam_at = move |t: f64| {
+            let rz = Pose3d::new(
+                SO3F64::exp(Vec3F64::new(0.0, 0.0, theta(t))).matrix(),
+                Vec3F64::ZERO,
+            );
+            t_cb.compose(&rz).compose(&t_cb.inverse())
+        };
+        let t_of = |seq: u32| f64::from(seq) * FRAME_NS as f64 * 1e-9;
+        let first = published(&feed_moving(
+            &mut tracker,
+            start,
+            &cam_at,
+            0.0,
+            &Pose3d::IDENTITY,
+        ));
+        let mut worst_deg = 0.0f64;
+        let mut worst_mm = 0.0f64;
+        for seq in start + 1..start + 17 {
+            let truth = cam_at(t_of(seq));
+            let status = feed_moving(&mut tracker, seq, &cam_at, theta(t_of(seq)), &truth);
+            assert!(
+                matches!(status, TrackStatus::Tracked(_)),
+                "frame {seq}: {status:?}"
+            );
+            assert!(
+                !tracker.frame_report().vision_rejected,
+                "frame {seq} rejected"
+            );
+            // Camera motion since the turn started, in the first frame's camera: the tracker's
+            // world was rotated by the inertial alignment, the relative motion was not.
+            let rel = first.compose(&published(&status).inverse());
+            let err = truth.inverse().compose(&rel);
+            worst_deg = worst_deg.max(crate::consistency::angle(&err.rotation).to_degrees());
+            worst_mm = worst_mm.max(err.translation.length() * 1e3);
+        }
+        let f = tracker.fusion_stats();
+        assert!(f.frames >= 16, "{f:?}");
+        assert_eq!((f.rejects, f.wheel_dropped), (0, 0), "{f:?}");
+        assert!(worst_deg < 0.3, "worst rotation error {worst_deg} deg");
+        assert!(worst_mm < 5.0, "worst translation error {worst_mm} mm");
+    }
+
+    /// (c) Wheels that report a 0.3 rad/s turn the gyro and vision do not see (slip, or the head
+    /// turning on its mast): the per-frame wheel factor is dropped, nothing is rejected, and the
+    /// published pose does not turn.
+    ///
+    /// Mutation: never dropping the wheel factor (`disagree` forced false in `fuse_frame`) turned
+    /// this red (the slipping wheels outvoted vision and turned the published pose).
+    #[test]
+    fn test_slipping_wheels_lose_their_per_frame_factor() {
+        const RATE: f64 = 0.3;
+        let mut tracker = fusion_tracker(true);
+        let start = park_until_static_init(&mut tracker);
+        let still = |_t: f64| Pose3d::IDENTITY;
+        let before = published(&feed_moving(
+            &mut tracker,
+            start,
+            &still,
+            0.0,
+            &Pose3d::IDENTITY,
+        ));
+        let mut worst_deg = 0.0f64;
+        for seq in start + 1..start + 20 {
+            let theta = RATE * f64::from(seq - start) * FRAME_NS as f64 * 1e-9;
+            let status = feed_moving(&mut tracker, seq, &still, theta, &Pose3d::IDENTITY);
+            let r = published(&status).rotation * before.rotation.transpose();
+            worst_deg = worst_deg.max(crate::consistency::angle(&r).to_degrees());
+        }
+        let f = tracker.fusion_stats();
+        assert!(
+            worst_deg < 0.2,
+            "the published pose turned {worst_deg} deg ({f:?})"
+        );
+        assert!(f.wheel_dropped >= 10, "{f:?}");
+        assert_eq!(f.rejects, 0, "{f:?}");
+    }
+
+    /// What the fusion costs per frame, against the whole frame, on the parked-then-turning run
+    /// (printed with `--nocapture`). The fusion is a few small dense solves over the kept
+    /// matches; it must stay a small fraction of `process_stereo`.
+    #[test]
+    fn test_per_frame_fusion_cost() {
+        let mut costs = Vec::new();
+        let mut frames = Vec::new();
+        for fusion in [false, true] {
+            let mut tracker = fusion_tracker(fusion);
+            let start = park_until_static_init(&mut tracker);
+            let still = |_t: f64| Pose3d::IDENTITY;
+            let mut frame_us = Vec::new();
+            for seq in start..start + 40 {
+                let t = std::time::Instant::now();
+                feed_moving(&mut tracker, seq, &still, 0.0, &Pose3d::IDENTITY);
+                frame_us.push(t.elapsed().as_micros() as u64);
+                if fusion && tracker.frame_report().fused {
+                    costs.push(u64::from(tracker.fusion_stats().last_cost_us));
+                }
+            }
+            frame_us.sort_unstable();
+            frames.push(frame_us[frame_us.len() / 2]);
+        }
+        costs.sort_unstable();
+        assert!(costs.len() >= 30, "{} fused frames", costs.len());
+        let (p50, p90) = (costs[costs.len() / 2], costs[costs.len() * 9 / 10]);
+        println!(
+            "per-frame fusion: cost p50={p50} us p90={p90} us; frame p50 off={} us on={} us",
+            frames[0], frames[1]
+        );
+        assert!(
+            p50 * 10 < frames[1],
+            "fusion p50 {p50} us is over 10 % of the frame p50 {} us",
+            frames[1]
+        );
     }
 }

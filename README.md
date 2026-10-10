@@ -89,7 +89,7 @@ cnx: [
   frame. Unknown config keys are refused at startup rather than ignored. The recognised keys are
   `on_tracking_loss` (`keep_map`, the default, or `reset_map` for a long-running graph),
   `max_keyframes`, `orb_keypoints`, `search_radius_px`, `max_covisible_keyframes`,
-  `pnp_lm_iterations`, `inertial`, `landmark_buffers` and `wheel_odom`;
+  `pnp_lm_iterations`, `inertial`, `landmark_buffers`, `wheel_odom` and `per_frame_fusion`;
   `cu_kornia_vio::config::CONFIG_KEYS` lists them. Its `Freezable` is a no-op (the kornia-slam
   map has no serialised form), so a resim of a `background: true` graph reproduces it only from
   the start of a log; see Known limitations.
@@ -230,6 +230,19 @@ With it on:
 
 `MountFeed` is only needed when the mount moves (a tilting head); the config's `cam_in_base_*`
 is used until the first `CameraMount` arrives.
+
+## Per-frame fusion
+
+Off by default. Without it the IMU and the wheels only seed each frame's PnP and meet vision in
+keyframe local BA; the published pose is PnP's. With `"per_frame_fusion": (enabled: true)` each
+tracked frame's pose is optimized against its map matches (Huber), the IMU preintegrated from the
+last keyframe at its bias and velocity (rotation; position once initialized) and the wheels from
+the last keyframe (the BA factor and noise model), weighted by the configured noise figures. A
+frame whose vision lies past the chi-square gate (`chi2_gate`, a 6-DOF value scaled to the frame's
+degrees of freedom; default 22.458, 99.9 %) from that prediction publishes the prediction instead
+and leaves the map untouched; a run of 16 goes to the loss path. The wheel term is dropped when
+the wheels disagree with the gyro. `VioDiagnostics::fusion` carries the counts, this frame's chi2
+and whether it was rejected. See the `fusion` module docs for the model and its assumptions.
 
 ## Documentation and development
 

@@ -73,6 +73,9 @@ pub enum FailureReason {
     LowReferenceCorrespondences,
     /// A map was anchored at a dead-reckoned pose after a loss: a coast, reported unmeasured.
     DeadReckonedAnchor,
+    /// Per-frame fusion: vision disagreed with the IMU and wheel prediction past the gate for
+    /// longer than the rejection run allows, and the frame went to the loss path.
+    VisionRejected,
 }
 
 impl FailureReason {
@@ -88,6 +91,7 @@ impl FailureReason {
             Self::LowReferenceMatches => "low_reference_matches",
             Self::LowReferenceCorrespondences => "low_reference_correspondences",
             Self::DeadReckonedAnchor => "dead_reckoned_anchor",
+            Self::VisionRejected => "vision_rejected",
         }
     }
 }
@@ -196,6 +200,30 @@ pub struct MotionCheck {
     pub vision_mm: f32,
 }
 
+/// The per-frame fusion's verdict on one frame: vision's pose against the IMU and wheel
+/// prediction from the last keyframe. All zero when the fusion is off.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect,
+)]
+pub struct FusionCheck {
+    /// Frames fused (a tracked frame with at least one motion factor), lifetime.
+    pub frames: u64,
+    /// Frames whose vision the gate rejected (the prediction was published), lifetime.
+    pub rejects: u64,
+    /// Frames whose wheel factor was left out because the wheels disagreed with the gyro (slip,
+    /// or the head turning on its mast), lifetime.
+    pub wheel_dropped: u64,
+    /// This frame's Mahalanobis distance between vision and the prediction; 0 with `dof` 0 when
+    /// the fusion did not run on it.
+    pub chi2: f32,
+    /// Its degrees of freedom: the motion factors' residual rows (3 gyro, 6 IMU, 6 wheels).
+    pub dof: u8,
+    /// This frame's vision was rejected and the prediction published.
+    pub rejected: bool,
+    /// The fusion's cost on this frame, microseconds.
+    pub cost_us: u32,
+}
+
 /// What the tracker knew about one processed frame. The time of validity is the frame's capture
 /// stamp, on the carrying `CuMsg`'s `tov`.
 #[derive(
@@ -248,6 +276,8 @@ pub struct VioDiagnostics {
     pub accel_bias: [f32; 3],
     /// The last moving interval's motion check.
     pub motion: MotionCheck,
+    /// The per-frame fusion's verdict on this frame.
+    pub fusion: FusionCheck,
 }
 
 /// [`FeaturePoint::class`] bit: the keypoint has a stereo depth.

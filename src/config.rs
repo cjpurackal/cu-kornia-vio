@@ -11,6 +11,7 @@ use kornia_algebra::{Mat3F64, Vec3F64};
 use kornia_sensors::imu::ImuCalib;
 
 use crate::error::VioError;
+use crate::fusion::FusionConfig;
 use crate::imu::InertialConfig;
 use crate::stationary::StaticInitConfig;
 use crate::wheel::{WheelOdomConfig, mat3_from_rows};
@@ -401,6 +402,57 @@ pub(crate) fn optional_wheel_odom(
         .flatten())
 }
 
+/// The `per_frame_fusion` block of a `vio` component config.
+///
+/// ```ron
+/// "per_frame_fusion": (
+///   enabled: true,
+///   // Optional: the vision-vs-prediction gate as a 6-DOF chi-square value, scaled to the
+///   // frame's actual degrees of freedom. Default 22.458, the 99.9 % quantile.
+///   chi2_gate: 22.458,
+/// ),
+/// ```
+///
+/// Absent, or `enabled: false` (the default), the published pose is PnP's, as it always was.
+/// Enabled, each tracked frame's pose is optimized against its map matches, the IMU from the last
+/// keyframe and the wheels from the last keyframe together, and a frame whose vision disagrees
+/// with the motion sensors past the gate publishes their prediction instead; see
+/// [`crate::fusion`]. It acts only through the `inertial` and `wheel_odom` blocks: with neither
+/// there is nothing to fuse and the tracker is unchanged.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FusionRon {
+    /// Off unless set.
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub chi2_gate: Option<f64>,
+}
+
+impl FusionRon {
+    /// The tracker's config, or `None` when disabled. Validated either way.
+    pub fn to_config(&self) -> Result<Option<FusionConfig>, VioError> {
+        let mut cfg = FusionConfig::default();
+        if let Some(g) = self.chi2_gate {
+            cfg.chi2_gate = g;
+        }
+        cfg.validate()?;
+        Ok(self.enabled.then_some(cfg))
+    }
+}
+
+/// Reads and validates the optional `per_frame_fusion` block; malformed is a hard error.
+pub(crate) fn optional_fusion(config: Option<&ComponentConfig>) -> CuResult<Option<FusionConfig>> {
+    let ron = config
+        .map(|c| c.get_value::<FusionRon>(PER_FRAME_FUSION))
+        .transpose()?
+        .flatten();
+    match ron {
+        Some(r) => r.to_config().map_err(|e| e.to_string().into()),
+        None => Ok(None),
+    }
+}
+
 /// Reads an optional finite, strictly-positive float key.
 pub(crate) fn optional_positive_f64(
     config: Option<&ComponentConfig>,
@@ -446,6 +498,7 @@ config_keys! {
     INERTIAL => "inertial",
     LANDMARK_BUFFERS => "landmark_buffers",
     WHEEL_ODOM => "wheel_odom",
+    PER_FRAME_FUSION => "per_frame_fusion",
 }
 
 /// Refuses a config key `task` does not read.
@@ -782,6 +835,47 @@ mod tests {
         assert!(CONFIG_KEYS.contains(&"wheel_odom"));
         deny_unknown_keys(Some(&cfg(&["wheel_odom"])), "task", CONFIG_KEYS).unwrap();
         assert!(deny_unknown_keys(Some(&cfg(&["wheel_odometry"])), "task", CONFIG_KEYS).is_err());
+    }
+
+    /// The `per_frame_fusion` block read the way a graph reads it.
+    fn fusion_ron(block: &str) -> CuResult<Option<FusionConfig>> {
+        let text = format!(
+            r#"( tasks: [ ( id: "vio", type: "t::T", config: {{ "per_frame_fusion": {block} }} ) ],
+                 cnx: [] )"#
+        );
+        let cfg = cu29::config::read_configuration_str(text, None)?;
+        let graph = cfg.get_graph(None)?;
+        let id = graph.get_node_id_by_name("vio").expect("the node");
+        let node = graph.get_node(id).expect("the node");
+        optional_fusion(node.get_instance_config())
+    }
+
+    /// Off unless enabled, the gate defaulted or read, and a bad block refused at startup, even
+    /// while disabled.
+    #[test]
+    fn test_the_per_frame_fusion_block() {
+        assert!(CONFIG_KEYS.contains(&"per_frame_fusion"));
+        assert_eq!(optional_fusion(None).unwrap(), None);
+        assert_eq!(
+            fusion_ron("(chi2_gate: 30.0)").unwrap(),
+            None,
+            "enabled defaults to false"
+        );
+        assert_eq!(
+            fusion_ron("(enabled: true)").unwrap(),
+            Some(FusionConfig::default())
+        );
+        assert_eq!(
+            fusion_ron("(enabled: true, chi2_gate: 30.0)")
+                .unwrap()
+                .map(|c| c.chi2_gate),
+            Some(30.0)
+        );
+        assert!(fusion_ron("(enabled: false, chi2_gate: 0.0)").is_err());
+        assert!(
+            fusion_ron("(enabled: true, chi2: 30.0)").is_err(),
+            "unknown field"
+        );
     }
 
     fn cfg(keys: &[&str]) -> ComponentConfig {

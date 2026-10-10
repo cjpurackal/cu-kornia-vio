@@ -27,6 +27,9 @@
 //!   as the IMU. It constrains local BA, replaces the constant-velocity prior, carries the pose
 //!   through a vision loss, and keeps the world continuous across a map drop. Off unless the
 //!   `wheel_odom` block enables it.
+//! * [`fusion`]: optional per-frame fused tracking: each frame's pose optimized against its map
+//!   matches, the IMU and the wheels together, with a Mahalanobis gate that publishes the motion
+//!   sensors' prediction when vision disagrees with them. Off unless `per_frame_fusion` enables it.
 //!
 //! That split is the reason this crate can be reviewed as a copper component rather than as a
 //! slice of an application: the estimation is testable without a graph, and the graph binding
@@ -40,6 +43,7 @@ pub mod consistency;
 pub mod diag;
 pub mod error;
 pub mod feed;
+pub mod fusion;
 pub mod imu;
 pub mod imu_channel;
 pub mod pose;
@@ -59,6 +63,7 @@ pub use config::OnTrackingLoss;
 pub use consistency::{ConsistencyStats, MotionVerdict};
 pub use error::VioError;
 pub use feed::ImuFeed;
+pub use fusion::{FusionConfig, FusionStats};
 pub use imu::{BiasLimit, ImuGates, ImuWindowError, InertialConfig, InertialStats};
 pub use imu_channel::ImuQueue;
 pub use reset::ResetEpoch;

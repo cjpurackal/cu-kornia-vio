@@ -4,7 +4,7 @@
 //! record ([`frame_diagnostics`]) is everything else read off the tracker, all of it cached or
 //! O(1) per frame.
 
-use cu_stereo_payloads::{TrackingState, VioDiagnostics};
+use cu_stereo_payloads::{FusionCheck, TrackingState, VioDiagnostics};
 
 use crate::track::{FrameReport, SystemMode, TrackStatus, Tracker};
 
@@ -112,6 +112,27 @@ pub fn frame_diagnostics(
         gyro_bias: f32x3(gyro),
         accel_bias: f32x3(accel),
         motion: tracker.last_motion_check(),
+        fusion: fusion_check(tracker),
+    }
+}
+
+/// The per-frame fusion's verdict on the frame `tracker` just processed.
+fn fusion_check(tracker: &Tracker) -> FusionCheck {
+    let f = tracker.fusion_stats();
+    let report = tracker.frame_report();
+    let (chi2, dof) = if report.fused {
+        (f.last_chi2 as f32, f.last_dof)
+    } else {
+        (0.0, 0)
+    };
+    FusionCheck {
+        frames: f.frames,
+        rejects: f.rejects,
+        wheel_dropped: f.wheel_dropped,
+        chi2,
+        dof,
+        rejected: report.vision_rejected,
+        cost_us: if report.fused { f.last_cost_us } else { 0 },
     }
 }
 
@@ -134,6 +155,7 @@ mod tests {
             failure: FailureReason::LowPnpInliers,
             relocalized: false,
             reanchored,
+            ..FrameReport::default()
         }
     }
 

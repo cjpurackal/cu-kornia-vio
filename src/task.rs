@@ -215,6 +215,10 @@ pub struct StereoVio {
     /// disabled leaves the task as it was.
     #[reflect(ignore)]
     wheel_odom: Option<WheelOdomRon>,
+    /// The `per_frame_fusion` block, read and validated in `new`; `None` leaves the published
+    /// pose PnP's.
+    #[reflect(ignore)]
+    per_frame_fusion: Option<crate::fusion::FusionConfig>,
     /// The bus's wheel queue, when `wheel_odom` is enabled. Bound and armed only then.
     #[reflect(ignore)]
     wheel: Option<Arc<WheelQueue>>,
@@ -388,6 +392,7 @@ impl CuTask for StereoVio {
             )?,
             inertial,
             wheel_odom,
+            per_frame_fusion: crate::config::optional_fusion(config)?,
             wheel,
             coasted: 0,
             not_localized: 0,
@@ -508,6 +513,7 @@ impl CuTask for StereoVio {
                         .map_err(|e| TaskError::from(e).into_cu_error("vio"))?,
                     _ => None,
                 };
+                config.per_frame_fusion = self.per_frame_fusion;
                 none.insert(Tracker::new(camera, config))
             }
         };

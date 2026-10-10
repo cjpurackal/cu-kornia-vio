@@ -53,8 +53,8 @@ pub use cu_sensor_payloads::ImuPayload;
 
 mod diag;
 pub use diag::{
-    FEATURE_INLIER, FEATURE_OUTLIER, FEATURE_STEREO, FailureReason, FeaturePoint, InertialStage,
-    MotionCheck, MotionVerdict, TrackingState, VioDiagnostics, VioFrame,
+    FEATURE_INLIER, FEATURE_OUTLIER, FEATURE_STEREO, FailureReason, FeaturePoint, FusionCheck,
+    InertialStage, MotionCheck, MotionVerdict, TrackingState, VioDiagnostics, VioFrame,
 };
 
 /// FourCC of the only pixel format a [`StereoPair`] eye may use: 8-bit grayscale.

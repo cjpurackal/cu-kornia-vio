@@ -189,6 +189,15 @@ pub enum VioError {
         value: f64,
     },
 
+    /// A `per_frame_fusion` parameter is not a usable positive number.
+    #[error("per_frame_fusion parameter `{field}` must be finite and > 0, got {value}")]
+    FusionParamInvalid {
+        /// Which parameter.
+        field: &'static str,
+        /// The offending value.
+        value: f64,
+    },
+
     /// ORB detection or a pyramid resize failed inside kornia-imgproc.
     #[error("image operation failed: {0}")]
     Image(#[from] ImageError),
