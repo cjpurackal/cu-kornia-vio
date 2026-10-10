@@ -110,10 +110,13 @@ use kornia_slam::tracking::{
 };
 
 use crate::consistency::{ConsistencyStats, IntervalMotion, MotionVerdict};
+use crate::covariance::{self, Cov6};
 use crate::error::VioError;
 use crate::fusion::{
-    FusionConfig, FusionOutcome, FusionStats, IncrementalPreintegration, KF_GYRO_BIAS_SIGMA,
-    MAX_CONSECUTIVE_REJECTS, MotionFactor, Predictor, UNINITIALIZED_GYRO_BIAS_SIGMA, VisualObs,
+    DEFAULT_EXTRINSIC_SIGMA_M, DEFAULT_EXTRINSIC_SIGMA_RAD, FusionConfig, FusionOutcome,
+    FusionStats, IncrementalPreintegration, KF_GYRO_BIAS_SIGMA, MAX_CONSECUTIVE_REJECTS,
+    MotionFactor, Predictor, UNINITIALIZED_GYRO_BIAS_SIGMA, VISION_ROTATION_SIGMA_FLOOR,
+    VISION_TRANSLATION_SIGMA_FLOOR, VisualObs,
 };
 use crate::imu::{
     ImuBuffer, ImuWindowError, InertialConfig, InertialStats, RawImuSample, WindowExcitation,
@@ -908,7 +911,30 @@ pub struct Tracker {
     /// Set by the frame that ends a rejection run: where its coast would have gone. Turned into
     /// [`PublishHold`] when the frame's pose is published (`held_pose`).
     publish_hold_target: Option<Pose3d>,
+    /// Each keyframe's pose covariance when it was inserted, keyed by `Frame::idx`: the world
+    /// left perturbation of its `T_wc` ([`crate::covariance`]). The spanning tree a frame's
+    /// covariance is chained from: a frame's is its base keyframe's plus its own relative one.
+    /// Cleared with the map, purged of keyframes the map no longer holds (`record_covariance`).
+    kf_cov: std::collections::HashMap<usize, Cov6>,
+    /// This frame's covariance, same convention; `None` for a frame with no pose to publish. See
+    /// [`Tracker::frame_covariance`].
+    frame_cov: Option<Cov6>,
+    /// What `tracking_step` measured this frame: the keyframe the frame's covariance chains from,
+    /// and the frame's covariance relative to it in the camera tangent. Reset every frame.
+    frame_rel: Option<(Option<usize>, Cov6)>,
+    /// What a coast grows from: the last measured frame's stamp and covariance, re-based every
+    /// [`COAST_REBASE_NS`] of coasting and at every anchor. Kept across a map DROP, so the next
+    /// map's first keyframe starts from where the last one left the uncertainty (never from zero,
+    /// which would read as perfectly localised); cleared only by a requested reset.
+    coast_origin: Option<(u64, Cov6)>,
 }
+
+/// How long a coast's covariance is integrated from one origin before it re-bases on its own
+/// value. The wheel interval it integrates must stay in the readings ring (it is held there,
+/// `prune`), and a minutes-long blind coast would otherwise pin minutes of readings. Each re-base
+/// restarts the interval's floors and its systematic heading term, which a 1 s chunk barely
+/// feels next to the per-metre growth it adds.
+const COAST_REBASE_NS: u64 = 1_000_000_000;
 
 /// How fast the published pose closes on the tracker's after a rejection run, metres and radians
 /// per second of frame time: 2.5 mm and 0.24 deg a frame at the head's 12 Hz. A run that ended
@@ -1119,6 +1145,10 @@ impl Tracker {
             vision_pose: None,
             publish_hold: None,
             publish_hold_target: None,
+            kf_cov: std::collections::HashMap::new(),
+            frame_cov: None,
+            frame_rel: None,
+            coast_origin: None,
         }
     }
 
@@ -1231,6 +1261,8 @@ impl Tracker {
         let stamp_ns = stamp.as_nanos();
 
         self.frame_report = FrameReport::default();
+        self.frame_rel = None;
+        self.frame_cov = None;
         self.apply_pending_map_reset();
 
         frame.idx = self.next_frame_idx;
@@ -1342,12 +1374,20 @@ impl Tracker {
         let carry_velocity_start = self
             .last_frame_stamp_ns
             .map(|t| t.saturating_sub(CARRY_VELOCITY_WINDOW_NS));
+        // The coast covariance integrates the wheels from its origin, which is re-based at least
+        // every `COAST_REBASE_NS` while coasting; an older one (the wheels stopped covering) is
+        // not worth holding readings for.
+        let coast_start = self
+            .coast_origin
+            .map(|(t, _)| t)
+            .filter(|&t| stamp_ns.saturating_sub(t) <= 2 * COAST_REBASE_NS);
         if let Some(w) = self.wheel.as_mut() {
             w.prune([
                 self.last_keyframe_stamp_ns,
                 self.last_frame_stamp_ns,
                 still_window_start,
                 carry_velocity_start,
+                coast_start,
             ]);
             if let Some((offset_ns, frames)) = w.check_coverage(stamp_ns) {
                 warning!(
@@ -1364,6 +1404,7 @@ impl Tracker {
             pose_world_to_cam: self.held_pose(ts_sec),
             keyframe: status == TrackingStatus::KeyframeAccepted,
         };
+        self.record_covariance(status, frame_idx, stamp_ns);
         match status {
             TrackingStatus::Skipped => {
                 self.stats.consecutive_failures = self.stats.consecutive_failures.saturating_add(1);
@@ -1759,6 +1800,12 @@ impl Tracker {
         }
         // Their keyframe indices name keyframes of the dropped map.
         self.kf_tracked_poses.clear();
+        self.kf_cov.clear();
+        // A DROP keeps what a coast grows from, so the next map's first keyframe inherits the
+        // uncertainty this one ended with; only a requested reset starts a world from nothing.
+        if !keep_calibration {
+            self.coast_origin = None;
+        }
         self.map_settled = false;
         self.vision_suspect.clear();
         self.vision_degraded = false;
@@ -2197,6 +2244,25 @@ impl Tracker {
                     self.fusion.consecutive_rejects = 0;
                 }
                 let pose = fused.map_or(estimate.pose, |o| o.pose);
+                // This frame's covariance relative to the keyframe it chains from: the fusion's
+                // (its posterior, or the prediction's for a rejected frame), else vision's own.
+                let relative = match fused {
+                    Some(o) => o.covariance_cw,
+                    None => crate::fusion::vision_covariance(
+                        &self.camera,
+                        &self.visual_obs(&frame, &matches),
+                        &estimate.pose,
+                    ),
+                };
+                if let Some(rel) = relative {
+                    // A rejected frame is the prediction from the last keyframe and nothing else.
+                    let base = if rejected {
+                        self.state.last_keyframe_idx
+                    } else {
+                        self.chain_base(&matches)
+                    };
+                    self.frame_rel = Some((base, rel));
+                }
                 if was_coasting && !rejected {
                     // Where the coast would have gone on this frame: the last one carried by
                     // this frame's motion prior (the gyro and the wheels since it), which is
@@ -2349,6 +2415,14 @@ impl Tracker {
                 self.state.last_frame_timestamp_sec = timestamp_sec;
                 self.frame_report.relocalized = true;
                 self.frame_report.failure = FailureReason::None;
+                // Placed against that keyframe's own points; `try_relocalize` keeps no matches to
+                // weigh, so vision's floors stand in for the PnP fit's spread.
+                let mut rel = [0.0; 36];
+                for k in 0..3 {
+                    rel[k * 7] = VISION_TRANSLATION_SIGMA_FLOOR.powi(2);
+                    rel[(k + 3) * 7] = VISION_ROTATION_SIGMA_FLOOR.powi(2);
+                }
+                self.frame_rel = Some((Some(kf_idx), rel));
                 // Measured (PnP inliers), so it may leave as Tracked — unlike the
                 // re-bootstrap coast below, which must not.
                 return TrackingStatus::Tracked;
@@ -2593,21 +2667,7 @@ impl Tracker {
             return None;
         }
 
-        let inv_scale = 1.0 / ORB_SCALE_FACTOR;
-        let mps = self.map.map_points();
-        let visual: Vec<VisualObs> = matches
-            .iter()
-            .filter_map(|&(mp_idx, kp_idx)| {
-                let mp = mps.get(mp_idx).filter(|mp| !mp.culled)?;
-                let xy = frame.undistorted_xy(kp_idx, &self.camera)?;
-                let octave = frame.features.octaves.get(kp_idx).copied().unwrap_or(0);
-                Some(VisualObs {
-                    point_world: mp.position,
-                    pixel: [f64::from(xy[0]), f64::from(xy[1])],
-                    inv_sigma: inv_scale.powi(i32::from(octave)),
-                })
-            })
-            .collect();
+        let visual = self.visual_obs(frame, matches);
         let out = crate::fusion::fuse(
             &self.camera,
             &visual,
@@ -2634,6 +2694,197 @@ impl Tracker {
     /// The per-frame fusion's counters; see [`crate::fusion`]. All zero with it off.
     pub fn fusion_stats(&self) -> FusionStats {
         self.fusion
+    }
+
+    /// The kept matches as the fusion's observations: the landmark, the undistorted pixel, and
+    /// the octave's sigma.
+    fn visual_obs(&self, frame: &Frame, matches: &[(usize, usize)]) -> Vec<VisualObs> {
+        let inv_scale = 1.0 / ORB_SCALE_FACTOR;
+        let mps = self.map.map_points();
+        matches
+            .iter()
+            .filter_map(|&(mp_idx, kp_idx)| {
+                let mp = mps.get(mp_idx).filter(|mp| !mp.culled)?;
+                let xy = frame.undistorted_xy(kp_idx, &self.camera)?;
+                let octave = frame.features.octaves.get(kp_idx).copied().unwrap_or(0);
+                Some(VisualObs {
+                    point_world: mp.position,
+                    pixel: [f64::from(xy[0]), f64::from(xy[1])],
+                    inv_sigma: inv_scale.powi(i32::from(octave)),
+                })
+            })
+            .collect()
+    }
+
+    /// The keyframe a measured frame's covariance chains from: the last keyframe, unless most of
+    /// the frame's matches are landmarks whose reference keyframe is better localised than it
+    /// (a smaller covariance trace), in which case the one of those keyframes most of them refer
+    /// to.
+    ///
+    /// A HEURISTIC, documented as one. A frame tracked against old landmarks is placed relative
+    /// to where those landmarks were mapped, so its uncertainty is that keyframe's plus its own,
+    /// not the newest keyframe's plus its own. Without it a parked robot, which inserts a keyframe
+    /// every eight frames, would chain them one onto the next and grow its covariance for as long
+    /// as it stood still; with it the parked covariance stays at the keyframe the scene was mapped
+    /// from, and a robot that drives back over its own map stops growing. A real answer is the
+    /// marginal of a joint solve over the window, which nothing here runs.
+    fn chain_base(&self, matches: &[(usize, usize)]) -> Option<usize> {
+        let last = self.state.last_keyframe_idx?;
+        let Some(last_cov) = self.kf_cov.get(&last) else {
+            return Some(last);
+        };
+        let trace = |c: &Cov6| (0..6).map(|k| c[k * 7]).sum::<f64>();
+        let last_trace = trace(last_cov);
+        let mps = self.map.map_points();
+        let mut votes: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        let mut older = 0usize;
+        for &(mp_idx, _) in matches {
+            let Some(mp) = mps.get(mp_idx) else {
+                continue;
+            };
+            if mp.keyframe_idx != last
+                && self
+                    .kf_cov
+                    .get(&mp.keyframe_idx)
+                    .is_some_and(|c| trace(c) < last_trace)
+            {
+                older += 1;
+                *votes.entry(mp.keyframe_idx).or_default() += 1;
+            }
+        }
+        if 2 * older <= matches.len() {
+            return Some(last);
+        }
+        // Most votes; the older keyframe on a tie, so the choice does not depend on hash order.
+        votes
+            .into_iter()
+            .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))
+            .map(|(k, _)| k)
+            .or(Some(last))
+    }
+
+    /// The covariance a coast has reached at `stamp_ns`: the origin's, plus the wheels' over the
+    /// interval since (the propagated measurement, with the factor's mount term), moved into the
+    /// world at the coasted pose. The origin's alone without wheels or without readings over the
+    /// interval, and zero when nothing was ever measured (a world being defined, not estimated).
+    ///
+    /// The wheel measurement is a right perturbation of the END base pose, so in the world it is
+    /// `Ad(T_wb)` of it, `T_wb = T_wc T_cb` at the end; the origin's left perturbation carries
+    /// through the composition unchanged.
+    fn coast_covariance(&self, stamp_ns: u64, pose_cw: &Pose3d) -> Cov6 {
+        let Some((t0, origin)) = self.coast_origin else {
+            return [0.0; 36];
+        };
+        let Some(w) = self.wheel.as_ref() else {
+            return origin;
+        };
+        let Ok(d) = w.delta(t0, stamp_ns, w.cfg.max_gap_ns()) else {
+            return origin;
+        };
+        let t_cb_to = w.t_cb_at(stamp_ns);
+        let extrinsic = self.config.per_frame_fusion.map_or(
+            [DEFAULT_EXTRINSIC_SIGMA_M, DEFAULT_EXTRINSIC_SIGMA_RAD],
+            |c| [c.extrinsic_sigma_m, c.extrinsic_sigma_rad],
+        );
+        let Some(f) = MotionFactor::wheel(
+            &w.cfg.measurement(&d),
+            w.t_cb_at(t0),
+            t_cb_to,
+            pose_cw,
+            extrinsic,
+        ) else {
+            return origin;
+        };
+        let measured: Cov6 = std::array::from_fn(|k| f.covariance[k]);
+        let t_wb = pose_cw.inverse().compose(&t_cb_to);
+        covariance::add(
+            &origin,
+            &covariance::congruence(&covariance::pose_adjoint(&t_wb), &measured),
+        )
+    }
+
+    /// This frame's covariance, from what `tracking_step` measured or from the coast, and the
+    /// keyframe bookkeeping that goes with it. Runs once per frame, after the status is known.
+    fn record_covariance(&mut self, status: TrackingStatus, frame_idx: usize, stamp_ns: u64) {
+        let pose_cw = self.state.pose_world_to_cam;
+        // Inserted by tracking, by a bootstrap, or by the re-bootstrap a loss reports Skipped.
+        let keyframe = self.state.last_keyframe_idx == Some(frame_idx)
+            && self.last_keyframe_stamp_ns == Some(stamp_ns);
+        let measured = status != TrackingStatus::Skipped && !self.frame_report.vision_rejected;
+        let cov = if let Some((base, rel)) = self.frame_rel.take() {
+            let base_cov = base
+                .and_then(|k| self.kf_cov.get(&k).copied())
+                .or(self.coast_origin.map(|(_, c)| c))
+                .unwrap_or([0.0; 36]);
+            let c = covariance::add(
+                &base_cov,
+                &covariance::world_from_camera_tangent(&rel, &pose_cw),
+            );
+            if measured {
+                self.coast_origin = Some((stamp_ns, c));
+            }
+            Some(c)
+        } else if keyframe {
+            // A map anchored on this frame at a propagated pose (a carried drop, a loss
+            // re-bootstrap) or at the start of a world: the coast's covariance, which is zero for
+            // a world that starts here. The anchor is the next coast's origin.
+            let c = self.coast_covariance(stamp_ns, &pose_cw);
+            self.coast_origin = Some((stamp_ns, c));
+            Some(c)
+        } else if status == TrackingStatus::Skipped
+            && self.wheel.is_some()
+            && self.world_anchored
+            && self.frame_on_wheels
+        {
+            let c = self.coast_covariance(stamp_ns, &pose_cw);
+            if let Some((t0, _)) = self.coast_origin
+                && stamp_ns.saturating_sub(t0) >= COAST_REBASE_NS
+            {
+                self.coast_origin = Some((stamp_ns, c));
+            }
+            Some(c)
+        } else {
+            None
+        };
+        if keyframe && let Some(c) = cov {
+            self.kf_cov.insert(frame_idx, c);
+            // The removal hook: a keyframe the map no longer holds (nothing removes one today; a
+            // keyframe culling would) must not stay a chain base.
+            if self.kf_cov.len() > self.map.keyframes().len() {
+                let live: HashSet<usize> =
+                    self.map.keyframes().iter().map(|k| k.frame.idx).collect();
+                self.kf_cov.retain(|k, _| live.contains(k));
+            }
+        }
+        self.frame_cov = cov;
+    }
+
+    /// The last frame's pose covariance: 6x6 row-major over `[rho; omega]`, the world left
+    /// perturbation of its camera-in-world pose ([`crate::covariance`]), the convention
+    /// `VioPose::covariance` carries. `None` for a frame with no pose to publish (untracked, not
+    /// localized).
+    ///
+    /// What it is: the frame's covariance relative to the keyframe it was tracked from (the
+    /// per-frame fusion's posterior, the prediction's when vision was rejected, or vision's own),
+    /// added to that keyframe's at its insertion, which was chained the same way back to the
+    /// map's first keyframe; a coast adds the wheels' propagated covariance to the last measured
+    /// frame's; a map drop carries it into the next map. What it is not: a joint marginal (local
+    /// BA's corrections are not fed back), so it is an approximation that grows with the chain.
+    pub fn frame_covariance(&self) -> Option<Cov6> {
+        self.frame_cov
+    }
+
+    /// The tracker world's up axis: against the gravity the inertial path aligned to once it is
+    /// initialized, else the bootstrap camera's `-y` (optical: `y` points down the image), which
+    /// is up only as far as the camera was level.
+    pub fn up_axis(&self) -> [f64; 3] {
+        match self.inertial.as_ref() {
+            Some(i) if self.state.imu_initialized => {
+                let g = i.gravity_world;
+                [-g.x, -g.y, -g.z]
+            }
+            _ => [0.0, -1.0, 0.0],
+        }
     }
 
     /// The pose to publish for the frame at `now_sec`: the tracker's, behind the hold that is
@@ -4180,6 +4431,31 @@ impl Tracker {
         );
     }
 
+    /// Moves every held covariance into the world an inertial alignment just produced: the
+    /// alignment is one rigid motion of the world (`T_new_old`, read off `reference`, a keyframe's
+    /// world-to-camera pose before it, against the same keyframe now), and a world left
+    /// perturbation crosses a change of world by `Ad(T_new_old)`. Its scale (one, to the
+    /// stereo baseline's accuracy) is not applied.
+    fn realign_covariances(&mut self, reference: Option<(usize, Pose3d)>) {
+        let Some((idx, old_cw)) = reference else {
+            return;
+        };
+        let Some(new_cw) = self
+            .map
+            .get_keyframe(idx)
+            .map(|kf| kf.frame.pose_world_to_cam)
+        else {
+            return;
+        };
+        let ad = covariance::pose_adjoint(&new_cw.inverse().compose(&old_cw));
+        for c in self.kf_cov.values_mut() {
+            *c = covariance::congruence(&ad, c);
+        }
+        if let Some((_, c)) = self.coast_origin.as_mut() {
+            *c = covariance::congruence(&ad, c);
+        }
+    }
+
     /// Commits an accepted initialization to the map and bumps the world generation.
     ///
     /// Only reachable through [`Self::accept_inertial_init`] with `enable_inertial_ba` on.
@@ -4208,6 +4484,13 @@ impl Tracker {
                     })
             })
             .flatten();
+        // A keyframe's pose before the alignment moves the world, to read off afterwards what the
+        // alignment did to it, so the covariances follow (`realign_covariances`).
+        let reference = self
+            .map
+            .keyframes()
+            .last()
+            .map(|kf| (kf.frame.idx, kf.frame.pose_world_to_cam));
         let applied = inert.initializer.apply_initialization(
             &mut self.map,
             &mut inert.bias,
@@ -4222,6 +4505,7 @@ impl Tracker {
                     aligned.pose_world_to_cam =
                         self.repivot_map(idx, centre, aligned.pose_world_to_cam);
                 }
+                self.realign_covariances(reference);
                 self.state.adopt_inertial_initialization(aligned)
             }
             // `apply_inertial_alignment` refuses an empty velocity list, and a non-empty one
@@ -6750,6 +7034,118 @@ mod tests {
                 assert!(err < 0.01, "lag {lag} frame {seq}: {err} m");
             }
         }
+    }
+
+    /// The position block's trace of a covariance, m^2.
+    fn position_trace(c: &Cov6) -> f64 {
+        c[0] + c[7] + c[14]
+    }
+
+    /// Driving through `max_keyframes` drops, every published pose carries a covariance, it ends
+    /// the drive larger than it started, and a drop never resets it: the first pose of each new
+    /// map (the coast it was anchored on) is at least as uncertain as the last measured pose of
+    /// the map before. A zero there would read as a robot that just became perfectly localised.
+    #[test]
+    fn world_sigma_grows_along_a_drive_and_is_carried_across_a_drop() {
+        let mut tracker = scene_tracker_with(|c| {
+            c.wheel_odom = Some(scene_wheel_config());
+            c.max_keyframes = Some(3);
+        });
+        push_scene_wheels(&mut tracker, 0..41);
+        let mut last_measured: Option<f64> = None;
+        let mut first: Option<f64> = None;
+        let mut drops = 0;
+        let mut generation = tracker.map_generation();
+        for seq in 0..40 {
+            let status = feed(&mut tracker, seq);
+            let cov = tracker
+                .frame_covariance()
+                .unwrap_or_else(|| panic!("frame {seq}: {status:?} carries no covariance"));
+            assert!(covariance::is_valid(&cov), "frame {seq}");
+            let tr = position_trace(&cov);
+            first.get_or_insert(tr);
+            if tracker.map_generation() != generation {
+                generation = tracker.map_generation();
+                drops += 1;
+                let before = last_measured.expect("a measured pose before the drop");
+                assert!(
+                    tr > before,
+                    "frame {seq}: the new map starts at trace {tr:e}, the old one ended at {before:e}"
+                );
+            }
+            if matches!(status, TrackStatus::Tracked(_)) {
+                last_measured = Some(tr);
+            }
+        }
+        assert!(drops >= 2, "only {drops} drops");
+        let (first, end) = (first.expect("a pose"), last_measured.expect("a pose"));
+        assert!(
+            end > first,
+            "trace {first:e} at the start, {end:e} at the end"
+        );
+    }
+
+    /// Blind on the wheels, the covariance grows every frame and faster than it did over the
+    /// same number of tracked frames before: the wheels' propagated covariance per metre, against
+    /// vision re-observing the map.
+    #[test]
+    fn coast_sigma_grows_faster_than_tracked() {
+        let mut tracker = scene_tracker_with(|c| c.wheel_odom = Some(scene_wheel_config()));
+        push_scene_wheels(&mut tracker, 0..31);
+        let mut trace = Vec::new();
+        for seq in 0..12 {
+            assert!(matches!(feed(&mut tracker, seq), TrackStatus::Tracked(_)));
+            trace.push(position_trace(
+                &tracker.frame_covariance().expect("tracked"),
+            ));
+        }
+        for seq in 12..18 {
+            assert!(matches!(
+                blank_frame(&mut tracker, seq),
+                TrackStatus::Coasting(_)
+            ));
+            let tr = position_trace(&tracker.frame_covariance().expect("coasting"));
+            assert!(tr > *trace.last().expect("a frame"), "frame {seq}: {tr:e}");
+            trace.push(tr);
+        }
+        let tracked = trace[11] - trace[5];
+        let coasted = trace[17] - trace[11];
+        assert!(
+            coasted > 2.0 * tracked.max(0.0),
+            "six coasted frames grew the trace {coasted:e}, six tracked ones {tracked:e}"
+        );
+    }
+
+    /// A parked robot inserts a keyframe every eight frames; chained one onto the next, each
+    /// would add its own relative covariance and the parked robot's would grow for as long as it
+    /// stood. Tracked against the landmarks the scene was mapped from, it chains from that
+    /// keyframe instead ([`Tracker::chain_base`]) and stays flat.
+    #[test]
+    fn a_parked_robot_s_covariance_stays_flat_across_its_keyframes() {
+        let mut tracker = scene_tracker(None);
+        let (left, right, _) = scene_pair(0);
+        let mut trace = Vec::new();
+        let mut keyframes = 0;
+        for k in 0..60u64 {
+            let stamp = CuTime::from_nanos(EPOCH_NS + k * FRAME_NS);
+            let status = tracker.process_stereo(&left, &right, stamp).expect("valid");
+            let TrackStatus::Tracked(p) = status else {
+                panic!("frame {k}: {status:?}");
+            };
+            keyframes += usize::from(p.keyframe);
+            trace.push(position_trace(
+                &tracker.frame_covariance().expect("tracked"),
+            ));
+        }
+        assert!(
+            keyframes >= 5,
+            "only {keyframes} keyframes: the test lost its premise"
+        );
+        let (early, late) = (trace[10], trace[59]);
+        assert!(
+            late < 1.5 * early,
+            "parked: trace {early:e} at frame 10, {late:e} at frame 59 ({keyframes} keyframes)"
+        );
     }
 
     /// Wheel stamps on another clock (+10 s) leave every frame outside the readings: no factor,

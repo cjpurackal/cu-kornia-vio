@@ -83,6 +83,7 @@ use kornia_algebra::{Mat3F64, SO3F64, Vec3F64};
 use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
 use kornia_slam::mapping::wheel_odom::WheelOdomMeasurement;
 
+use crate::covariance::{Cov6, UNKNOWN_VARIANCE};
 use crate::error::VioError;
 
 /// The default gate: the 6-DOF chi-square 99.9 % quantile. Scaled to the frame's actual degrees of
@@ -516,6 +517,11 @@ pub(crate) struct FusionOutcome {
     /// Vision's Mahalanobis distance from the prediction, and its degrees of freedom (3 or 6).
     pub chi2: f64,
     pub dof: usize,
+    /// `pose`'s covariance in the camera tangent (`T_cw <- Exp(xi) T_cw`, [`crate::covariance`]),
+    /// relative to the keyframe the factors start from, which they hold fixed: the inverse of the
+    /// fused solve's Gauss-Newton information ([`posterior_covariance`]), or of the prediction's
+    /// alone for a rejected frame ([`prediction_covariance`]). `None` when it is singular.
+    pub covariance_cw: Option<Cov6>,
 }
 
 /// The gate and the solve for one frame. `None` when there is nothing to fuse (no motion factor)
@@ -571,16 +577,85 @@ pub(crate) fn fuse(
             dropped,
             chi2,
             dof,
+            // The prediction's alone, even when vision's rotation was kept: that rotation passed
+            // a gate, it was not fused, so claiming vision's rotation information for it would
+            // be claiming a measurement the frame was refused on.
+            covariance_cw: Some(prediction_covariance(&gate.h_p)),
         });
     }
+    let pose = solve(camera, visual, &active, vision_pose);
     Some(FusionOutcome {
-        pose: solve(camera, visual, &active, vision_pose),
+        pose,
         rejected: false,
         rotation_kept: false,
         dropped,
         chi2,
         dof,
+        covariance_cw: posterior_covariance(&vision_info, &active, &pose),
     })
+}
+
+/// The fused pose's covariance in the camera tangent: the inverse of the Gauss-Newton information
+/// at `pose`, vision's ([`vision_information`], the same weight the gate gave it) plus
+/// `J^T Omega J` of every motion factor the solve used. `None` when it is singular.
+///
+/// Vision's term is the gate's honest information (the reprojections' Hessian widened by its
+/// a-posteriori variance factor and the landmark floor), not the solve's raw reprojection
+/// Hessian: the solve treats the landmarks as exact, and a few hundred of them at 1 px would
+/// claim a sub-millimetre pose that the map they were triangulated into does not have.
+pub(crate) fn posterior_covariance(
+    vision_info: &[f64],
+    factors: &[MotionFactor],
+    pose: &Pose3d,
+) -> Option<Cov6> {
+    let mut h = [[0.0; 6]; 6];
+    let mut unused = [0.0; 6];
+    for f in factors {
+        let (r, j) = f.linearize(pose);
+        accumulate(&mut h, &mut unused, &j, &f.information, &r, f.dim);
+    }
+    let total: Vec<f64> = (0..36).map(|k| h[k / 6][k % 6] + vision_info[k]).collect();
+    let inv = invert(&total, 6)?;
+    Some(std::array::from_fn(|k| inv[k]))
+}
+
+/// The prediction's covariance in the camera tangent, from its Gauss-Newton information `h_p`.
+///
+/// A gyro-only prediction constrains the rotation alone: its information has no translation
+/// rows (a camera-tangent translation does not move a rotation residual), so the translation is
+/// given [`UNKNOWN_VARIANCE`] and the rotation block is inverted on its own. A prediction that
+/// is singular even there carries no information at all, and every direction is unknown.
+pub(crate) fn prediction_covariance(h_p: &Mat6) -> Cov6 {
+    let flat: Vec<f64> = h_p.iter().flatten().copied().collect();
+    if let Some(inv) = invert(&flat, 6) {
+        return std::array::from_fn(|k| inv[k]);
+    }
+    let mut out = [0.0; 36];
+    for k in 0..6 {
+        out[k * 6 + k] = UNKNOWN_VARIANCE;
+    }
+    let rot: Vec<f64> = (0..9).map(|k| h_p[3 + k / 3][3 + k % 3]).collect();
+    if let Some(inv) = invert(&rot, 3) {
+        for r in 0..3 {
+            for c in 0..3 {
+                out[(r + 3) * 6 + c + 3] = inv[r * 3 + c];
+            }
+        }
+    }
+    out
+}
+
+/// A vision-only frame's covariance in the camera tangent: [`vision_information`] inverted, for
+/// a frame the fusion did not run on (off, suspended, or no motion factor). `None` when vision's
+/// information is singular.
+pub(crate) fn vision_covariance(
+    camera: &PinholeCamera,
+    visual: &[VisualObs],
+    pose: &Pose3d,
+) -> Option<Cov6> {
+    let info = vision_information(camera, visual, pose)?;
+    let inv = invert(&info, 6)?;
+    Some(std::array::from_fn(|k| inv[k]))
 }
 
 /// The predictor to leave out, when there are two and they disagree past the gate at their joint
@@ -1695,6 +1770,73 @@ mod tests {
         let back = se3_log(&se3_exp(&xi));
         for k in 0..6 {
             assert!((back[k] - xi[k]).abs() < 1e-12);
+        }
+    }
+
+    /// The fused covariance is the inverse of the cost's own curvature at the solution: vision's
+    /// information plus the finite-difference Hessian of half the motion factors' `r^T Omega r`
+    /// (the Gaussian's negative log-likelihood), taken under the same camera-tangent perturbation.
+    /// A stiff wheel factor (1 mm, 1 mrad) makes the motion term as large as vision's, so leaving
+    /// it out is visible.
+    #[test]
+    fn posterior_covariance_is_the_inverse_finite_difference_hessian() {
+        let cam = camera();
+        let truth = se3_exp(&[0.02, 0.0, 0.1, 0.0, 0.05, 0.0]);
+        let obs = observations(&truth);
+        let f = wheel_factor_at(&truth, 0.001, 0.001);
+        let factors = std::slice::from_ref(&f);
+        let out = fuse(&cam, &obs, factors, &truth, &truth, DEFAULT_CHI2_GATE).expect("fused");
+        assert!(!out.rejected);
+        let cov = out.covariance_cw.expect("a covariance");
+
+        let half_chi2 = |xi: &[f64; 6]| 0.5 * f.chi2(&se3_exp(xi).compose(&out.pose));
+        let eps = 1e-4;
+        let mut h = vision_information(&cam, &obs, &truth).expect("vision information");
+        for i in 0..6 {
+            for j in 0..6 {
+                let at = |si: f64, sj: f64| {
+                    let mut xi = [0.0; 6];
+                    xi[i] += si * eps;
+                    xi[j] += sj * eps;
+                    half_chi2(&xi)
+                };
+                h[i * 6 + j] += (at(1.0, 1.0) - at(1.0, -1.0) - at(-1.0, 1.0) + at(-1.0, -1.0))
+                    / (4.0 * eps * eps);
+            }
+        }
+        let want = invert(&h, 6).expect("positive definite");
+        for k in 0..36 {
+            let scale = (want[(k / 6) * 7] * want[(k % 6) * 7]).sqrt();
+            assert!(
+                (cov[k] - want[k]).abs() <= 1e-3 * scale,
+                "[{}][{}]: {:e} vs {:e}",
+                k / 6,
+                k % 6,
+                cov[k],
+                want[k]
+            );
+        }
+        // And the motion factor did tighten it: vision alone is wider in every direction.
+        let alone = vision_covariance(&cam, &obs, &truth).expect("vision covariance");
+        for k in 0..6 {
+            assert!(cov[k * 7] < alone[k * 7], "axis {k}");
+        }
+    }
+
+    /// A rejected frame publishes the prediction, with the prediction's covariance: a gyro-only
+    /// prediction (rotation rows alone) leaves the translation unknown, not zero.
+    #[test]
+    fn a_gyro_only_prediction_leaves_the_translation_unknown() {
+        let mut h = [[0.0; 6]; 6];
+        for (k, row) in h.iter_mut().enumerate().skip(3) {
+            row[k] = 1e6;
+        }
+        let c = prediction_covariance(&h);
+        for k in 0..3 {
+            assert_eq!(c[k * 7], UNKNOWN_VARIANCE);
+        }
+        for k in 3..6 {
+            assert!((c[k * 7] - 1e-6).abs() < 1e-15, "{}", c[k * 7]);
         }
     }
 }

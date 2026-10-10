@@ -40,6 +40,7 @@
 pub mod bus;
 pub mod config;
 pub mod consistency;
+pub mod covariance;
 pub mod diag;
 pub mod error;
 pub mod feed;

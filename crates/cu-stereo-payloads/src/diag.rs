@@ -295,6 +295,12 @@ pub struct VioDiagnostics {
     pub motion: MotionCheck,
     /// The per-frame fusion's verdict on this frame.
     pub fusion: FusionCheck,
+    /// The published pose's horizontal position sigma, metres: both horizontal axes together
+    /// (the square root of the position variance off the tracker world's up axis), from
+    /// [`crate::VioPose::covariance`] at the camera's position. NaN when the frame has none.
+    pub pose_sigma_xy_m: f32,
+    /// The published pose's heading sigma (rotation about the up axis), radians. NaN likewise.
+    pub pose_sigma_yaw_rad: f32,
 }
 
 /// [`FeaturePoint::class`] bit: the keypoint has a stereo depth.
@@ -364,6 +370,8 @@ mod tests {
                 gyro_deg: f32::NAN,
                 ..Default::default()
             },
+            pose_sigma_xy_m: 0.125,
+            pose_sigma_yaw_rad: f32::NAN,
             ..Default::default()
         };
         let bytes = bincode::encode_to_vec(d, standard()).expect("encode");
@@ -376,6 +384,13 @@ mod tests {
         assert_eq!(back.map_generation, 5);
         assert!(back.motion.gyro_deg.is_nan());
         assert_eq!(back.motion.verdict, MotionVerdict::WheelsDisagree);
+        assert_eq!(back.pose_sigma_xy_m, 0.125);
+        assert!(back.pose_sigma_yaw_rad.is_nan());
+        // The two sigmas are the LAST eight bytes, in this order: a field appended anywhere else
+        // shifts every log already written.
+        let n = bytes.len();
+        assert_eq!(&bytes[n - 8..n - 4], &0.125f32.to_le_bytes());
+        assert_eq!(&bytes[n - 4..], &f32::NAN.to_le_bytes());
     }
 
     #[test]

@@ -541,14 +541,25 @@ pub struct Landmark {
 /// inversion happens once, at the type boundary: publishing the un-inverted pose looks like a
 /// plausible trajectory travelled in reverse.
 ///
-/// `Default` is safe to call (no map points), unlike [`StereoPair`]'s.
-#[derive(Default, Debug, Clone, Encode, Serialize, Deserialize, Reflect)]
+/// `Default` is safe to call (no map points, and [`NO_COVARIANCE`]), unlike [`StereoPair`]'s.
+#[derive(Debug, Clone, Encode, Serialize, Deserialize, Reflect)]
 #[reflect(from_reflect = false, no_field_bounds)]
 pub struct VioPose {
     /// Camera pose in the tracker's world frame, metres.
     pub cam_in_world: Pose<f64>,
     /// Tracker bookkeeping for this pose.
     pub status: VioStatus,
+    /// `cam_in_world`'s covariance: 6x6, row-major (`covariance[row][col]`), over `[rho; omega]`
+    /// (translation first), as the WORLD LEFT PERTURBATION `cam_in_world <- Exp(delta) *
+    /// cam_in_world`. Not ROS's convention: a left perturbation moves the camera centre by
+    /// `rho + omega x p`, so the position covariance is `G S G^T` with `G = [[I, -[p]x], [0, I]]`
+    /// at the camera position `p`; this form is the one that crosses a change of world by the
+    /// adjoint alone, which is why it is the one carried. [`NO_COVARIANCE`] (`-1` in `[0][0]`)
+    /// when the tracker has none for this frame.
+    ///
+    /// An approximation the producer documents: a chain of per-frame covariances, not a joint
+    /// marginal.
+    pub covariance: [[f64; 6]; 6],
     /// A snapshot of map points, or `None`. A viewer payload, not part of the estimate.
     ///
     /// Each snapshot is the COMPLETE current view the producer chose to send: a consumer
@@ -564,11 +575,31 @@ pub struct VioPose {
     pub map_points: Option<CuHandle<Vec<Landmark>>>,
 }
 
+/// [`VioPose::covariance`]'s "none": ROS's invalid-covariance marker, `-1` in `[0][0]`. A zero
+/// matrix would read as a perfectly known pose.
+pub const NO_COVARIANCE: [[f64; 6]; 6] = {
+    let mut c = [[0.0; 6]; 6];
+    c[0][0] = -1.0;
+    c
+};
+
+impl Default for VioPose {
+    fn default() -> Self {
+        Self {
+            cam_in_world: Pose::default(),
+            status: VioStatus::default(),
+            covariance: NO_COVARIANCE,
+            map_points: None,
+        }
+    }
+}
+
 impl Decode<()> for VioPose {
     fn decode<D: Decoder<Context = ()>>(decoder: &mut D) -> Result<Self, DecodeError> {
         Ok(Self {
             cam_in_world: Decode::decode(decoder)?,
             status: Decode::decode(decoder)?,
+            covariance: Decode::decode(decoder)?,
             map_points: Decode::decode(decoder)?,
         })
     }
@@ -719,6 +750,8 @@ mod tests {
                 landmarks: 9,
                 localization: Localization::Coasting,
             },
+            // Distinct per element, so a transposed or reordered matrix is red.
+            covariance: std::array::from_fn(|r| std::array::from_fn(|c| (r * 6 + c) as f64)),
             map_points: None,
         };
         let bytes = encode(&pose);
@@ -735,6 +768,8 @@ mod tests {
             row(ZERO, ZERO, ZERO, ONE),
             // keyframe = false, reset_epoch, landmarks, localization = Coasting
             vec![0, 6, 9, 1],
+            // the covariance, 36 fixed-width f64 row by row, no length prefix: 0, 1, 2, ...
+            (0..36).flat_map(|k| (k as f64).to_le_bytes()).collect(),
             // no map_points snapshot: the Option tag alone
             vec![0],
         ]
@@ -743,6 +778,7 @@ mod tests {
 
         let back: VioPose = decode(&bytes);
         assert_eq!(back.status, pose.status);
+        assert_eq!(back.covariance, pose.covariance);
         assert_eq!(back.cam_in_world.to_matrix(), pose.cam_in_world.to_matrix());
         assert!(back.map_points.is_none());
     }
@@ -767,13 +803,18 @@ mod tests {
                 landmarks: 5,
                 localization: Localization::Tracking,
             },
+            covariance: NO_COVARIANCE,
             map_points: Some(CuHandle::new_detached(points.clone())),
         };
         let bytes = encode(&pose);
         let head = encode(&pose.cam_in_world);
+        let status: &[u8] = &[1, 2, 5, 0]; // keyframe = true, reset_epoch, landmarks, Tracking
+        // NO_COVARIANCE: -1.0 then 35 zeros.
+        let cov: Vec<u8> = (0..36)
+            .flat_map(|k| if k == 0 { -1.0f64 } else { 0.0 }.to_le_bytes())
+            .collect();
         #[rustfmt::skip]
         let tail: &[u8] = &[
-            1, 2, 5, 0,             // keyframe = true, reset_epoch, landmarks, Tracking
             1,                      // Some: a snapshot follows
             2,                      // two points
             0x00, 0x00, 0x80, 0x3f, // x = 1.0
@@ -785,7 +826,7 @@ mod tests {
             0x00, 0x00, 0x80, 0x40, // z = 4.0
             251, 0x2c, 0x01,        // index = 300, varint u16 form
         ];
-        assert_eq!(bytes, [head.as_slice(), tail].concat());
+        assert_eq!(bytes, [head.as_slice(), status, &cov, tail].concat());
 
         let back: VioPose = decode(&bytes);
         assert_eq!(back.status, pose.status);

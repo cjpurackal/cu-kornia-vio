@@ -666,6 +666,13 @@ impl CuTask for StereoVio {
                 landmarks: u32::try_from(landmarks).unwrap_or(u32::MAX),
                 localization,
             },
+            // The tracker's chained estimate (`Tracker::frame_covariance`), in the convention the
+            // payload documents; none for a frame it has none for.
+            covariance: tracker
+                .frame_covariance()
+                .map_or(cu_stereo_payloads::NO_COVARIANCE, |c| {
+                    crate::covariance::to_rows(&c)
+                }),
             map_points,
         });
         Ok(())

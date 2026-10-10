@@ -6,6 +6,7 @@
 
 use cu_stereo_payloads::{FusionCheck, TrackingState, VioDiagnostics};
 
+use crate::covariance::{horizontal_sigmas, ros_from_left};
 use crate::track::{FrameReport, SystemMode, TrackStatus, Tracker};
 
 /// What one frame produced, without its pose.
@@ -84,6 +85,7 @@ pub fn frame_diagnostics(
     let (inertial_stage, gyro, accel) = tracker.inertial_diag();
     let f32x3 = |v: [f64; 3]| v.map(|c| c as f32);
     let sat = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+    let (pose_sigma_xy_m, pose_sigma_yaw_rad) = pose_sigmas(tracker, status);
     VioDiagnostics {
         seq: stream.seq,
         frames: stream.frames,
@@ -113,7 +115,26 @@ pub fn frame_diagnostics(
         accel_bias: f32x3(accel),
         motion: tracker.last_motion_check(),
         fusion: fusion_check(tracker),
+        pose_sigma_xy_m,
+        pose_sigma_yaw_rad,
     }
+}
+
+/// The published pose's horizontal position sigma and heading sigma ([`horizontal_sigmas`]),
+/// about the tracker world's up axis ([`Tracker::up_axis`]), at the camera's own position. NaN
+/// for a frame with no covariance, which is not the same as a perfectly known one.
+fn pose_sigmas(tracker: &Tracker, status: &TrackStatus) -> (f32, f32) {
+    let pose = match status {
+        TrackStatus::Tracked(p) | TrackStatus::Coasting(p) => p,
+        TrackStatus::NotLocalized(_) | TrackStatus::Untracked => return (f32::NAN, f32::NAN),
+    };
+    let Some(cov) = tracker.frame_covariance() else {
+        return (f32::NAN, f32::NAN);
+    };
+    let c = pose.cam_in_world().translation;
+    let ros = ros_from_left(&cov, [c.x, c.y, c.z]);
+    let (xy, yaw) = horizontal_sigmas(&ros, tracker.up_axis());
+    (xy as f32, yaw as f32)
 }
 
 /// The per-frame fusion's verdict on the frame `tracker` just processed.
