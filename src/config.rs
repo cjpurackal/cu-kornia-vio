@@ -384,6 +384,8 @@ pub(crate) struct WheelOdomRon {
     pub min_translation_sigma_m: Option<f64>,
     #[serde(default)]
     pub min_heading_sigma_rad: Option<f64>,
+    #[serde(default)]
+    pub parked_keyframe_interval_s: Option<f64>,
 }
 
 impl WheelOdomRon {
@@ -425,6 +427,9 @@ impl WheelOdomRon {
         if let Some(v) = self.min_heading_sigma_rad {
             cfg.min_heading_sigma_rad = v;
         }
+        cfg.parked_keyframe_interval = self
+            .parked_keyframe_interval_s
+            .map(cu29::units::si::f64::Time::new::<cu29::units::si::time::second>);
         cfg.validate()?;
         Ok(self.enabled.then_some(cfg))
     }
@@ -955,6 +960,31 @@ mod tests {
         for key in ["heading_noise_per_m", "z_slope", "clock_sigma_s"] {
             assert!(!CONFIG_KEYS.contains(&key), "{key} is a wheel_odom field");
         }
+    }
+
+    #[test]
+    fn test_the_parked_keyframe_interval_is_off_unless_set_and_positive() {
+        let to = |block: &str| wheel_ron(block).unwrap().expect("parses").to_config();
+        let off = to(WHEEL_BLOCK).unwrap().expect("enabled");
+        assert_eq!(off.parked_keyframe_interval, None);
+        let on = to(&WHEEL_BLOCK.replace(")", ", parked_keyframe_interval_s: 10.0)"))
+            .unwrap()
+            .expect("enabled");
+        assert_eq!(
+            on.parked_keyframe_interval
+                .map(|t| t.get::<cu29::units::si::time::second>()),
+            Some(10.0)
+        );
+        // Zero would suppress every parked keyframe for ever; negative is a typo.
+        for v in ["0.0", "-1.0"] {
+            let err = to(&WHEEL_BLOCK.replace(")", &format!(", parked_keyframe_interval_s: {v})")));
+            assert!(
+                matches!(err, Err(VioError::WheelParamInvalid { field, .. })
+                    if field == "parked_keyframe_interval_s"),
+                "{v}: {err:?}"
+            );
+        }
+        assert!(!CONFIG_KEYS.contains(&"parked_keyframe_interval_s"));
     }
 
     #[test]

@@ -759,6 +759,14 @@ const STATIC_REFINE_MOTION_M: f64 = 0.2;
 /// Camera rotation from the still window that ends the same hold, radians (10 deg).
 const STATIC_REFINE_MOTION_RAD: f64 = 0.174_532_925_199_432_95;
 
+/// Camera travel since the last keyframe under which a parked robot withholds keyframes, metres:
+/// the stationary initialization's camera floor, ~50x a parked keyframe's drift (0.2 mm).
+const PARKED_CAMERA_TRANSLATION_M: f64 = 0.01;
+
+/// The rotation counterpart of [`PARKED_CAMERA_TRANSLATION_M`]: 0.5 deg, an order over stereo
+/// attitude noise and well under a head re-tilt or the mast's ~7 deg pan play.
+const PARKED_CAMERA_ROTATION_RAD: f64 = 0.008_726_646_259_971_648;
+
 /// Wheel-odometry span the anchor velocity of a carried alignment is measured over: a few wheel
 /// readings, short enough to be the velocity at the bootstrap and not an average over a stop.
 const CARRY_VELOCITY_WINDOW_NS: u64 = 200_000_000;
@@ -2981,6 +2989,65 @@ impl Tracker {
             .collect()
     }
 
+    /// Whether to withhold a keyframe the policy asked for because the robot is parked.
+    ///
+    /// kornia-slam inserts one every `max_frames_between` frames however still the scene, which
+    /// filled `max_keyframes` and dropped the map every ~75 s on a parked robot (2026-10-11). All
+    /// must hold to withhold it: the interval is configured and not yet elapsed since the last
+    /// keyframe; tracking is strong (a weak reference is the policy's scene-change trigger, and a
+    /// person walking past a parked robot still gets its keyframe); the wheels' PATH since the last
+    /// keyframe is under the parked floors; and the camera is within
+    /// [`PARKED_CAMERA_TRANSLATION_M`] / [`PARKED_CAMERA_ROTATION_RAD`] of it, so a head re-tilt or
+    /// a pan the wheels cannot see is motion. Anything missing (no wheels, no readings, no
+    /// keyframe) inserts as before, and so does an inertial path not yet initialized: the still
+    /// window is built from keyframe IMU edges, and withholding them kept a robot parked 9 s
+    /// uninitialized into its first drive (replay of a 2026-10-11 capture).
+    fn parked_keyframe_suppressed(
+        &mut self,
+        stamp_ns: u64,
+        tracked_inliers: usize,
+        n_ref_map_points: usize,
+    ) -> bool {
+        let Some(w) = self.wheel.as_ref() else {
+            return false;
+        };
+        let Some(interval) = w.cfg.parked_keyframe_interval else {
+            return false;
+        };
+        if self.inertial.is_some() && !self.state.imu_initialized {
+            return false;
+        }
+        let (Some(kf_ns), Some(kf_idx)) =
+            (self.last_keyframe_stamp_ns, self.state.last_keyframe_idx)
+        else {
+            return false;
+        };
+        let interval_ns = (interval.get::<cu29::units::si::time::second>() * 1e9) as u64;
+        if stamp_ns.saturating_sub(kf_ns) >= interval_ns {
+            return false;
+        }
+        let strong = n_ref_map_points > 0
+            && tracked_inliers as f64
+                >= n_ref_map_points as f64 * self.config.keyframe_policy.ref_ratio;
+        if !strong || !w.parked_between(kf_ns, stamp_ns) {
+            return false;
+        }
+        let Some(kf) = self.map.get_keyframe(kf_idx) else {
+            return false;
+        };
+        let (p0, p1) = (kf.frame.pose_world_to_cam, self.state.pose_world_to_cam);
+        let moved = (p1.inverse().translation - p0.inverse().translation).length();
+        let turned = crate::consistency::angle_between(&p0.rotation, &p1.rotation);
+        // A NaN pose is not parked.
+        if !(moved <= PARKED_CAMERA_TRANSLATION_M && turned <= PARKED_CAMERA_ROTATION_RAD) {
+            return false;
+        }
+        if let Some(w) = self.wheel.as_mut() {
+            w.stats.parked_keyframes_skipped += 1;
+        }
+        true
+    }
+
     /// Canonical order: insert -> associate -> densify close stereo -> grow(xN)
     /// -> IMU edge -> fuse -> local BA -> pose sync-back -> cull.
     fn try_insert_keyframe(
@@ -3011,6 +3078,9 @@ impl Tracker {
             tracked_inliers,
             n_ref_map_points,
         ) {
+            return false;
+        }
+        if self.parked_keyframe_suppressed(stamp_ns, tracked_inliers, n_ref_map_points) {
             return false;
         }
 
@@ -8234,6 +8304,88 @@ mod tests {
         tracker
             .process_stereo(&left, &right, CuTime::from_nanos(stamp))
             .expect("a valid pair");
+    }
+
+    /// A tracker on the parked scene with the wheels on and, when given, the parked interval.
+    fn parked_gate_tracker(interval_s: Option<f64>) -> Tracker {
+        scene_tracker_with(|c| {
+            c.inertial = Some(static_inertial_config());
+            let mut w = scene_wheel_config();
+            w.parked_keyframe_interval = interval_s.map(Time::new::<cu29::units::si::time::second>);
+            c.wheel_odom = Some(w);
+        })
+    }
+
+    /// 2026-10-11, parked robot: kornia-slam's policy inserted a keyframe every 8 frames, so the
+    /// map hit `max_keyframes` and dropped every ~75 s. With the interval set, a parked robot
+    /// inserts about one keyframe per interval once initialized; until then, and with it unset,
+    /// exactly what it did before.
+    #[test]
+    fn test_a_parked_robot_withholds_keyframes_for_the_interval() {
+        let frames = 150; // 10 s at 15 Hz after the initialization
+        let count = |interval_s: Option<f64>| {
+            let mut t = parked_gate_tracker(interval_s);
+            let at_init = park_still_until_initialized(&mut t);
+            for seq in at_init.0..at_init.0 + frames {
+                feed_still(&mut t, seq, &Pose3d::IDENTITY, Some((0.0, 0.0)));
+            }
+            let skipped = t.wheel_stats().unwrap().parked_keyframes_skipped;
+            (at_init, t.map.keyframes().len() - at_init.1, skipped)
+        };
+        let (off_init, off, off_skipped) = count(None);
+        let (on_init, on, on_skipped) = count(Some(4.0));
+        assert_eq!(on_init, off_init, "the still window waits for no gate");
+        assert_eq!(off_skipped, 0);
+        assert!(off >= 10, "the policy's forced keyframes: {off}");
+        // One per 4 s over 10 s: never none, at most 3.
+        assert!((1..=3).contains(&on), "parked keyframes {on} (off: {off})");
+        assert!(on_skipped > 0);
+    }
+
+    /// The gate withholds only while ALL still signals hold: wheels driving a few millimetres a
+    /// frame, or the camera turning with the wheels at rest (a head pan), insert as before.
+    #[test]
+    fn test_parked_gate_yields_to_wheel_motion_and_to_a_camera_turn() {
+        let base = {
+            let mut t = parked_gate_tracker(None);
+            let (s0, k0) = park_still_until_initialized(&mut t);
+            for seq in s0..s0 + 60 {
+                feed_still(&mut t, seq, &Pose3d::IDENTITY, Some((0.0, 0.0)));
+            }
+            t.map.keyframes().len() - k0
+        };
+        // Wheels creep 2 mm a frame (the camera does not see it; the gate must still yield).
+        let mut wheels = parked_gate_tracker(Some(100.0));
+        let (s0, k0) = park_still_until_initialized(&mut wheels);
+        for seq in s0..s0 + 60 {
+            let x = 0.002 * f64::from(seq - s0);
+            feed_still(&mut wheels, seq, &Pose3d::IDENTITY, Some((x, 0.0)));
+        }
+        assert_eq!(wheels.wheel_stats().unwrap().parked_keyframes_skipped, 0);
+        assert_eq!(wheels.map.keyframes().len() - k0, base);
+        // Parked 20 frames, then the camera turns 0.1 deg a frame with the wheels at rest: from
+        // 0.5 deg on it inserts.
+        let mut pan = parked_gate_tracker(Some(100.0));
+        let (s0, k0) = park_still_until_initialized(&mut pan);
+        for seq in s0..s0 + 60 {
+            let deg = 0.1 * f64::from((seq - s0).saturating_sub(20));
+            feed_still(&mut pan, seq, &yaw_view(deg), Some((0.0, 0.0)));
+        }
+        let skipped = pan.wheel_stats().unwrap().parked_keyframes_skipped;
+        let added = pan.map.keyframes().len() - k0;
+        assert!(skipped > 0, "the first 20 frames are parked");
+        assert!(added >= 3, "the pan must insert: {added} (still: {base})");
+    }
+
+    /// Feeds still frames until the inertial path initializes; the next seq and the keyframes.
+    fn park_still_until_initialized(t: &mut Tracker) -> (u32, usize) {
+        for seq in 0..80 {
+            feed_still(t, seq, &Pose3d::IDENTITY, Some((0.0, 0.0)));
+            if t.state.imu_initialized {
+                return (seq + 1, t.map.keyframes().len());
+            }
+        }
+        panic!("a parked robot never initialized");
     }
 
     fn yaw_view(deg: f64) -> Pose3d {

@@ -177,6 +177,12 @@ pub struct WheelOdomConfig {
     pub max_gap: Time,
     /// Readings held; see [`DEFAULT_WHEEL_BUFFER_CAPACITY`].
     pub buffer_capacity: usize,
+    /// Longest gap between keyframes while parked; `None` (the default) keeps kornia-slam's own
+    /// policy. kornia-slam forces a keyframe every few frames however still the scene, so a
+    /// parked robot filled `max_keyframes` and dropped its map every ~75 s (4 drops in 5 min,
+    /// 2026-10-11). Parked keyframes add nothing but that; one per interval keeps the IMU edges
+    /// of the visual-inertial BA bounded. See `Tracker::parked_keyframe_suppressed`.
+    pub parked_keyframe_interval: Option<Time>,
 }
 
 impl WheelOdomConfig {
@@ -207,6 +213,7 @@ impl WheelOdomConfig {
             huber_chi2: None,
             max_gap: Time::new::<second>(0.5),
             buffer_capacity: DEFAULT_WHEEL_BUFFER_CAPACITY,
+            parked_keyframe_interval: None,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -224,6 +231,11 @@ impl WheelOdomConfig {
             ("min_heading_sigma_rad", self.min_heading_sigma_rad),
             ("max_gap_s", self.max_gap.get::<second>()),
             ("huber_chi2", self.huber_chi2.unwrap_or(1.0)),
+            (
+                "parked_keyframe_interval_s",
+                self.parked_keyframe_interval
+                    .map_or(1.0, |t| t.get::<second>()),
+            ),
         ] {
             if !value.is_finite() || value <= 0.0 {
                 return Err(VioError::WheelParamInvalid { field, value });
@@ -396,6 +408,9 @@ pub struct WheelStats {
     /// Frames whose stamp lay outside `[oldest reading, newest reading + max_gap]`: the stream is
     /// silent or on another clock, and the wheels are not being used.
     pub frames_uncovered: u64,
+    /// Keyframes kornia-slam's policy asked for and the parked gate withheld; see
+    /// [`WheelOdomConfig::parked_keyframe_interval`].
+    pub parked_keyframes_skipped: u64,
 }
 
 /// A keyframe interval waiting for its readings.
@@ -406,6 +421,13 @@ struct PendingEdge {
     to_idx: usize,
     to_ns: u64,
 }
+
+/// Wheel path under which an interval counts as parked, metres: the stationary initialization's
+/// net-motion floor, applied to the path.
+pub(crate) const PARKED_PATH_M: f64 = 0.005;
+
+/// The heading counterpart of [`PARKED_PATH_M`], radians turned.
+pub(crate) const PARKED_PATH_RAD: f64 = 0.01;
 
 /// The tracker's wheel half: readings, mounts, pending intervals and the factors built from them.
 pub(crate) struct WheelState {
@@ -670,6 +692,14 @@ impl WheelState {
                 None
             }
         }
+    }
+
+    /// Whether the base stood still over `[t0_ns, t1_ns]`: the PATH, not the net delta, under the
+    /// stationary initialization's wheel floors, so a there-and-back is motion. `false` when the
+    /// readings do not cover the interval: nothing then vouches for the base.
+    pub fn parked_between(&self, t0_ns: u64, t1_ns: u64) -> bool {
+        self.delta(t0_ns, t1_ns, self.cfg.max_gap_ns())
+            .is_ok_and(|d| d.path_m <= PARKED_PATH_M && d.path_rad <= PARKED_PATH_RAD)
     }
 
     /// Checks a frame stamp against the readings' span. Returns `frame - newest reading` in ns

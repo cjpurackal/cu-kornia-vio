@@ -687,7 +687,7 @@ impl CuTask for StereoVio {
             info!(
                 "vio wheel: {} coasting, {} not localized; {} edges ({} refused, {} of them discontinuous, {} expired); \
                  prior {} / unavailable {}; {} frames outside the readings; readings {} accepted / {} out-of-order / {} \
-                 non-finite / {} evicted / {} queue-evicted; mounts {} / refused {}",
+                 non-finite / {} evicted / {} queue-evicted; mounts {} / refused {}; {} parked keyframes skipped",
                 self.coasted,
                 self.not_localized,
                 w.edges_added,
@@ -704,6 +704,7 @@ impl CuTask for StereoVio {
                 w.queue_evicted,
                 w.mounts_accepted,
                 w.mounts_refused,
+                w.parked_keyframes_skipped,
             );
         }
         if let Some(t) = self.tracker.as_ref() {
