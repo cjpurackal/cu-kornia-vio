@@ -767,6 +767,26 @@ const PARKED_CAMERA_TRANSLATION_M: f64 = 0.01;
 /// attitude noise and well under a head re-tilt or the mast's ~7 deg pan play.
 const PARKED_CAMERA_ROTATION_RAD: f64 = 0.008_726_646_259_971_648;
 
+/// IMU ring headroom past a parked keyframe interval, seconds. The ring holds from the last
+/// keyframe to the newest drained sample, which leads the frame by its lag plus the solve (140 ms
+/// worst lag at 15 fps, p99 ~200 ms after a keyframe solve, multi-second outliers), and a device
+/// running fast of its nominal rate fills it sooner.
+const PARKED_IMU_RING_MARGIN_S: f64 = 2.0;
+
+/// The tracker's IMU ring capacity: the configured one, grown to span a parked keyframe interval
+/// plus [`PARKED_IMU_RING_MARGIN_S`]. A 10 s interval in the default 2048 (10.24 s at 200 Hz)
+/// evicted the start of the parked edge whenever the IMU led the frame by ~0.25 s, and the edge
+/// and the per-frame IMU prediction were refused as a leading gap.
+fn imu_ring_capacity(inertial: &InertialConfig, wheel: Option<&WheelOdomConfig>) -> usize {
+    let Some(interval) = wheel.and_then(|w| w.parked_keyframe_interval) else {
+        return inertial.buffer_capacity;
+    };
+    let span_s = interval.get::<cu29::units::si::time::second>() + PARKED_IMU_RING_MARGIN_S;
+    let need = (inertial.gates.nominal_rate.get::<hertz>() * span_s).ceil();
+    // Validated finite and positive; the cast saturates on anything absurd.
+    inertial.buffer_capacity.max(need as usize)
+}
+
 /// Wheel-odometry span the anchor velocity of a carried alignment is measured over: a few wheel
 /// readings, short enough to be the velocity at the bootstrap and not an average over a stop.
 const CARRY_VELOCITY_WINDOW_NS: u64 = 200_000_000;
@@ -931,9 +951,10 @@ pub struct Tracker {
     /// and the frame's covariance relative to it in the camera tangent. Reset every frame.
     frame_rel: Option<(Option<usize>, Cov6)>,
     /// What a coast grows from: the last measured frame's stamp and covariance, re-based every
-    /// [`COAST_REBASE_NS`] of coasting and at every anchor. Kept across a map DROP, so the next
-    /// map's first keyframe starts from where the last one left the uncertainty (never from zero,
-    /// which would read as perfectly localised); cleared only by a requested reset.
+    /// [`COAST_REBASE_NS`] of coasting and at every anchor. Kept across a map drop that carries
+    /// the world, so the next map's first keyframe starts from where the last one left the
+    /// uncertainty (never from zero, which would read as perfectly localised); cleared whenever
+    /// the world restarts at identity.
     coast_origin: Option<(u64, Cov6)>,
 }
 
@@ -1071,7 +1092,10 @@ impl Tracker {
             );
         }
 
-        let inertial = config.inertial.clone().map(InertialState::new);
+        let inertial = config.inertial.clone().map(|mut c| {
+            c.buffer_capacity = imu_ring_capacity(&c, config.wheel_odom.as_ref());
+            InertialState::new(c)
+        });
         if let Some(inert) = &inertial {
             // Loud at startup, because from here on the only externally visible difference is
             // that the world gets rotated once, silently, when initialization succeeds.
@@ -1809,9 +1833,10 @@ impl Tracker {
         // Their keyframe indices name keyframes of the dropped map.
         self.kf_tracked_poses.clear();
         self.kf_cov.clear();
-        // A DROP keeps what a coast grows from, so the next map's first keyframe inherits the
-        // uncertainty this one ended with; only a requested reset starts a world from nothing.
-        if !keep_calibration {
+        // A carried world keeps what a coast grows from, so the next map's first keyframe
+        // inherits the uncertainty this one ended with. A world that restarts at identity starts
+        // from nothing: the old covariance is in the old world's axes and would only stack up.
+        if !carry {
             self.coast_origin = None;
         }
         self.map_settled = false;
@@ -3001,7 +3026,8 @@ impl Tracker {
     /// a pan the wheels cannot see is motion. Anything missing (no wheels, no readings, no
     /// keyframe) inserts as before, and so does an inertial path not yet initialized: the still
     /// window is built from keyframe IMU edges, and withholding them kept a robot parked 9 s
-    /// uninitialized into its first drive (replay of a 2026-10-11 capture).
+    /// uninitialized into its first drive (replay of a 2026-10-11 capture). So does a fusion
+    /// suspended on the last keyframe, which waits for the next one.
     fn parked_keyframe_suppressed(
         &mut self,
         stamp_ns: u64,
@@ -3022,6 +3048,11 @@ impl Tracker {
         else {
             return false;
         };
+        // A fusion suspended on this keyframe resumes only at the next one; withheld, it stayed
+        // off for the rest of the interval.
+        if self.fusion_suspended_on == Some(kf_idx) {
+            return false;
+        }
         let interval_ns = (interval.get::<cu29::units::si::time::second>() * 1e9) as u64;
         if stamp_ns.saturating_sub(kf_ns) >= interval_ns {
             return false;
@@ -7155,6 +7186,40 @@ mod tests {
         );
     }
 
+    /// Without wheels a drop restarts the world at identity, so its covariance restarts at zero
+    /// too: the old world's covariance is in the old world's axes, and carried into each new one
+    /// it stacked up without bound across drops.
+    ///
+    /// Red before the fix: `coast_origin` was kept on every drop, carried or not.
+    #[test]
+    fn a_world_restarted_at_identity_starts_its_covariance_at_zero() {
+        let mut tracker = scene_tracker_with(|c| c.max_keyframes = Some(3));
+        let mut generation = tracker.map_generation();
+        let mut drops = 0;
+        let mut grew = false;
+        for seq in 0..40 {
+            let status = feed(&mut tracker, seq);
+            let Some(cov) = tracker.frame_covariance() else {
+                continue;
+            };
+            let tr = position_trace(&cov);
+            grew |= tr > 0.0;
+            if tracker.map_generation() != generation {
+                generation = tracker.map_generation();
+                drops += 1;
+                assert_eq!(
+                    tr, 0.0,
+                    "frame {seq}: {status:?} starts the new world at {tr:e}"
+                );
+            }
+        }
+        assert!(drops >= 2, "only {drops} drops");
+        assert!(
+            grew,
+            "the covariance never grew; this test lost its control"
+        );
+    }
+
     /// Blind on the wheels, the covariance grows every frame and faster than it did over the
     /// same number of tracked frames before: the wheels' propagated covariance per metre, against
     /// vision re-observing the map.
@@ -8375,6 +8440,74 @@ mod tests {
         let added = pan.map.keyframes().len() - k0;
         assert!(skipped > 0, "the first 20 frames are parked");
         assert!(added >= 3, "the pan must insert: {added} (still: {base})");
+    }
+
+    /// A reject run that expires suspends the fusion until the next keyframe and relies on the
+    /// policy forcing one within `max_frames_between`. On a still robot the parked gate withheld
+    /// it, leaving the fusion off for the rest of the interval.
+    ///
+    /// Red before the fix: no keyframe in the frames after the suspension.
+    #[test]
+    fn test_parked_gate_never_withholds_the_keyframe_a_suspended_fusion_waits_for() {
+        let mut t = parked_gate_tracker(Some(100.0));
+        let (s0, _) = park_still_until_initialized(&mut t);
+        let mut seq = s0;
+        for _ in 0..20 {
+            feed_still(&mut t, seq, &Pose3d::IDENTITY, Some((0.0, 0.0)));
+            seq += 1;
+        }
+        assert!(t.wheel_stats().unwrap().parked_keyframes_skipped > 0);
+        // What the reject-run expiry in `tracking_step` sets.
+        let suspended = t.state.last_keyframe_idx;
+        t.fusion_suspended_on = suspended;
+        let (k0, budget) = (
+            t.map.keyframes().len(),
+            t.config.keyframe_policy.max_frames_between,
+        );
+        for _ in 0..budget {
+            feed_still(&mut t, seq, &Pose3d::IDENTITY, Some((0.0, 0.0)));
+            seq += 1;
+        }
+        assert!(
+            t.map.keyframes().len() > k0,
+            "no keyframe within {budget} frames of the suspension"
+        );
+        assert_ne!(t.state.last_keyframe_idx, suspended);
+    }
+
+    /// The robot's config: a 10 s parked interval at the real 200 Hz with the IMU drained 300 ms
+    /// ahead of the frame (a slow solve). The interval's keyframe edge reaches back the full 10 s
+    /// and must still be integrated, not refused as a leading gap.
+    ///
+    /// Red before the fix: `refused_gap` 1, the ring holding 10.24 s and the edge needing 10.3 s.
+    #[test]
+    fn test_a_full_parked_interval_keeps_its_imu_edge_with_the_imu_ahead() {
+        const LEAD_NS: u64 = 300_000_000;
+        let mut t = parked_gate_tracker(Some(10.0));
+        let (s0, k0) = park_still_until_initialized(&mut t);
+        let refused = |t: &Tracker| t.inertial.as_ref().unwrap().stats.refused_gap;
+        let refused0 = refused(&t);
+        let mut imu_to = EPOCH_NS + u64::from(s0 - 1) * FRAME_NS;
+        let frames = (10.6e9 / FRAME_NS as f64) as u32;
+        for seq in s0..s0 + frames {
+            let stamp = EPOCH_NS + u64::from(seq) * FRAME_NS;
+            let samples = parked_imu(&t, Some(imu_to), stamp + LEAD_NS, no_extra);
+            imu_to = stamp + LEAD_NS;
+            t.push_raw_imu(samples, 0, false).unwrap();
+            t.push_wheel([WheelSample {
+                stamp_ns: stamp,
+                x: 0.0,
+                y: 0.0,
+                theta: 0.0,
+            }])
+            .unwrap();
+            let (left, right) = render_pair(&Pose3d::IDENTITY);
+            t.process_stereo(&left, &right, CuTime::from_nanos(stamp))
+                .expect("a valid pair");
+        }
+        assert!(t.wheel_stats().unwrap().parked_keyframes_skipped > 0);
+        assert!(t.map.keyframes().len() > k0, "the interval's keyframe");
+        assert_eq!(refused(&t), refused0, "the parked edge was refused");
     }
 
     /// Feeds still frames until the inertial path initializes; the next seq and the keyframes.

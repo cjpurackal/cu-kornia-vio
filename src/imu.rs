@@ -111,15 +111,16 @@ impl From<cu_stereo_payloads::ImuSample> for RawImuSample {
 /// Samples held by a ring — `ImuBuffer` and [`crate::ImuQueue`] alike.
 ///
 /// 2048 = 10.2 s at 200 Hz, ~115 kB. Sized against the LONGEST interval that can be asked for,
-/// not the frame interval: a keyframe edge spans back to the previous keyframe, which on a
-/// parked robot has been measured 600-670 ms back, and the channel has to hold what arrives while
-/// the tracker is mid-solve and not draining (a frame that inserts a keyframe: p50 ~93 ms /
-/// p99 ~200 ms tuned, with multi-second outliers). 10.2 s is margin over both, not a bound: an
-/// edge whose start the tracker's ring evicted is refused as a leading gap, and samples the
-/// channel evicted during a longer stall are folded into the drop count and refused as dropped
-/// samples (`refused_dropped`); either way that keyframe pair stays visual-only, never
-/// integrated over a hole. One constant for both rings so they cannot drift apart in size with
-/// nothing noticing.
+/// not the frame interval: a keyframe edge spans back to the previous keyframe, and the channel
+/// has to hold what arrives while the tracker is mid-solve and not draining (a frame that inserts
+/// a keyframe: p50 ~93 ms / p99 ~200 ms tuned, with multi-second outliers). A parked keyframe
+/// interval can push the edge past this, so the tracker grows its own ring to span that interval
+/// plus a margin (`track::imu_ring_capacity`); the channel is drained every frame and keeps this
+/// size. The size is margin, not a bound: an edge whose start the tracker's ring evicted is
+/// refused as a leading gap, and samples the channel evicted during a longer stall are folded
+/// into the drop count and refused as dropped samples (`refused_dropped`); either way that
+/// keyframe pair stays visual-only, never integrated over a hole. One constant is the floor for
+/// both rings, so neither can shrink below the other with nothing noticing.
 pub const DEFAULT_BUFFER_CAPACITY: usize = 2048;
 
 /// Appends to a capacity-bounded ring, evicting the oldest sample and counting the eviction.
