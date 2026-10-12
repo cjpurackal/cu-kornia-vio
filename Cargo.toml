@@ -63,11 +63,12 @@ cu-stereo-payloads = { path = "crates/cu-stereo-payloads" }
 # - the kornia-rs crates come from crates.io at `version = "0.2.0"`, the exact requirement
 #   kornia-slam uses. A git spelling of kornia-rs (even at the same code) is a DIFFERENT source
 #   and a second `Image` type;
-# - the two kornia-slam repo crates are on git `rev` of kornia-slam `main`, not crates.io:
-#   v0.1.0 is published, but #143 (local BA captures only its window, peak RSS 768 -> 504 MB on
-#   an 8565-frame stereo-inertial run, same trajectory) landed after it, and it changed
-#   `Map::ba_snapshot`'s signature. Move to crates.io at the first release that carries it.
-kornia-slam = { git = "https://github.com/kornia/kornia-slam", rev = "a9f8c529b9861821a4c410ab94717729fb2ea225" }
+# - the two kornia-slam repo crates are on a git `rev`, not crates.io. That rev is the head of
+#   kornia-slam's `feat/wheel-odom-factor` PR branch (kornia/kornia-slam#158: wheel-odometry VI-BA
+#   factor, stationary IMU init, parallax keyframes, keyframe culling), which this crate needs and
+#   which is not on `main` yet. Pinned to that rev until the PR merges, then to a `main` rev, then
+#   to crates.io at the first release that carries it (v0.1.0 lacks all of it).
+kornia-slam = { git = "https://github.com/kornia/kornia-slam", rev = "512520e5446184d01b3ced70dc5a6bf088477d8e" }
 # The IMU types (`ImuMeasurement`, `ImuBias`, `ImuCalib`, `PreintegratedImu`) are NOT re-exported
 # by kornia-slam — `ImuFactor::{preintegrated, raw_samples}` (inserted via `Map::apply_insertion`)
 # and `ImuInitializer::{try_initialize, apply_initialization}` name them from this crate, so naming
@@ -75,7 +76,7 @@ kornia-slam = { git = "https://github.com/kornia/kornia-slam", rev = "a9f8c529b9
 # so the spec string MUST be spelled exactly as the line above: a different spelling is a
 # different cargo source, which would make `ImuBias` here a DIFFERENT type from the `ImuBias` in
 # `ImuFactor`, with a type error that names the same path twice.
-kornia-sensors = { git = "https://github.com/kornia/kornia-slam", rev = "a9f8c529b9861821a4c410ab94717729fb2ea225" }
+kornia-sensors = { git = "https://github.com/kornia/kornia-slam", rev = "512520e5446184d01b3ced70dc5a6bf088477d8e" }
 kornia-image = "0.2.0"
 kornia-3d = "0.2.0"
 kornia-algebra = "0.2.0"
@@ -95,11 +96,3 @@ cu29-export = { workspace = true }
 [build-dependencies]
 cu29-build = { workspace = true }
 
-# LOCAL ONLY: the wheel-odometry factor (`kornia_slam::mapping::wheel_odom`) lives on the
-# unpublished kornia-slam branch `feat/wheel-odom-factor`, checked out beside this repo. Keyed on
-# the git URL, so it replaces both repo crates above at once and their spec strings stay as they
-# are. Becomes a `rev` of the published branch, and this table goes away, before anything here is
-# pushed.
-[patch."https://github.com/kornia/kornia-slam"]
-kornia-slam = { path = "../kornia-slam/crates/kornia-slam" }
-kornia-sensors = { path = "../kornia-slam/crates/kornia-sensors" }
