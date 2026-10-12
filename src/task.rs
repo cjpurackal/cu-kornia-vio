@@ -762,6 +762,13 @@ impl CuTask for StereoVio {
         {
             info!("vio: gyro prior unavailable on {} frames", n);
         }
+        // Only when non-zero: a coast the wheels did not measure grew at a worst-case rate, so a
+        // published sigma looked worse than the drive was.
+        if let Some(n) = self.tracker.as_ref().map(|t| t.coast_unmeasured())
+            && n > 0
+        {
+            info!("vio: {} coasted frames the wheels did not measure", n);
+        }
         // Only when non-zero, and lifetime counts (a map drop does not zero them): a refused
         // write leaves nothing behind but a thinner map, and a refused BA a map left unrefined.
         if let Some(t) = self.tracker.as_ref()

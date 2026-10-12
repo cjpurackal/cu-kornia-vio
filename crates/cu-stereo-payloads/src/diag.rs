@@ -386,8 +386,12 @@ mod tests {
         assert_eq!(back.motion.verdict, MotionVerdict::WheelsDisagree);
         assert_eq!(back.pose_sigma_xy_m, 0.125);
         assert!(back.pose_sigma_yaw_rad.is_nan());
-        // The two sigmas are the LAST eight bytes, in this order: a field appended anywhere else
-        // shifts every log already written.
+        // The encoding is bincode's positional one: no field names, no lengths, no version. ANY
+        // layout change (a field added anywhere, appended at the end included, removed, retyped
+        // or reordered) makes every log already written undecodable as the new type. These
+        // golden bytes pin the current layout on purpose, so such a change fails here first and
+        // ships as a deliberate format break, not by accident: the two sigmas are the LAST eight
+        // bytes, in this order.
         let n = bytes.len();
         assert_eq!(&bytes[n - 8..n - 4], &0.125f32.to_le_bytes());
         assert_eq!(&bytes[n - 4..], &f32::NAN.to_le_bytes());

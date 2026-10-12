@@ -123,7 +123,7 @@ use crate::imu::{
     preintegration_is_finite, ts_sec, window_excitation,
 };
 use crate::stationary::{NotStill, StaticInitConfig, check_camera, check_imu, check_wheels};
-use crate::wheel::{WheelOdomConfig, WheelSample, WheelState, WheelStats};
+use crate::wheel::{WheelOdomConfig, WheelSample, WheelState, WheelStats, WheelWindowError};
 use cu_stereo_payloads::ImuSample;
 use cu_stereo_payloads::{
     FEATURE_INLIER, FEATURE_OUTLIER, FEATURE_STEREO, FailureReason, FeaturePoint, InertialStage,
@@ -955,15 +955,107 @@ pub struct Tracker {
     /// the world, so the next map's first keyframe starts from where the last one left the
     /// uncertainty (never from zero, which would read as perfectly localised); cleared whenever
     /// the world restarts at identity.
-    coast_origin: Option<(u64, Cov6)>,
+    coast_origin: Option<CoastOrigin>,
+    /// Coasted frames whose interval since the coast origin the wheels did not measure (a gap
+    /// or a discontinuity in the readings, readings pruned under an old origin, a factor that
+    /// would not invert); each grew its covariance by [`CoastOrigin::unmeasured`]. Lifetime.
+    coast_unmeasured: u64,
 }
 
 /// How long a coast's covariance is integrated from one origin before it re-bases on its own
 /// value. The wheel interval it integrates must stay in the readings ring (it is held there,
 /// `prune`), and a minutes-long blind coast would otherwise pin minutes of readings. Each re-base
 /// restarts the interval's floors and its systematic heading term, which a 1 s chunk barely
-/// feels next to the per-metre growth it adds.
+/// feels next to the per-metre growth it adds; the mount term does not restart, it is carried
+/// as the total motion since the measured origin ([`CoastOrigin`]).
 const COAST_REBASE_NS: u64 = 1_000_000_000;
+
+/// How fast a coast's covariance grows over an interval the wheels did not measure, 1 sigma per
+/// second of it, metres and radians: a base driven blind at a brisk walk, turning a radian a
+/// second. A worst case chosen above anything the robot is driven at, not a measured figure;
+/// what matters is that the growth is never lost while the pose keeps moving.
+const COAST_UNMEASURED_M_PER_S: f64 = 0.5;
+/// See [`COAST_UNMEASURED_M_PER_S`].
+const COAST_UNMEASURED_RAD_PER_S: f64 = 1.0;
+/// Unmeasured coast frames ([`Tracker::coast_unmeasured`]): the first is logged, then one in
+/// this many, ~1 min apart at the head's 15 Hz while it persists.
+const COAST_UNMEASURED_WARN_EVERY: u64 = 900;
+
+/// What a coast grows from ([`Tracker::coast_covariance`]). The wheels' measurement noise is
+/// independent from one interval to the next and accumulates chunk by chunk; the camera-to-base
+/// mount term is not: a mount error is systematic, so its effect on the residual depends only on
+/// the TOTAL base motion since the last measured origin, `(I - Ad(dT^-1)) Sigma_e (...)^T` of that
+/// one `dT` ([`crate::fusion::extrinsic_covariance`]). Summed per chunk it would depend on where
+/// the re-bases fell rather than on the motion: a long turn's term (which grows with the whole
+/// angle) came out as a root sum of small ones, and a turn driven back never cancelled.
+#[derive(Debug, Clone, Copy)]
+struct CoastOrigin {
+    /// Where the current chunk is integrated from.
+    stamp_ns: u64,
+    /// The covariance at `stamp_ns`, as published: `accumulated` plus the mount term of
+    /// `since_measured`. World left perturbation, like every covariance here.
+    cov: Cov6,
+    /// The last measured (or anchored) covariance plus every chunk's wheel noise since, moved
+    /// into the world at its own end; no mount term.
+    accumulated: Cov6,
+    /// Base motion from the last measured origin to `stamp_ns`: the chunks' deltas composed.
+    since_measured: Pose3d,
+}
+
+impl CoastOrigin {
+    /// A measured origin, or one taken as such (an anchor, an unmeasured interval): nothing of
+    /// its covariance is left to recompute.
+    fn measured(stamp_ns: u64, cov: Cov6) -> Self {
+        Self {
+            stamp_ns,
+            cov,
+            accumulated: cov,
+            since_measured: Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(0.0, 0.0, 0.0)),
+        }
+    }
+
+    /// Advanced to `stamp_ns` by a chunk the wheels measured: `noise` the measurement's
+    /// covariance and `delta` its base motion (a right perturbation of the END base pose),
+    /// `t_wb` that end pose in the world, `extrinsic` the mount's `[metres, radians]` sigma.
+    fn advanced(
+        &self,
+        stamp_ns: u64,
+        noise: &Cov6,
+        delta: &Pose3d,
+        t_wb: &Pose3d,
+        extrinsic: [f64; 2],
+    ) -> Self {
+        let since_measured = self.since_measured.compose(delta);
+        let ad = covariance::pose_adjoint(t_wb);
+        let accumulated = covariance::add(&self.accumulated, &covariance::congruence(&ad, noise));
+        let mount = crate::fusion::extrinsic_covariance(&since_measured, extrinsic);
+        Self {
+            stamp_ns,
+            cov: covariance::add(&accumulated, &covariance::congruence(&ad, &mount)),
+            accumulated,
+            since_measured,
+        }
+    }
+
+    /// Advanced to `stamp_ns` over an interval nothing measured: the covariance so far (its
+    /// mount term included, which can no longer be recomputed from a total motion nobody saw)
+    /// plus [`COAST_UNMEASURED_M_PER_S`] / [`COAST_UNMEASURED_RAD_PER_S`] for the time elapsed,
+    /// isotropic in the world. Becomes a measured origin: the next chunk restarts the mount
+    /// term from here. Linear in the interval's own length; consecutive unmeasured re-bases add
+    /// their variances, so a blind run of many chunks grows as their root sum.
+    fn unmeasured(&self, stamp_ns: u64) -> Self {
+        let dt = stamp_ns.saturating_sub(self.stamp_ns) as f64 * 1e-9;
+        let (vm, vr) = (
+            (COAST_UNMEASURED_M_PER_S * dt).powi(2),
+            (COAST_UNMEASURED_RAD_PER_S * dt).powi(2),
+        );
+        let mut cov = self.cov;
+        for k in 0..6 {
+            cov[k * 7] += if k < 3 { vm } else { vr };
+        }
+        Self::measured(stamp_ns, cov)
+    }
+}
 
 /// How fast the published pose closes on the tracker's after a rejection run, metres and radians
 /// per second of frame time: 2.5 mm and 0.24 deg a frame at the head's 12 Hz. A run that ended
@@ -1181,6 +1273,7 @@ impl Tracker {
             frame_cov: None,
             frame_rel: None,
             coast_origin: None,
+            coast_unmeasured: 0,
         }
     }
 
@@ -1411,7 +1504,7 @@ impl Tracker {
         // not worth holding readings for.
         let coast_start = self
             .coast_origin
-            .map(|(t, _)| t)
+            .map(|o| o.stamp_ns)
             .filter(|&t| stamp_ns.saturating_sub(t) <= 2 * COAST_REBASE_NS);
         if let Some(w) = self.wheel.as_mut() {
             w.prune([
@@ -1589,6 +1682,12 @@ impl Tracker {
     /// Frames the gyro rotation prior could not be built for. See the field.
     pub fn gyro_prior_unavailable(&self) -> u64 {
         self.gyro_prior_unavailable
+    }
+
+    /// Coasted frames whose interval the wheels did not measure, which grew their covariance at
+    /// the worst-case rate instead. See the field.
+    pub fn coast_unmeasured(&self) -> u64 {
+        self.coast_unmeasured
     }
 
     /// Map writes kornia-slam refused, over the tracker's lifetime. See the field.
@@ -2796,44 +2895,79 @@ impl Tracker {
             .or(Some(last))
     }
 
-    /// The covariance a coast has reached at `stamp_ns`: the origin's, plus the wheels' over the
-    /// interval since (the propagated measurement, with the factor's mount term), moved into the
-    /// world at the coasted pose. The origin's alone without wheels or without readings over the
-    /// interval, and zero when nothing was ever measured (a world being defined, not estimated).
+    /// The coast at `stamp_ns`: its covariance (`cov`) is the origin's, plus the wheels' over
+    /// the interval since (the propagated measurement), plus the mount term of the whole base
+    /// motion since the last measured origin, moved into the world at the coasted pose
+    /// ([`CoastOrigin`]). The origin's alone without wheels, and zero when nothing was ever
+    /// measured (a world being defined, not estimated). `true` with an interval the wheels did
+    /// not measure, which grows by [`CoastOrigin::unmeasured`] instead: a coast whose pose keeps
+    /// moving never hands back the origin's covariance, nor re-bases on it.
     ///
     /// The wheel measurement is a right perturbation of the END base pose, so in the world it is
     /// `Ad(T_wb)` of it, `T_wb = T_wc T_cb` at the end; the origin's left perturbation carries
     /// through the composition unchanged.
-    fn coast_covariance(&self, stamp_ns: u64, pose_cw: &Pose3d) -> Cov6 {
-        let Some((t0, origin)) = self.coast_origin else {
-            return [0.0; 36];
+    fn coast_covariance(&self, stamp_ns: u64, pose_cw: &Pose3d) -> (CoastOrigin, bool) {
+        let Some(origin) = self.coast_origin else {
+            return (CoastOrigin::measured(stamp_ns, [0.0; 36]), false);
         };
         let Some(w) = self.wheel.as_ref() else {
-            return origin;
+            return (CoastOrigin { stamp_ns, ..origin }, false);
         };
-        let Ok(d) = w.delta(t0, stamp_ns, w.cfg.max_gap_ns()) else {
-            return origin;
+        let d = match w.delta(origin.stamp_ns, stamp_ns, w.cfg.max_gap_ns()) {
+            Ok(d) => d,
+            // No time since the origin: nothing to grow.
+            Err(WheelWindowError::NonPositiveInterval) => {
+                return (CoastOrigin { stamp_ns, ..origin }, false);
+            }
+            Err(_) => return (origin.unmeasured(stamp_ns), true),
         };
         let t_cb_to = w.t_cb_at(stamp_ns);
         let extrinsic = self.config.per_frame_fusion.map_or(
             [DEFAULT_EXTRINSIC_SIGMA_M, DEFAULT_EXTRINSIC_SIGMA_RAD],
             |c| [c.extrinsic_sigma_m, c.extrinsic_sigma_rad],
         );
+        let measurement = w.cfg.measurement(&d);
+        // The noise alone (a zero mount sigma adds nothing); the mount term is the origin's.
         let Some(f) = MotionFactor::wheel(
-            &w.cfg.measurement(&d),
-            w.t_cb_at(t0),
+            &measurement,
+            w.t_cb_at(origin.stamp_ns),
             t_cb_to,
             pose_cw,
-            extrinsic,
+            [0.0, 0.0],
         ) else {
-            return origin;
+            return (origin.unmeasured(stamp_ns), true);
         };
-        let measured: Cov6 = std::array::from_fn(|k| f.covariance[k]);
+        let noise: Cov6 = std::array::from_fn(|k| f.covariance[k]);
         let t_wb = pose_cw.inverse().compose(&t_cb_to);
-        covariance::add(
-            &origin,
-            &covariance::congruence(&covariance::pose_adjoint(&t_wb), &measured),
+        (
+            origin.advanced(
+                stamp_ns,
+                &noise,
+                &measurement.delta_pose(),
+                &t_wb,
+                extrinsic,
+            ),
+            false,
         )
+    }
+
+    /// Counts an unmeasured coast frame and says so, rate-limited.
+    fn note_coast_unmeasured(&mut self, frame_idx: usize, stamp_ns: u64) {
+        self.coast_unmeasured += 1;
+        let n = self.coast_unmeasured;
+        if n == 1 || n.is_multiple_of(COAST_UNMEASURED_WARN_EVERY) {
+            let since_ms = self
+                .coast_origin
+                .map_or(0, |o| stamp_ns.saturating_sub(o.stamp_ns) / 1_000_000);
+            warning!(
+                "vio coast: frame {}: the wheels did not measure the {} ms since the coast origin (a gap or \
+                 discontinuity in the readings, or readings already pruned); its covariance grows at the \
+                 worst-case rate instead ({} such frames so far)",
+                frame_idx,
+                since_ms,
+                n
+            );
+        }
     }
 
     /// This frame's covariance, from what `tracking_step` measured or from the coast, and the
@@ -2847,35 +2981,41 @@ impl Tracker {
         let cov = if let Some((base, rel)) = self.frame_rel.take() {
             let base_cov = base
                 .and_then(|k| self.kf_cov.get(&k).copied())
-                .or(self.coast_origin.map(|(_, c)| c))
+                .or(self.coast_origin.map(|o| o.cov))
                 .unwrap_or([0.0; 36]);
             let c = covariance::add(
                 &base_cov,
                 &covariance::world_from_camera_tangent(&rel, &pose_cw),
             );
             if measured {
-                self.coast_origin = Some((stamp_ns, c));
+                self.coast_origin = Some(CoastOrigin::measured(stamp_ns, c));
             }
             Some(c)
         } else if keyframe {
             // A map anchored on this frame at a propagated pose (a carried drop, a loss
             // re-bootstrap) or at the start of a world: the coast's covariance, which is zero for
             // a world that starts here. The anchor is the next coast's origin.
-            let c = self.coast_covariance(stamp_ns, &pose_cw);
-            self.coast_origin = Some((stamp_ns, c));
-            Some(c)
+            let (o, unmeasured) = self.coast_covariance(stamp_ns, &pose_cw);
+            if unmeasured {
+                self.note_coast_unmeasured(frame_idx, stamp_ns);
+            }
+            self.coast_origin = Some(CoastOrigin::measured(stamp_ns, o.cov));
+            Some(o.cov)
         } else if status == TrackingStatus::Skipped
             && self.wheel.is_some()
             && self.world_anchored
             && self.frame_on_wheels
         {
-            let c = self.coast_covariance(stamp_ns, &pose_cw);
-            if let Some((t0, _)) = self.coast_origin
+            let (o, unmeasured) = self.coast_covariance(stamp_ns, &pose_cw);
+            if unmeasured {
+                self.note_coast_unmeasured(frame_idx, stamp_ns);
+            }
+            if let Some(t0) = self.coast_origin.map(|o| o.stamp_ns)
                 && stamp_ns.saturating_sub(t0) >= COAST_REBASE_NS
             {
-                self.coast_origin = Some((stamp_ns, c));
+                self.coast_origin = Some(o);
             }
-            Some(c)
+            Some(o.cov)
         } else {
             None
         };
@@ -4552,8 +4692,10 @@ impl Tracker {
         for c in self.kf_cov.values_mut() {
             *c = covariance::congruence(&ad, c);
         }
-        if let Some((_, c)) = self.coast_origin.as_mut() {
-            *c = covariance::congruence(&ad, c);
+        if let Some(o) = self.coast_origin.as_mut() {
+            // Both world covariances; the motion since the measured origin is the base's own.
+            o.cov = covariance::congruence(&ad, &o.cov);
+            o.accumulated = covariance::congruence(&ad, &o.accumulated);
         }
     }
 
@@ -7248,6 +7390,180 @@ mod tests {
         assert!(
             coasted > 2.0 * tracked.max(0.0),
             "six coasted frames grew the trace {coasted:e}, six tracked ones {tracked:e}"
+        );
+    }
+
+    /// One base step of the coast tests: a turn with a lever arm, so the mount term is not zero.
+    fn coast_chunk() -> Pose3d {
+        Pose3d::new(
+            SO3F64::exp(Vec3F64::new(0.0, 0.0, 0.3)).matrix(),
+            Vec3F64::new(0.2, 0.05, 0.0),
+        )
+    }
+
+    fn assert_cov_close(a: &Cov6, b: &Cov6, what: &str) {
+        let scale = a.iter().chain(b).fold(0.0f64, |m, v| m.max(v.abs()));
+        for k in 0..36 {
+            assert!(
+                (a[k] - b[k]).abs() <= 1e-9 * scale,
+                "{what}: entry {k}: {:e} vs {:e}",
+                a[k],
+                b[k]
+            );
+        }
+    }
+
+    /// The mount error is systematic, so a coast's mount term is that of the TOTAL motion since
+    /// the measured origin: five 1 s chunks of a turn give exactly what one interval of the same
+    /// motion gives, and a turn driven back cancels it. Summed per chunk (as if each chunk had
+    /// its own independent mount error) it came out 4x too small here, and would never cancel.
+    ///
+    /// Red before the fix: every chunk's factor carried its own mount term into the re-base.
+    #[test]
+    fn a_coast_s_mount_term_is_the_total_motion_s_not_the_chunks() {
+        let extrinsic = [0.03, 0.035];
+        let zero = [0.0; 36];
+        let t_wb0 = Pose3d::new(
+            SO3F64::exp(Vec3F64::new(0.0, 0.0, 0.7)).matrix(),
+            Vec3F64::new(1.0, -2.0, 0.3),
+        );
+        let (step, n) = (coast_chunk(), 5u64);
+        let mut chunked = CoastOrigin::measured(0, zero);
+        let (mut t_wb, mut total) = (t_wb0, CoastOrigin::measured(0, zero).since_measured);
+        for k in 1..=n {
+            t_wb = t_wb.compose(&step);
+            total = total.compose(&step);
+            chunked = chunked.advanced(k * COAST_REBASE_NS, &zero, &step, &t_wb, extrinsic);
+        }
+        let single = CoastOrigin::measured(0, zero).advanced(
+            n * COAST_REBASE_NS,
+            &zero,
+            &total,
+            &t_wb,
+            extrinsic,
+        );
+        assert!(
+            position_trace(&single.cov) > 1e-4,
+            "no mount term: the test lost its premise"
+        );
+        assert_cov_close(&chunked.cov, &single.cov, "chunked vs one interval");
+        // The control: one independent mount term per chunk, each at its own end pose.
+        let mut per_chunk = zero;
+        let mut t = t_wb0;
+        for _ in 0..n {
+            t = t.compose(&step);
+            per_chunk = covariance::add(
+                &per_chunk,
+                &covariance::congruence(
+                    &covariance::pose_adjoint(&t),
+                    &crate::fusion::extrinsic_covariance(&step, extrinsic),
+                ),
+            );
+        }
+        assert!(
+            (position_trace(&per_chunk) - position_trace(&single.cov)).abs()
+                > 0.1 * position_trace(&single.cov),
+            "the per-chunk sum matches the total: the test cannot tell them apart"
+        );
+        // Driven back to where it was measured, the mount error cancels.
+        let back = chunked.advanced(
+            (n + 1) * COAST_REBASE_NS,
+            &zero,
+            &total.inverse(),
+            &t_wb0,
+            extrinsic,
+        );
+        assert!(
+            position_trace(&back.cov) < 1e-20,
+            "{:e}",
+            position_trace(&back.cov)
+        );
+    }
+
+    /// The wheels' noise is independent per chunk and keeps accumulating across re-bases.
+    #[test]
+    fn a_coast_s_wheel_noise_accumulates_per_chunk() {
+        let mut noise = [0.0; 36];
+        for k in 0..6 {
+            noise[k * 7] = 1e-4;
+        }
+        let id = CoastOrigin::measured(0, [0.0; 36]).since_measured;
+        let mut o = CoastOrigin::measured(0, [0.0; 36]);
+        for k in 1..=4 {
+            o = o.advanced(k * COAST_REBASE_NS, &noise, &coast_chunk(), &id, [0.0, 0.0]);
+        }
+        assert_cov_close(&o.cov, &noise.map(|v| 4.0 * v), "four chunks of noise");
+        assert_eq!(o.cov, o.accumulated);
+    }
+
+    /// An interval the wheels did not measure grows the covariance at the worst-case rate for
+    /// its length, on top of everything so far (the mount term of the motion before it
+    /// included), and the next chunk restarts from there.
+    #[test]
+    fn an_unmeasured_coast_interval_grows_at_the_worst_case_rate() {
+        let t_wb = Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(0.5, 0.0, 0.0));
+        let o = CoastOrigin::measured(0, [0.0; 36]).advanced(
+            COAST_REBASE_NS,
+            &[0.0; 36],
+            &coast_chunk(),
+            &t_wb,
+            [0.03, 0.035],
+        );
+        let blind = o.unmeasured(3 * COAST_REBASE_NS);
+        assert_eq!(blind.stamp_ns, 3 * COAST_REBASE_NS);
+        assert_eq!(blind.cov, blind.accumulated);
+        for k in 0..6 {
+            let rate = if k < 3 {
+                COAST_UNMEASURED_M_PER_S
+            } else {
+                COAST_UNMEASURED_RAD_PER_S
+            };
+            let grown = blind.cov[k * 7] - o.cov[k * 7];
+            assert!(
+                (grown - (2.0 * rate).powi(2)).abs() < 1e-12,
+                "axis {k}: {grown}"
+            );
+        }
+    }
+
+    /// Readings with a gap longer than `max_gap` under a coast: the interval from the coast
+    /// origin cannot be integrated while the frame-to-frame prior still can, and the coast's
+    /// covariance must keep growing (and the frames be counted) rather than fall back to the
+    /// origin's while the pose keeps moving.
+    ///
+    /// Red before the fix: `coast_covariance` returned the origin's covariance on a failed
+    /// interval, so the trace dropped back to the last measured frame's.
+    #[test]
+    fn a_coast_across_a_reading_gap_never_loses_its_growth() {
+        let mut tracker = scene_tracker_with(|c| c.wheel_odom = Some(scene_wheel_config()));
+        push_scene_wheels(&mut tracker, 0..15);
+        // 15..23 never arrive: 0.6 s between readings 14 and 23, past the 0.5 s `max_gap`.
+        push_scene_wheels(&mut tracker, 23..41);
+        for seq in 0..12 {
+            assert!(matches!(feed(&mut tracker, seq), TrackStatus::Tracked(_)));
+        }
+        let mut last = position_trace(&tracker.frame_covariance().expect("tracked"));
+        let mut coasted_after_gap = 0;
+        for seq in 12..36 {
+            let status = blank_frame(&mut tracker, seq);
+            let Some(cov) = tracker.frame_covariance() else {
+                continue;
+            };
+            if !matches!(status, TrackStatus::Coasting(_)) {
+                continue;
+            }
+            let tr = position_trace(&cov);
+            assert!(tr >= last, "frame {seq}: trace {tr:e} fell below {last:e}");
+            last = tr;
+            coasted_after_gap += usize::from(seq > 23);
+        }
+        assert!(
+            coasted_after_gap > 0,
+            "nothing coasted past the gap: the test lost its premise"
+        );
+        assert!(
+            tracker.coast_unmeasured() > 0,
+            "no unmeasured interval was counted"
         );
     }
 
