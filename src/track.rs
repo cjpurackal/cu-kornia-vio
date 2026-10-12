@@ -245,7 +245,9 @@ pub struct TrackerConfig {
     pub keyframe_max_interval: Option<Time>,
     /// Redundant-keyframe culling at [`Self::max_keyframes`]. `None` — what
     /// [`TrackerConfig::new`] sets — drops the map at the bound, as it always did. `Some` culls
-    /// first and drops only if culling cannot make room; see [`Tracker::cull_for_room`].
+    /// first and drops only if culling cannot make room; see [`Tracker::cull_for_room`]. It
+    /// bounds keyframes, not landmark slots, so `Some` also drops the map once those reach
+    /// `max_keyframes * orb.n_keypoints` ([`Tracker::landmark_slot_cap`]).
     pub keyframe_culling: Option<KeyframeCullingConfig>,
     /// Map-projection tracker thresholds (projection search, PnP).
     pub map_projection: MapProjectionConfig,
@@ -789,15 +791,29 @@ const PARKED_CAMERA_ROTATION_RAD: f64 = 0.008_726_646_259_971_648;
 /// running fast of its nominal rate fills it sooner.
 const PARKED_IMU_RING_MARGIN_S: f64 = 2.0;
 
-/// The tracker's IMU ring capacity: the configured one, grown to span a parked keyframe interval
-/// plus [`PARKED_IMU_RING_MARGIN_S`]. A 10 s interval in the default 2048 (10.24 s at 200 Hz)
-/// evicted the start of the parked edge whenever the IMU led the frame by ~0.25 s, and the edge
-/// and the per-frame IMU prediction were refused as a leading gap.
-fn imu_ring_capacity(inertial: &InertialConfig, wheel: Option<&WheelOdomConfig>) -> usize {
-    let Some(interval) = wheel.and_then(|w| w.parked_keyframe_interval) else {
+/// The tracker's IMU ring capacity: the configured one, grown to span the longest keyframe
+/// interval the config allows, a parked keyframe interval or the policy's
+/// [`TrackerConfig::keyframe_max_interval`], plus [`PARKED_IMU_RING_MARGIN_S`]. A 10 s interval in
+/// the default 2048 (10.24 s at 200 Hz) evicted the start of the parked edge whenever the IMU led
+/// the frame by ~0.25 s, and the edge and the per-frame IMU prediction were refused as a leading
+/// gap.
+fn imu_ring_capacity(
+    inertial: &InertialConfig,
+    wheel: Option<&WheelOdomConfig>,
+    keyframe_max_interval: Option<Time>,
+) -> usize {
+    let longest = [
+        wheel.and_then(|w| w.parked_keyframe_interval),
+        keyframe_max_interval,
+    ]
+    .into_iter()
+    .flatten()
+    .map(|t| t.get::<cu29::units::si::time::second>())
+    .reduce(f64::max);
+    let Some(interval_s) = longest else {
         return inertial.buffer_capacity;
     };
-    let span_s = interval.get::<cu29::units::si::time::second>() + PARKED_IMU_RING_MARGIN_S;
+    let span_s = interval_s + PARKED_IMU_RING_MARGIN_S;
     let need = (inertial.gates.nominal_rate.get::<hertz>() * span_s).ceil();
     // Validated finite and positive; the cast saturates on anything absurd.
     inertial.buffer_capacity.max(need as usize)
@@ -966,9 +982,13 @@ pub struct Tracker {
     /// This frame's covariance, same convention; `None` for a frame with no pose to publish. See
     /// [`Tracker::frame_covariance`].
     frame_cov: Option<Cov6>,
-    /// What `tracking_step` measured this frame: the keyframe the frame's covariance chains from,
-    /// and the frame's covariance relative to it in the camera tangent. Reset every frame.
-    frame_rel: Option<(Option<usize>, Cov6)>,
+    /// What `tracking_step` measured this frame: the covariance of the keyframe the frame's
+    /// covariance chains from, looked up when the base was chosen (`None` when it has none), and
+    /// the frame's covariance relative to it in the camera tangent. Reset every frame. The base's
+    /// covariance and not its id: the same frame's insertion may cull the base before
+    /// `record_covariance` reads it, and a relative covariance measured against one keyframe must
+    /// not be added to another's.
+    frame_rel: Option<(Option<Cov6>, Cov6)>,
     /// What a coast grows from: the last measured frame's stamp and covariance, re-based every
     /// [`COAST_REBASE_NS`] of coasting and at every anchor. Kept across a map drop that carries
     /// the world, so the next map's first keyframe starts from where the last one left the
@@ -979,6 +999,10 @@ pub struct Tracker {
     /// or a discontinuity in the readings, readings pruned under an old origin, a factor that
     /// would not invert); each grew its covariance by [`CoastOrigin::unmeasured`]. Lifetime.
     coast_unmeasured: u64,
+    /// Unmeasured coast frames in the current episode: since the last frame whose covariance the
+    /// wheels or vision measured. What [`COAST_UNMEASURED_WARN_EVERY`] counts, so every episode's
+    /// first frame is logged however many came before it.
+    coast_unmeasured_run: u64,
 }
 
 /// How long a coast's covariance is integrated from one origin before it re-bases on its own
@@ -996,8 +1020,8 @@ const COAST_REBASE_NS: u64 = 1_000_000_000;
 const COAST_UNMEASURED_M_PER_S: f64 = 0.5;
 /// See [`COAST_UNMEASURED_M_PER_S`].
 const COAST_UNMEASURED_RAD_PER_S: f64 = 1.0;
-/// Unmeasured coast frames ([`Tracker::coast_unmeasured`]): the first is logged, then one in
-/// this many, ~1 min apart at the head's 15 Hz while it persists.
+/// Unmeasured coast frames ([`Tracker::coast_unmeasured`]): the first of each episode is logged,
+/// then one in this many, ~1 min apart at the head's 15 Hz while it persists.
 const COAST_UNMEASURED_WARN_EVERY: u64 = 900;
 
 /// What a coast grows from ([`Tracker::coast_covariance`]). The wheels' measurement noise is
@@ -1204,7 +1228,8 @@ impl Tracker {
         }
 
         let inertial = config.inertial.clone().map(|mut c| {
-            c.buffer_capacity = imu_ring_capacity(&c, config.wheel_odom.as_ref());
+            c.buffer_capacity =
+                imu_ring_capacity(&c, config.wheel_odom.as_ref(), config.keyframe_max_interval);
             InertialState::new(c)
         });
         if let Some(inert) = &inertial {
@@ -1294,6 +1319,7 @@ impl Tracker {
             frame_rel: None,
             coast_origin: None,
             coast_unmeasured: 0,
+            coast_unmeasured_run: 0,
         }
     }
 
@@ -1679,17 +1705,43 @@ impl Tracker {
     /// conjunct here is a way to silently disable the bound or to fire it every frame.
     ///
     /// With [`TrackerConfig::keyframe_culling`] on, redundant keyframes are culled first and the
-    /// map is dropped only if that did not bring it back under the bound.
+    /// map is dropped only if that did not bring it back under the bound, or once its landmark
+    /// slots reach [`Self::landmark_slot_cap`]: culling never shrinks those.
     fn arm_map_bound(&mut self, inserted: bool) {
-        if let Some(cap) = self.config.max_keyframes
-            && inserted
-            && self.map.keyframes().len() >= cap
+        let Some(cap) = self.config.max_keyframes else {
+            return;
+        };
+        if !inserted {
+            return;
+        }
+        if self
+            .landmark_slot_cap()
+            .is_some_and(|slots| self.map.map_points().len() >= slots)
         {
+            self.pending_map_reset = true;
+            return;
+        }
+        if self.map.keyframes().len() >= cap {
             self.cull_for_room();
             if self.map.keyframes().len() >= cap {
                 self.pending_map_reset = true;
             }
         }
+    }
+
+    /// The landmark slots a culled map may reach before it is dropped anyway: `max_keyframes`
+    /// times `orb.n_keypoints`, the most a map could hold at the keyframe bound without culling
+    /// (a keyframe creates at most a landmark per feature). `None` unless culling is on.
+    ///
+    /// kornia-slam never compacts `map_points`: a retired landmark keeps its slot, and the
+    /// per-keyframe passes (landmark culling, the live count, each keyframe removal) walk every
+    /// slot. Culling keeps the map alive past the drop that used to clear them, so without this
+    /// the slots, the memory and the insertion cost would grow with the map's lifetime, the
+    /// stall `max_keyframes` exists to prevent.
+    fn landmark_slot_cap(&self) -> Option<usize> {
+        self.config.keyframe_culling.as_ref()?;
+        let cap = self.config.max_keyframes?;
+        Some(cap.saturating_mul(self.config.orb.n_keypoints))
     }
 
     /// Removes redundant keyframes ([`TrackerConfig::keyframe_culling`]); returns how many.
@@ -1715,6 +1767,10 @@ impl Tracker {
                 || !inert.stats.first_refinement_done
                 || !inert.stats.second_refinement_done)
         {
+            debug!(
+                "keyframe culling: the inertial path is not settled, nothing culled keyframes={}",
+                self.map.keyframes().len()
+            );
             return 0;
         }
         let keep: HashSet<usize> = self
@@ -1754,7 +1810,8 @@ impl Tracker {
         self.kf_cov.retain(|idx, _| !removed.contains(idx));
         self.culled_keyframes += removed.len() as u64;
         info!(
-            "keyframe culling: removed={} keyframes={} -> {} imu_edges_merged={}              wheel_edges_merged={} kept_for_edges={} landmarks_retired={} culled_total={}",
+            "keyframe culling: removed={} keyframes={} -> {} imu_edges_merged={} \
+             wheel_edges_merged={} kept_for_edges={} landmarks_retired={} culled_total={}",
             removed.len(),
             before,
             self.map.keyframes().len(),
@@ -1782,9 +1839,12 @@ impl Tracker {
             return;
         }
         warning!(
-            "map bound reached: dropping the map (TrackerConfig::max_keyframes) keyframes={} cap={}",
+            "map bound reached: dropping the map (TrackerConfig::max_keyframes) keyframes={} cap={} \
+             landmark_slots={} slot_cap={}",
             self.map.keyframes().len(),
-            self.config.max_keyframes
+            self.config.max_keyframes,
+            self.map.map_points().len(),
+            self.landmark_slot_cap()
         );
         // Keeps the IMU bias: the map hit a size cap, the sensor did not change.
         self.reset_keeping_calibration();
@@ -2504,7 +2564,7 @@ impl Tracker {
                     } else {
                         self.chain_base(&matches)
                     };
-                    self.frame_rel = Some((base, rel));
+                    self.set_frame_rel(base, rel);
                 }
                 if was_coasting && !rejected {
                     // Where the coast would have gone on this frame: the last one carried by
@@ -2606,9 +2666,10 @@ impl Tracker {
             );
 
             // MAP GROWTH, at info so it survives a production log filter that drops debug.
-            // Nothing culls keyframes, so insertion cost rises with `kfs` until the graph stalls
-            // silently: measured on a Jetson Orin with an OAK-D at 640x400, 757 MB RSS and zero
-            // poses after 2.5 h of clean tracking. This is the curve that sets a keyframe bound.
+            // Unless `keyframe_culling` is on nothing culls keyframes, so insertion cost rises
+            // with `kfs` until the graph stalls silently: measured on a Jetson Orin with an OAK-D
+            // at 640x400, 757 MB RSS and zero poses after 2.5 h of clean tracking. This is the
+            // curve that sets a keyframe bound. Culling bounds `kfs`, not `map_points`.
             //
             // SAMPLED ONLY, with no "slow insertion" escape: past the knee EVERY insertion is
             // slow, so such an escape degenerates to a line per keyframe on exactly the
@@ -2665,7 +2726,7 @@ impl Tracker {
                     rel[k * 7] = VISION_TRANSLATION_SIGMA_FLOOR.powi(2);
                     rel[(k + 3) * 7] = VISION_ROTATION_SIGMA_FLOOR.powi(2);
                 }
-                self.frame_rel = Some((Some(kf_idx), rel));
+                self.set_frame_rel(Some(kf_idx), rel);
                 // Measured (PnP inliers), so it may leave as Tracked — unlike the
                 // re-bootstrap coast below, which must not.
                 return TrackingStatus::Tracked;
@@ -3006,6 +3067,13 @@ impl Tracker {
             .or(Some(last))
     }
 
+    /// Records this frame's covariance `rel`, relative to keyframe `base`, with that keyframe's
+    /// covariance as it is now (see the `frame_rel` field).
+    fn set_frame_rel(&mut self, base: Option<usize>, rel: Cov6) {
+        let base_cov = base.and_then(|k| self.kf_cov.get(&k).copied());
+        self.frame_rel = Some((base_cov, rel));
+    }
+
     /// The coast at `stamp_ns`: its covariance (`cov`) is the origin's, plus the wheels' over
     /// the interval since (the propagated measurement), plus the mount term of the whole base
     /// motion since the last measured origin, moved into the world at the coasted pose
@@ -3062,23 +3130,33 @@ impl Tracker {
         )
     }
 
-    /// Counts an unmeasured coast frame and says so, rate-limited.
-    fn note_coast_unmeasured(&mut self, frame_idx: usize, stamp_ns: u64) {
+    /// Counts a coast frame's covariance as measured or not and says so when not, rate-limited
+    /// per episode; `true` when it logged. A measured one ends the episode.
+    fn note_coast(&mut self, unmeasured: bool, frame_idx: usize, stamp_ns: u64) -> bool {
+        if !unmeasured {
+            self.coast_unmeasured_run = 0;
+            return false;
+        }
         self.coast_unmeasured += 1;
+        self.coast_unmeasured_run += 1;
         let n = self.coast_unmeasured;
-        if n == 1 || n.is_multiple_of(COAST_UNMEASURED_WARN_EVERY) {
+        let run = self.coast_unmeasured_run;
+        let logged = run == 1 || run.is_multiple_of(COAST_UNMEASURED_WARN_EVERY);
+        if logged {
             let since_ms = self
                 .coast_origin
                 .map_or(0, |o| stamp_ns.saturating_sub(o.stamp_ns) / 1_000_000);
             warning!(
                 "vio coast: frame {}: the wheels did not measure the {} ms since the coast origin (a gap or \
                  discontinuity in the readings, or readings already pruned); its covariance grows at the \
-                 worst-case rate instead ({} such frames so far)",
+                 worst-case rate instead ({} such frames in this episode, {} so far)",
                 frame_idx,
                 since_ms,
+                run,
                 n
             );
         }
+        logged
     }
 
     /// This frame's covariance, from what `tracking_step` measured or from the coast, and the
@@ -3089,9 +3167,8 @@ impl Tracker {
         let keyframe = self.state.last_keyframe_idx == Some(frame_idx)
             && self.last_keyframe_stamp_ns == Some(stamp_ns);
         let measured = status != TrackingStatus::Skipped && !self.frame_report.vision_rejected;
-        let cov = if let Some((base, rel)) = self.frame_rel.take() {
-            let base_cov = base
-                .and_then(|k| self.kf_cov.get(&k).copied())
+        let cov = if let Some((base_cov, rel)) = self.frame_rel.take() {
+            let base_cov = base_cov
                 .or(self.coast_origin.map(|o| o.cov))
                 .unwrap_or([0.0; 36]);
             let c = covariance::add(
@@ -3100,6 +3177,7 @@ impl Tracker {
             );
             if measured {
                 self.coast_origin = Some(CoastOrigin::measured(stamp_ns, c));
+                self.note_coast(false, frame_idx, stamp_ns);
             }
             Some(c)
         } else if keyframe {
@@ -3107,9 +3185,7 @@ impl Tracker {
             // re-bootstrap) or at the start of a world: the coast's covariance, which is zero for
             // a world that starts here. The anchor is the next coast's origin.
             let (o, unmeasured) = self.coast_covariance(stamp_ns, &pose_cw);
-            if unmeasured {
-                self.note_coast_unmeasured(frame_idx, stamp_ns);
-            }
+            self.note_coast(unmeasured, frame_idx, stamp_ns);
             self.coast_origin = Some(CoastOrigin::measured(stamp_ns, o.cov));
             Some(o.cov)
         } else if status == TrackingStatus::Skipped
@@ -3118,9 +3194,7 @@ impl Tracker {
             && self.frame_on_wheels
         {
             let (o, unmeasured) = self.coast_covariance(stamp_ns, &pose_cw);
-            if unmeasured {
-                self.note_coast_unmeasured(frame_idx, stamp_ns);
-            }
+            self.note_coast(unmeasured, frame_idx, stamp_ns);
             if let Some(t0) = self.coast_origin.map(|o| o.stamp_ns)
                 && stamp_ns.saturating_sub(t0) >= COAST_REBASE_NS
             {
@@ -3132,8 +3206,8 @@ impl Tracker {
         };
         if keyframe && let Some(c) = cov {
             self.kf_cov.insert(frame_idx, c);
-            // The removal hook: a keyframe the map no longer holds (nothing removes one today; a
-            // keyframe culling would) must not stay a chain base.
+            // The removal hook: a keyframe the map no longer holds must not stay a chain base.
+            // `cull_for_room` purges what it removes; this catches anything else that does.
             if self.kf_cov.len() > self.map.keyframes().len() {
                 let live: HashSet<usize> =
                     self.map.keyframes().iter().map(|k| k.frame.idx).collect();
@@ -10440,6 +10514,198 @@ mod tests {
         assert_eq!(tracker.cull_for_room(), 0);
         tracker.arm_map_bound(true);
         assert!(tracker.pending_map_reset);
+    }
+
+    /// A diagonal covariance, `v` on every axis.
+    fn diag_cov(v: f64) -> Cov6 {
+        std::array::from_fn(|k| if k % 7 == 0 { v } else { 0.0 })
+    }
+
+    /// A frame chains from its base keyframe's covariance as it was when the base was chosen:
+    /// the same frame's insertion can cull that keyframe (it is old and redundant, exactly what
+    /// `chain_base` prefers on a parked robot) before `record_covariance` runs, and the relative
+    /// covariance was measured against it, not against the coast origin.
+    ///
+    /// Mutation: `set_frame_rel` resolving no base covariance (what looking the culled keyframe
+    /// up in `record_covariance` gave) turned this red.
+    #[test]
+    fn a_frame_chained_from_a_keyframe_culled_in_the_same_frame_keeps_its_base() {
+        let mut tracker = parked_map(None, 100);
+        let base = tracker.map().keyframes()[2].frame.idx;
+        let base_cov = diag_cov(1e-6);
+        tracker.kf_cov.insert(base, base_cov);
+        tracker.coast_origin = Some(CoastOrigin::measured(0, diag_cov(1.0)));
+        let rel = diag_cov(4e-6);
+        tracker.set_frame_rel(Some(base), rel);
+        tracker.cull_for_room();
+        assert!(
+            tracker.map().get_keyframe(base).is_none(),
+            "keyframe {base} was not culled: the test lost its point"
+        );
+        assert!(!tracker.kf_cov.contains_key(&base));
+        let frame_idx = tracker.next_frame_idx;
+        tracker.record_covariance(
+            TrackingStatus::Tracked,
+            frame_idx,
+            EPOCH_NS + 200 * FRAME_NS,
+        );
+        let want = covariance::add(
+            &base_cov,
+            &covariance::world_from_camera_tangent(&rel, &tracker.state.pose_world_to_cam),
+        );
+        assert_cov_close(
+            &tracker.frame_covariance().expect("measured"),
+            &want,
+            "chained from the culled base",
+        );
+    }
+
+    /// Culling bounds keyframes, not landmark slots (kornia-slam never compacts them), so a
+    /// culled map is still dropped once its slots reach `max_keyframes * orb.n_keypoints`, the
+    /// most it could have held at the keyframe bound without culling; under the keyframe bound
+    /// and without culling nothing changes.
+    ///
+    /// Mutation: dropping the slot check from `arm_map_bound` turned this red.
+    #[test]
+    fn a_culled_map_is_still_dropped_at_its_landmark_slot_cap() {
+        let mut tracker = parked_map(None, 100);
+        let (kfs, slots) = (
+            tracker.map().keyframes().len(),
+            tracker.map().map_points().len(),
+        );
+        let cap = kfs + 10;
+        tracker.config.max_keyframes = Some(cap);
+        let per_kf = slots / cap;
+        assert!(per_kf >= 1, "{slots} slots: the test lost its premise");
+
+        tracker.config.orb.n_keypoints = per_kf + 1;
+        assert_eq!(tracker.landmark_slot_cap(), Some(cap * (per_kf + 1)));
+        tracker.arm_map_bound(true);
+        assert!(!tracker.pending_map_reset, "under both bounds");
+
+        tracker.config.orb.n_keypoints = per_kf;
+        tracker.arm_map_bound(false);
+        assert!(!tracker.pending_map_reset, "armed only by an insertion");
+        tracker.arm_map_bound(true);
+        assert!(
+            tracker.pending_map_reset,
+            "{slots} slots at a cap of {}",
+            cap * per_kf
+        );
+        assert_eq!(tracker.map().keyframes().len(), kfs, "dropped, not culled");
+
+        tracker.pending_map_reset = false;
+        tracker.config.keyframe_culling = None;
+        assert_eq!(tracker.landmark_slot_cap(), None);
+        tracker.arm_map_bound(true);
+        assert!(
+            !tracker.pending_map_reset,
+            "without culling the slots are not bounded"
+        );
+    }
+
+    /// The IMU ring spans the longest keyframe interval the config allows: a motion-only
+    /// policy's `keyframe_max_interval` as much as a parked interval.
+    ///
+    /// Mutation: leaving `keyframe_max_interval` out of `imu_ring_capacity` turned this red.
+    #[test]
+    fn the_imu_ring_spans_the_policy_s_keyframe_interval() {
+        let inertial = inertial_config();
+        let rate = inertial.gates.nominal_rate.get::<hertz>();
+        let need =
+            |interval_s: f64| ((interval_s + PARKED_IMU_RING_MARGIN_S) * rate).ceil() as usize;
+        assert_eq!(
+            imu_ring_capacity(&inertial, None, None),
+            inertial.buffer_capacity
+        );
+        let long = Some(Time::new::<second>(12.0));
+        assert_eq!(imu_ring_capacity(&inertial, None, long), need(12.0));
+        let mut wheel = scene_wheel_config();
+        wheel.parked_keyframe_interval = Some(Time::new::<second>(11.0));
+        assert_eq!(imu_ring_capacity(&inertial, Some(&wheel), None), need(11.0));
+        assert_eq!(
+            imu_ring_capacity(&inertial, Some(&wheel), long),
+            need(12.0),
+            "the longer of the two"
+        );
+        assert_eq!(
+            imu_ring_capacity(&inertial, None, Some(Time::new::<second>(1.0))),
+            inertial.buffer_capacity,
+            "never below the configured ring"
+        );
+    }
+
+    /// `coast_covariance` counts the mount term once, from the total motion since the measured
+    /// origin: the covariance with a mount sigma minus the one without is exactly that term.
+    ///
+    /// Mutation: passing the mount sigma into the per-chunk `MotionFactor::wheel` again (it was
+    /// counted there and in the origin's total) turned this red: twice the term.
+    #[test]
+    fn a_coast_counts_the_mount_term_once() {
+        let (t0, t1) = (EPOCH_NS, EPOCH_NS + 12 * FRAME_NS);
+        let pose = Pose3d::new(
+            SO3F64::exp(Vec3F64::new(0.1, -0.4, 0.2)).matrix(),
+            Vec3F64::new(0.3, 0.1, -0.2),
+        );
+        let coast = |extrinsic: [f64; 2]| {
+            let mut tracker = scene_tracker_with(|c| {
+                c.wheel_odom = Some(scene_wheel_config());
+                c.per_frame_fusion = Some(FusionConfig {
+                    extrinsic_sigma_m: extrinsic[0],
+                    extrinsic_sigma_rad: extrinsic[1],
+                    ..FusionConfig::default()
+                });
+            });
+            push_scene_wheels(&mut tracker, 0..20);
+            tracker.coast_origin = Some(CoastOrigin::measured(t0, diag_cov(1e-6)));
+            let (o, unmeasured) = tracker.coast_covariance(t1, &pose);
+            assert!(!unmeasured);
+            (tracker, o.cov)
+        };
+        let extrinsic = [0.03, 0.035];
+        let (tracker, with_mount) = coast(extrinsic);
+        let (_, without) = coast([0.0, 0.0]);
+        let w = tracker.wheel.as_ref().unwrap();
+        let delta = w
+            .cfg
+            .measurement(&w.delta(t0, t1, w.cfg.max_gap_ns()).unwrap())
+            .delta_pose();
+        let t_wb = pose.inverse().compose(&w.t_cb_at(t1));
+        let once = covariance::congruence(
+            &covariance::pose_adjoint(&t_wb),
+            &crate::fusion::extrinsic_covariance(&delta, extrinsic),
+        );
+        assert!(
+            position_trace(&once) > 1e-6,
+            "no mount term: the test lost its premise"
+        );
+        let added: Cov6 = std::array::from_fn(|k| with_mount[k] - without[k]);
+        assert_cov_close(&added, &once, "the mount term, once");
+    }
+
+    /// The unmeasured-coast warning is rate-limited per episode: the first frame of every
+    /// episode logs, however many came before it, and a measured frame ends the episode.
+    ///
+    /// Mutation: keying the limit off the lifetime count turned this red (episode two silent).
+    #[test]
+    fn every_unmeasured_coast_episode_logs_its_first_frame() {
+        let mut tracker = scene_tracker(None);
+        let logged: Vec<bool> = (0..3).map(|k| tracker.note_coast(true, k, 0)).collect();
+        assert_eq!(logged, [true, false, false]);
+        assert!(!tracker.note_coast(false, 3, 0));
+        assert!(
+            tracker.note_coast(true, 4, 0),
+            "a new episode logs its first frame"
+        );
+        assert!(!tracker.note_coast(true, 5, 0));
+        assert_eq!(tracker.coast_unmeasured(), 5, "the count stays lifetime");
+        for k in 3..COAST_UNMEASURED_WARN_EVERY {
+            tracker.note_coast(true, k as usize + 4, 0);
+        }
+        assert!(
+            tracker.note_coast(true, 0, 0),
+            "then one in COAST_UNMEASURED_WARN_EVERY of the episode"
+        );
     }
 
     /// Keyframes over `frames` frames at `pos(slot)`.

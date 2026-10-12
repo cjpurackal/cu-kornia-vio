@@ -314,7 +314,11 @@ does not compile against this crate.
   and rebuilt when it reaches the bound. With `"keyframe_culling": (enabled: true)` the tracker
   first removes redundant keyframes there (ORB-SLAM's rule, IMU and wheel edges merged) and drops
   the map only if that cannot make room. Culling waits for a settled inertial path, and while
-  driving few keyframes are redundant: the room comes mostly from stops.
+  driving few keyframes are redundant: the room comes mostly from stops. With the inertial path
+  on, that needs `max_merged_imu_span_s` of at least twice the parked keyframe spacing
+  (`parked_keyframe_interval_s`), which startup checks. Culling bounds keyframes, not landmark
+  slots (kornia-slam never compacts those), so the map is still dropped once it holds
+  `max_keyframes * orb_keypoints` of them.
 
 ## License
 

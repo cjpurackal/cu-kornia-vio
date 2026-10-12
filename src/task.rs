@@ -376,10 +376,45 @@ impl CuTask for StereoVio {
             && keyframe_insertion.policy.max_frames_between == usize::MAX
             && keyframe_insertion.max_interval.is_none()
         {
-            return Err("`keyframe_policy.motion_only` with the `inertial` block needs                         `keyframe_policy.max_interval_s`"
-                .into());
+            return Err(
+                "`keyframe_policy.motion_only` with the `inertial` block needs \
+                 `keyframe_policy.max_interval_s`"
+                    .into(),
+            );
         }
         let keyframe_culling = crate::config::keyframe_culling(config, max_keyframes)?;
+        // A parked keyframe sits between two IMU edges as long as the keyframe spacing while
+        // parked; culling it merges them, and kornia-slam keeps a keyframe whose merge would be
+        // longer than `max_merged_imu_span_sec`. Past half of it no parked keyframe is ever culled
+        // (`kept_for_edges`), the stops give no room and the map drops at the bound as before.
+        let parked_spacing = wheel_odom
+            .as_ref()
+            .and_then(|ron| ron.to_config().ok().flatten())
+            .and_then(|w| w.parked_keyframe_interval)
+            .map(|t| (t, "wheel_odom.parked_keyframe_interval_s"))
+            .or_else(|| {
+                (keyframe_insertion.policy.max_frames_between == usize::MAX)
+                    .then_some(keyframe_insertion.max_interval)
+                    .flatten()
+                    .map(|t| (t, "keyframe_policy.max_interval_s"))
+            })
+            .map(|(t, key)| (t.get::<cu29::units::si::time::second>(), key));
+        if inertial.is_some()
+            && let Some(cull) = keyframe_culling.as_ref()
+            && let Some((spacing_s, key)) = parked_spacing
+            && 2.0 * spacing_s > cull.max_merged_imu_span_sec
+        {
+            return Err(format!(
+                "`keyframe_culling` with the `inertial` block can never cull a parked keyframe: \
+                 `{key}` ({} s) puts an IMU edge that long on each side, and two of them exceed \
+                 `keyframe_culling.max_merged_imu_span_s` ({} s); raise it to at least {} s or \
+                 shorten `{key}`",
+                spacing_s,
+                cull.max_merged_imu_span_sec,
+                2.0 * spacing_s
+            )
+            .into());
+        }
         if inertial.is_some() {
             // Declares the consumer. Until this runs the producer's push is a single atomic
             // load and no lock: the right state for every graph without this block.
@@ -1167,6 +1202,14 @@ mod tests {
 
     /// A `vio` task built from a RON config carrying `entries` (RON map entries).
     fn vio_with_entries(entries: &str) -> CuResult<StereoVio> {
+        vio_with_entries_and_wheel(entries, None)
+    }
+
+    /// [`vio_with_entries`] with `wheel` bound as the wheel resource.
+    fn vio_with_entries_and_wheel(
+        entries: &str,
+        wheel: Option<Arc<WheelQueue>>,
+    ) -> CuResult<StereoVio> {
         let text = format!(
             r#"( tasks: [ ( id: "vio", type: "t::T", config: {{ {entries} }} ) ], cnx: [] )"#
         );
@@ -1180,7 +1223,7 @@ mod tests {
             vio_resources::Resources {
                 imu: Arc::new(ImuQueue::new()),
                 epoch: Arc::new(ResetEpoch::new()),
-                wheel: None,
+                wheel,
                 tap: None,
             },
         )
@@ -1239,9 +1282,82 @@ mod tests {
                  gyro_bias_noise: 0.000002, accel_bias_noise: 0.00004, rate_hz: 200.0)"#;
         let motion = r#""keyframe_policy": (motion_only: true, min_parallax_px: 10.0"#;
         vio_with_entries(&format!("{motion})")).expect("visual-only needs no time bound");
-        assert!(vio_with_entries(&format!("{inertial}, {motion})")).is_err());
+        let unbounded = vio_with_entries(&format!("{inertial}, {motion})"))
+            .err()
+            .expect("an inertial motion-only policy needs a time bound")
+            .to_string();
+        // The message line; the error's display adds an indented context line.
+        let unbounded = unbounded.lines().next().unwrap_or_default();
+        assert!(
+            unbounded.contains("needs `keyframe_policy.max_interval_s`")
+                && !unbounded.contains("  "),
+            "{unbounded}"
+        );
         vio_with_entries(&format!("{inertial}, {motion}, max_interval_s: 1.0)"))
             .expect("bounded in time");
+    }
+
+    /// With the inertial path on, culling is refused when the keyframe spacing while parked puts
+    /// more than `max_merged_imu_span_s` across a parked keyframe (an IMU edge as long as the
+    /// spacing on each side): it could never cull one, and the stops are where the room is.
+    ///
+    /// Mutation: dropping the startup check turned this red (the 5 s parked interval accepted).
+    #[test]
+    fn test_culling_is_refused_when_no_parked_keyframe_could_be_culled() {
+        let inertial = r#""inertial": (
+                 t_bc_rotation: [-1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0],
+                 t_bc_translation: [0.0, 0.0, 0.0],
+                 gyro_noise: 0.00012, accel_noise: 0.0019,
+                 gyro_bias_noise: 0.000002, accel_bias_noise: 0.00004, rate_hz: 200.0)"#;
+        let parked = |interval_s: f64| {
+            format!(
+                r#""wheel_odom": {}"#,
+                WHEEL_BLOCK.replace(")", &format!(", parked_keyframe_interval_s: {interval_s})"))
+            )
+        };
+        let with_wheel =
+            |entries: &str| vio_with_entries_and_wheel(entries, Some(Arc::new(WheelQueue::new())));
+        let cull = r#""max_keyframes": 120, "keyframe_culling": (enabled: true"#;
+        let refused = with_wheel(&format!("{inertial}, {}, {cull})", parked(5.0)))
+            .err()
+            .expect("5 s each side is over the default 3 s merge")
+            .to_string();
+        let refused = refused.lines().next().unwrap_or_default();
+        assert!(
+            refused.contains("wheel_odom.parked_keyframe_interval_s")
+                && refused.contains("can never cull a parked keyframe")
+                && !refused.contains("  "),
+            "{refused}"
+        );
+        with_wheel(&format!(
+            "{inertial}, {}, {cull}, max_merged_imu_span_s: 10.0)",
+            parked(5.0)
+        ))
+        .expect("a merge as long as both edges");
+        with_wheel(&format!("{inertial}, {}, {cull})", parked(1.5))).expect("1.5 s each side");
+        with_wheel(&format!("{}, {cull})", parked(5.0))).expect("no IMU edges to merge");
+        with_wheel(&format!(
+            r#"{inertial}, {}, "max_keyframes": 120, "keyframe_culling": (enabled: false)"#,
+            parked(5.0)
+        ))
+        .expect("culling off");
+
+        // A motion-only policy without the parked gate spaces parked keyframes by its time bound.
+        let motion = r#""keyframe_policy": (motion_only: true, min_parallax_px: 10.0"#;
+        let refused = vio_with_entries(&format!(
+            "{inertial}, {motion}, max_interval_s: 2.0), {cull})"
+        ))
+        .err()
+        .expect("2 s each side is over 3 s")
+        .to_string();
+        assert!(
+            refused.contains("keyframe_policy.max_interval_s"),
+            "{refused}"
+        );
+        vio_with_entries(&format!(
+            "{inertial}, {motion}, max_interval_s: 1.0), {cull})"
+        ))
+        .expect("1 s each side");
     }
 
     #[test]
