@@ -92,8 +92,8 @@ cnx: [
   `on_tracking_loss` (`keep_map`, the default, or `reset_map` for a long-running graph),
   `max_keyframes`, `orb_keypoints`, `search_radius_px`, `max_covisible_keyframes`,
   `pnp_lm_iterations`, `inertial`, `landmark_buffers`, `wheel_odom`, `per_frame_fusion`,
-  `keyframe_policy` (insertion thresholds, parallax, a time bound), `keyframe_culling` and
-  `stationary_edges`;
+  `keyframe_policy` (insertion thresholds, parallax, a time bound), `keyframe_culling`,
+  `stationary_edges` and `motion_veto` (on when absent; see Motion veto);
   `cu_kornia_vio::config::CONFIG_KEYS` lists them. Its `Freezable` is a no-op (the kornia-slam
   map has no serialised form), so a resim of a `background: true` graph reproduces it only from
   the start of a log; see Known limitations.
@@ -304,7 +304,7 @@ means false closures).
 ## Per-frame fusion
 
 Off by default. Without it the IMU and the wheels only seed each frame's PnP and meet vision in
-keyframe local BA; the published pose is PnP's. With `"per_frame_fusion": (enabled: true)` each
+keyframe local BA; the published pose is PnP's unless the motion veto (below) refuses it. With `"per_frame_fusion": (enabled: true)` each
 tracked frame's pose is optimized against its map matches (Huber), the IMU preintegrated from the
 last keyframe at its bias and velocity (rotation; position once gravity is settled: a still-window
 initialization or the second refinement) and the wheels from the last keyframe (the BA factor and
@@ -318,11 +318,47 @@ Two gates, at `chi2_gate` (a 6-DOF value scaled to each test's degrees of freedo
   disagrees with the gyro's);
 - vision against the remaining prediction: past the gate the frame publishes the prediction as
   `Coasting` (`FailureReason::VisionRejected`) and leaves the map untouched. After 15 rejections
-  in a row the next frame's vision is accepted and the fusion waits for the next keyframe.
+  in a row the next frame's vision is accepted, if the motion veto passes it, and the fusion waits
+  for the next keyframe.
 
 `VioDiagnostics::fusion` carries the counts (frames, rejects, expired runs, wheel and IMU drops),
 this frame's chi2 and whether it was rejected. See the `fusion` module docs for the model and its
 assumptions, none of which is measured on the robot yet.
+
+## Motion veto
+
+On by default (`"motion_veto": (enabled: false)` turns it off). It is the last gate on every pose
+the tracker is about to adopt and publish: the tracked or fused pose whatever the fusion did, a
+relocalization, and a local BA's result. A pose that the gyro (rotation) or the wheels
+(translation of the camera centre) contradict is never published and never written to the map.
+Each sensor is checked only when it measured the interval, so with neither nothing is checked.
+
+- **Bounds.** 10 deg and 0.3 m, growing by 2 deg/s and 0.1 m/s since the last trusted pose and by
+  0.2 of the rotation and distance the sensors measured since (`rotation_deg`, `translation_m`,
+  `rotation_deg_per_s`, `translation_m_per_s`, `motion_fraction`).
+- **Cumulative.** The candidate is checked against the previous pose carried by this frame's
+  gyro and wheel increment, and also against every trusted pose of the last
+  `rotation_window_s` (5 s) for rotation and `translation_window_s` (0.5 s) for translation, each
+  carried forward by the dead reckoning since. Vision that drifts or freezes below the per-frame
+  bound (a frozen view in a slow turn) is therefore still vetoed. The translation window is short
+  because over seconds a frozen view and wheels spinning in place look alike.
+- **Vetoed frames** publish the gyro and wheel dead reckoning as `Coasting`
+  (`FailureReason::VisionVetoed`) with a growing covariance, or as `NotLocalized` when the wheels
+  did not measure the frame (the translation is then a constant-velocity guess).
+- **Recovery.** After a veto, or a tracking DEGRADED verdict from the keyframe-level motion check,
+  vision is accepted again only after `recovery_frames` (5) consecutive frames agree with the dead
+  reckoning within half the bounds. Vision itself is checked, not the fusion's prediction. Frames
+  held this way are also `VisionVetoed` coasts, with `vio_diag`'s `veto.vetoed` false. If vision
+  never agrees within `recovery_timeout_s` (3 s), the map is dropped and re-anchored at the
+  dead-reckoned pose (the world stays continuous with wheels). The suspect interval leaving the BA
+  window only lets local BA run again; it never recovers the pose in place.
+- **BA gate.** A local BA is refused when it moved any keyframe past the bounds from its pre-BA
+  pose, or the newest keyframe away from the dead reckoning of the trusted poses (so repeated
+  small moves cannot add up). The map already holds the solve, so it is dropped next frame and
+  re-anchored at the pre-BA pose, which is the one kept and published.
+
+`vio_diag`'s `veto` record counts vetoes, dead-reckoned frames, recoveries, timeout re-anchors and
+refused BA solves.
 
 ## Documentation and development
 
