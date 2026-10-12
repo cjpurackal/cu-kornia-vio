@@ -388,13 +388,84 @@ mod tests {
         assert!(back.pose_sigma_yaw_rad.is_nan());
         // The encoding is bincode's positional one: no field names, no lengths, no version. ANY
         // layout change (a field added anywhere, appended at the end included, removed, retyped
-        // or reordered) makes every log already written undecodable as the new type. These
-        // golden bytes pin the current layout on purpose, so such a change fails here first and
-        // ships as a deliberate format break, not by accident: the two sigmas are the LAST eight
-        // bytes, in this order.
+        // or reordered) makes every log already written undecodable as the new type.
+        // `test_diagnostics_golden_bytes` pins the whole layout; this only checks the two sigmas
+        // close the encoding, NaN included.
         let n = bytes.len();
         assert_eq!(&bytes[n - 8..n - 4], &0.125f32.to_le_bytes());
         assert_eq!(&bytes[n - 4..], &f32::NAN.to_le_bytes());
+    }
+
+    /// Every field set to a value no other field of its type holds, so the golden bytes below
+    /// change on ANY layout change: a field added (anywhere), removed, retyped, or two of the
+    /// same type swapped.
+    fn every_field_distinct() -> VioDiagnostics {
+        VioDiagnostics {
+            seq: 1,
+            frames: 2,
+            skipped_frames: 3,
+            state: TrackingState::Recovering,
+            failure: FailureReason::LowReferenceCorrespondences,
+            keyframe: true,
+            relocalized: false,
+            keypoints: 4,
+            stereo_matches: 5,
+            inliers: 6,
+            consecutive_failures: 7,
+            map_points: 8,
+            keyframes: 9,
+            map_drops: 10,
+            reset_epoch: 11,
+            map_generation: 12,
+            solve_ms: 1.5,
+            vision_degraded: true,
+            inertial_stage: InertialStage::Initial,
+            gyro_bias: [2.5, 3.5, 4.5],
+            accel_bias: [5.5, 6.5, 7.5],
+            motion: MotionCheck {
+                checks: 13,
+                verdict: MotionVerdict::GyroDisagrees,
+                translation_disagrees: true,
+                wheels_deg: 8.5,
+                gyro_deg: 9.5,
+                vision_deg: 10.5,
+                wheels_mm: 11.5,
+                vision_mm: 12.5,
+                oop_z_mm: 13.5,
+                oop_roll_deg: 14.5,
+                oop_pitch_deg: 15.5,
+                path_m: 16.5,
+            },
+            fusion: FusionCheck {
+                frames: 14,
+                rejects: 15,
+                wheel_dropped: 16,
+                chi2: 17.5,
+                dof: 17,
+                rejected: true,
+                cost_us: 18,
+                reject_runs_expired: 19,
+                imu_dropped: 20,
+            },
+            pose_sigma_xy_m: 18.5,
+            pose_sigma_yaw_rad: 19.5,
+        }
+    }
+
+    /// The whole recorded layout, byte for byte. A failure here is a blackbox format break:
+    /// every log already written stops decoding as the new type. Ship it deliberately (a new
+    /// golden, and a note for the log readers), never by accident.
+    #[test]
+    fn test_diagnostics_golden_bytes() {
+        const GOLDEN: &str = concat!(
+            "010203030701000405060708090a0b0c0000c03f010300002040000060400000",
+            "90400000b0400000d0400000f0400d0401000008410000184100002841000038",
+            "4100004841000058410000684100007841000084410e0f1000008c4111011213",
+            "140000944100009c41",
+        );
+        let bytes = bincode::encode_to_vec(every_field_distinct(), standard()).expect("encode");
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, GOLDEN, "VioDiagnostics' recorded layout changed");
     }
 
     #[test]

@@ -409,7 +409,8 @@ pub struct WheelStats {
     /// silent or on another clock, and the wheels are not being used.
     pub frames_uncovered: u64,
     /// Keyframes kornia-slam's policy asked for and the parked gate withheld; see
-    /// [`WheelOdomConfig::parked_keyframe_interval`].
+    /// [`WheelOdomConfig::parked_keyframe_interval`]. Counted once per keyframe interval: past its
+    /// frame budget the policy asks again on every frame, and those frames are one keyframe.
     pub parked_keyframes_skipped: u64,
 }
 

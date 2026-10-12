@@ -175,7 +175,7 @@ pub(crate) struct InertialRon {
 ///   window_s: 1.2,            // contiguous IMU edges the still window must span
 ///   accel_rms_max: 0.186,     // m/s^2, accelerometer vector spread
 ///   gyro_rms_max: 0.0118,     // rad/s, gyroscope vector spread
-///   gyro_mean_max: 0.02,      // rad/s, largest believable gyro bias
+///   gyro_mean_max: 0.02,      // rad/s, largest believable gyro bias; capped at gyro_bias_limit
 ///   gravity_tolerance: 0.3,   // m/s^2, | |mean accel| - 9.81 |
 /// ),
 /// ```
@@ -304,6 +304,13 @@ impl InertialRon {
                 &cfg.calib,
                 cfg.gates.nominal_rate,
             ))?;
+        }
+        // A still window's mean gyro rate IS its bias estimate, and one over the gyro bias limit
+        // is always refused after the window is accepted. Capped here, the window itself is
+        // refused for its gyro mean, which names the cause, instead of a found window refused
+        // on every `init_retry`.
+        if let Some(s) = cfg.static_init.as_mut() {
+            s.gyro_mean_max = s.gyro_mean_max.min(cfg.bias_limit.gyro_rad_s);
         }
         Ok(cfg)
     }
@@ -655,10 +662,11 @@ pub(crate) fn keyframe_insertion(config: Option<&ComponentConfig>) -> CuResult<K
 /// Enabled, it needs `max_keyframes`: that is what it acts at. It bounds keyframes only: retired
 /// landmarks keep their slot, so the map is still dropped once it holds
 /// `max_keyframes * orb_keypoints` landmark slots. With the `inertial` block on, the keyframe
-/// spacing while parked (`wheel_odom.parked_keyframe_interval_s`, or a motion-only
-/// `keyframe_policy.max_interval_s`) plus 0.25 s must be at most half `max_merged_imu_span_s`:
-/// a parked keyframe sits between two such IMU edges, each up to a frame longer than the
-/// interval, and a merge longer than the bound is kept.
+/// spacing while parked plus 0.25 s must be at most half `max_merged_imu_span_s`: a parked
+/// keyframe sits between two such IMU edges, each up to a frame longer than the interval, and a
+/// merge longer than the bound is kept. That spacing is the longer of
+/// `wheel_odom.parked_keyframe_interval_s` and the policy's own bound, the sooner of
+/// `keyframe_policy.max_interval_s` and `max_frames_between` frames at 140 ms each.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct KeyframeCullingRon {
@@ -759,6 +767,12 @@ pub(crate) fn keyframe_culling(
             "`keyframe_culling.min_keyframes` ({}) must be below `{MAX_KEYFRAMES}` ({cap}), or \
              culling can never make room",
             cfg.min_keyframes
+        )
+        .into()),
+        Some(cap) if cfg.protect_newest >= cap => Err(format!(
+            "`keyframe_culling.protect_newest` ({}) must be below `{MAX_KEYFRAMES}` ({cap}), or \
+             culling can never make room",
+            cfg.protect_newest
         )
         .into()),
         Some(_) => Ok(Some(cfg)),
@@ -942,6 +956,18 @@ mod tests {
         let tuned = cfg(", accel_bias_limit: Some(0.8)").unwrap().bias_limit;
         assert_eq!(tuned.accel_m_s2, 0.8);
         assert_eq!(tuned.gyro_rad_s, crate::BiasLimit::DEFAULT_GYRO_RAD_S);
+        // The still window's gyro mean is capped at the gyro bias limit: a window over it could
+        // only be refused by the limit after it was found.
+        let capped = cfg(", gyro_bias_limit: Some(0.01), static_init: Some((enabled: true))")
+            .unwrap()
+            .static_init
+            .expect("enabled");
+        assert_eq!(capped.gyro_mean_max, 0.01);
+        let kept = cfg(", static_init: Some((enabled: true))")
+            .unwrap()
+            .static_init
+            .expect("enabled");
+        assert_eq!(kept.gyro_mean_max, 0.02, "under the default limit");
         for bad in ["gyro_bias_limit: Some(0.0)", "accel_bias_limit: Some(-1.0)"] {
             assert!(
                 matches!(

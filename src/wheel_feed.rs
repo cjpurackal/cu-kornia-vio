@@ -71,6 +71,14 @@ impl CuSinkTask for WheelFeed {
         };
         let Some(stamp_ns) = stamp_ns(input.tov) else {
             self.untimed += 1;
+            // Once, at the first: a source that never stamps its tov leaves the wheels off for
+            // good, and the count in `stop` is the only other trace.
+            if self.untimed == 1 {
+                warning!(
+                    "wheel_feed: a wheel reading carries no tov and is dropped; the tracker \
+                     gets no wheel odometry until the source stamps its messages"
+                );
+            }
             return Ok(());
         };
         self.wheel.push_odom(WheelSample {
@@ -127,6 +135,12 @@ impl CuSinkTask for MountFeed {
         };
         let Some(stamp_ns) = stamp_ns(input.tov) else {
             self.untimed += 1;
+            if self.untimed == 1 {
+                warning!(
+                    "mount_feed: a camera mount carries no tov and is dropped; the tracker \
+                     keeps the configured mount until the source stamps its messages"
+                );
+            }
             return Ok(());
         };
         // Camera-in-base on the wire; the factor takes base-to-camera. Inverted once, here.

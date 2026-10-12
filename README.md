@@ -9,8 +9,8 @@ input edge and can run with `background: true`.
 
 ## Crates
 
-- **`cu-kornia-vio`**: the tasks (`StereoVio`, `ImuFeed`, `WheelFeed`, `MountFeed`) and the
-  `VioBus` resource bundle.
+- **`cu-kornia-vio`**: the tasks (`StereoVio`, `ImuFeed`, `WheelFeed`, `MountFeed`,
+  `VioTapSource`) and the `VioBus` resource bundle.
 - **`cu-stereo-payloads`**: the wire types alone. It depends on cu29, the upstream copper
   payload crates, bincode and serde and nothing else, so a stereo driver can name the types it
   produces without depending on `cu-kornia-vio` and, through it, on kornia-slam. That is the whole
@@ -79,9 +79,11 @@ cnx: [
 ],
 ```
 
-- **`VioBus`** is a resource bundle with three members: `imu`, a bounded queue of IMU samples,
+- **`VioBus`** is a resource bundle with four members: `imu`, a bounded queue of IMU samples,
   `reset_epoch`, a counter a caller bumps with `ResetEpoch::request` to drop the map on the next
-  frame, and `wheel`, a bounded queue of wheel readings and camera mounts. Each bus instance is independent, so two estimators in one graph need two buses.
+  frame, `wheel`, a bounded queue of wheel readings and camera mounts, and `tap`, the latest
+  frame's diagnostics for `VioTapSource` (below). Each bus instance is independent, so two
+  estimators in one graph need two buses.
 - **`ImuFeed<N>`** is an inline sink that pushes each `ImuBatch<N>` into the bus queue. Its `N`
   must match the source's batch capacity. The queue is armed only when `StereoVio` has an
   `inertial` config block; without one the push is a single atomic load.
@@ -94,6 +96,21 @@ cnx: [
   `cu_kornia_vio::config::CONFIG_KEYS` lists them. Its `Freezable` is a no-op (the kornia-slam
   map has no serialised form), so a resim of a `background: true` graph reproduces it only from
   the start of a log; see Known limitations.
+- **`VioTapSource`** is an inline source that emits what the tracker saw and concluded on each
+  processed frame: `VioDiagnostics` (tracking state, failure reason, inertial stage and biases,
+  the motion check, the fusion verdict, pose sigmas) and `VioFrame` (the solved `StereoPair`, a
+  refcount on the camera's buffers, plus its classified keypoints). It is the only place a lost,
+  recovering or vision-rejected frame shows up, because an untracked frame carries no `VioPose`.
+  Bind `"tap": "bus.tap"` on both `StereoVio` and the source; the tap is inert (one atomic load
+  per frame) until a source arms it. Its one config key, `frames` (default `true`), set to
+  `false` emits the diagnostics alone and retains no camera buffer.
+
+```ron
+( id: "vio_tap", type: "cu_kornia_vio::VioTapSource", config: { "frames": false },
+  resources: { "tap": "bus.tap" } ),
+// cnx: ( src: "vio_tap", dst: "status", msg: "cu_stereo_payloads::VioDiagnostics" ),
+//      ( src: "vio_tap", dst: "viewer", msg: "cu_stereo_payloads::VioFrame" ),
+```
 
 Why the IMU does not ride a second input: `CuAsyncTask`, which `background: true` wraps a task
 in, accepts a single input message. And while a solve is running the background task refuses the

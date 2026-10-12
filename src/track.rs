@@ -547,6 +547,18 @@ impl SystemState {
 /// gravity direction and the staged initialization's progress live nowhere in the library —
 /// `SlamSystem` owns them privately, and this tracker does not use `SlamSystem`. This struct is
 /// that ownership.
+/// How far the staged initialization had got when a map drop carried the alignment: the next
+/// bootstrap restores exactly this, so a carried world that was never refined still gets its
+/// refinements, and one under a stationary hold keeps waiting for motion. See
+/// [`InertialState::carried_alignment`].
+#[derive(Debug, Clone, Copy)]
+struct CarriedProgress {
+    first_refinement_done: bool,
+    second_refinement_done: bool,
+    static_hold: Option<StaticHold>,
+    applied_stage: Option<InitStage>,
+}
+
 /// The keyframe a stationary initialization holds the refinements at, and its pose then. See
 /// [`InertialState::static_hold`].
 #[derive(Debug, Clone, Copy)]
@@ -601,7 +613,11 @@ struct InertialState {
     /// (a dark room) can defer the adoption by minutes: a velocity from before the drop says
     /// nothing about the robot when the next map starts. The anchor's velocity is measured at
     /// the bootstrap instead, from the wheels, or the alignment is not adopted.
-    carried_alignment: bool,
+    ///
+    /// The staged initialization's progress rides along AS IT WAS ([`CarriedProgress`]): a world
+    /// carried right after a motion solve still has gravity from that solve, and marking the
+    /// refinements spent would switch the IMU position rows on against it and never correct it.
+    carried_alignment: Option<CarriedProgress>,
     /// Set when a stationary initialization was applied: the newest keyframe of its still
     /// window. While set the refinements wait. On parked data they cannot separate the
     /// accelerometer bias from tilt any better than the still window did, yet an accepted one
@@ -616,12 +632,18 @@ struct InertialState {
     /// again for `init_retry`, as the motion solve is throttled after its own refusals. Without
     /// it a refused alignment re-ran the search and the apply, and warned, on every keyframe.
     static_map_refused_at: Option<f64>,
+    /// Set when the refinement schedule ran out (50 s into the window) with a refinement never
+    /// run: an initial solve accepted late, or keyframes too sparse to reach both stages. The
+    /// stage stays where it is (the IMU position rows stay off), but nothing is pending any more,
+    /// so culling, which waits for pending refinements, may run. Cleared whenever the window is
+    /// re-armed.
+    refinements_lapsed: bool,
     /// Test-only fault injection: empties the stationary result's velocities so the map refuses
     /// it (`MissingVelocities`), the one way to reach the map-refusal path from a real window.
     #[cfg(test)]
     refuse_static_alignment: bool,
     /// The stage of the last APPLIED initialization, for diagnostics; `None` until one, and
-    /// after a reset (a carried alignment then reads as the motion solve's).
+    /// after a reset (a carried alignment restores it with the rest of [`CarriedProgress`]).
     applied_stage: Option<InitStage>,
     /// Counters, plus the staged initialization's progress (`first_refinement_done` / `second_refinement_done` mark the
     /// first and second refinement, live here and nowhere else, and are read by the ladder and
@@ -645,14 +667,25 @@ impl InertialState {
             last_window_log: None,
             dry_run_accepted: false,
             last_static_log: None,
-            carried_alignment: false,
+            carried_alignment: None,
             static_hold: None,
             static_map_refused_at: None,
+            refinements_lapsed: false,
             applied_stage: None,
             #[cfg(test)]
             refuse_static_alignment: false,
             stats: InertialStats::default(),
             cfg,
+        }
+    }
+
+    /// The staged initialization's progress, to carry across a map drop that keeps the world.
+    fn progress(&self) -> CarriedProgress {
+        CarriedProgress {
+            first_refinement_done: self.stats.first_refinement_done,
+            second_refinement_done: self.stats.second_refinement_done,
+            static_hold: self.static_hold,
+            applied_stage: self.applied_stage,
         }
     }
 
@@ -690,9 +723,10 @@ impl InertialState {
         self.last_window_log = None;
         self.dry_run_accepted = false;
         self.last_static_log = None;
-        self.carried_alignment = false;
+        self.carried_alignment = None;
         self.static_hold = None;
         self.static_map_refused_at = None;
+        self.refinements_lapsed = false;
         self.applied_stage = None;
         self.stats.first_refinement_done = false;
         self.stats.second_refinement_done = false;
@@ -800,17 +834,41 @@ const PARKED_CAMERA_ROTATION_RAD: f64 = 0.008_726_646_259_971_648;
 /// running fast of its nominal rate fills it sooner.
 const PARKED_IMU_RING_MARGIN_S: f64 = 2.0;
 
+/// The slowest a backgrounded solve processes frames on the robot, seconds per frame: 70-140 ms
+/// apart at 15 fps, every frame or every other. Turns the keyframe policy's frame-count bound
+/// (`max_frames_between`) into the time it can take on a parked robot, where parallax and the
+/// reference ratio never fire and that bound alone sets the keyframe spacing.
+pub(crate) const SLOWEST_FRAME_PERIOD_S: f64 = 0.14;
+
+/// How long a parked robot can go between keyframes on the keyframe policy alone, seconds: the
+/// sooner of its frame-count bound (at [`SLOWEST_FRAME_PERIOD_S`]) and `keyframe_max_interval`.
+/// `None` when neither bounds it (a motion-only policy with no time bound).
+pub(crate) fn policy_keyframe_bound_s(
+    max_frames_between: usize,
+    keyframe_max_interval: Option<Time>,
+) -> Option<f64> {
+    let frames = (max_frames_between != usize::MAX)
+        .then_some(max_frames_between as f64 * SLOWEST_FRAME_PERIOD_S);
+    let time = keyframe_max_interval.map(|t| t.get::<cu29::units::si::time::second>());
+    [frames, time].into_iter().flatten().reduce(f64::min)
+}
+
 /// The tracker's IMU ring capacity: the configured one, grown to span the longest keyframe
-/// interval the config allows, a parked keyframe interval or the policy's
-/// [`TrackerConfig::keyframe_max_interval`], plus [`PARKED_IMU_RING_MARGIN_S`]. A 10 s interval in
-/// the default 2048 (10.24 s at 200 Hz) evicted the start of the parked edge whenever the IMU led
-/// the frame by ~0.25 s, and the edge and the per-frame IMU prediction were refused as a leading
-/// gap.
+/// interval the config allows, a parked keyframe interval, the policy's
+/// [`TrackerConfig::keyframe_max_interval`] or its frame-count bound at
+/// [`SLOWEST_FRAME_PERIOD_S`], plus [`PARKED_IMU_RING_MARGIN_S`]. Deliberately the longest of all
+/// three, not the policy's sooner bound: an over-sized ring costs a few kB, an evicted edge start
+/// costs the edge. A 10 s interval in the default 2048 (10.24 s at 200 Hz) evicted the start of
+/// the parked edge whenever the IMU led the frame by ~0.25 s, and the edge and the per-frame IMU
+/// prediction were refused as a leading gap.
 fn imu_ring_capacity(
     inertial: &InertialConfig,
     wheel: Option<&WheelOdomConfig>,
     keyframe_max_interval: Option<Time>,
+    max_frames_between: usize,
 ) -> usize {
+    let frames_s = (max_frames_between != usize::MAX)
+        .then_some(max_frames_between as f64 * SLOWEST_FRAME_PERIOD_S);
     let longest = [
         wheel.and_then(|w| w.parked_keyframe_interval),
         keyframe_max_interval,
@@ -818,6 +876,7 @@ fn imu_ring_capacity(
     .into_iter()
     .flatten()
     .map(|t| t.get::<cu29::units::si::time::second>())
+    .chain(frames_s)
     .reduce(f64::max);
     let Some(interval_s) = longest else {
         return inertial.buffer_capacity;
@@ -913,6 +972,11 @@ pub struct Tracker {
     wheel: Option<WheelState>,
     /// Whether the current frame's prior came from the wheels. Reset at the top of every frame.
     frame_on_wheels: bool,
+    /// Whether the current frame's prior ROTATION came from the gyro (`predict_pose`), at the
+    /// current bias estimate: a coast then turns with the gyro, not the wheels, and its
+    /// covariance carries the bias's drift ([`gyro_bias_coast_sigma`]). Reset with
+    /// `frame_on_wheels`.
+    frame_on_gyro: bool,
     /// Whether a world exists that a pose can stay continuous in: set by every bootstrap,
     /// cleared by a requested [`reset`](Self::reset). With wheels it is what lets a map drop
     /// carry the pose into the next map instead of restarting at identity.
@@ -945,6 +1009,12 @@ pub struct Tracker {
     /// integrates the gyro at. The CURRENT bias may already hold part of what it is checking (a
     /// bias local BA absorbed under the limit, ~1.9 deg per keyframe interval at 0.05 rad/s),
     /// which would make the gyro side with frozen vision.
+    ///
+    /// Cleared whenever the bias it was taken from is superseded wholesale: an applied
+    /// initialization (a dedicated solve, not a BA drift) and a reset that does not keep the
+    /// bias. Left set, a check locked on a stale bias: on long parked intervals the gyro
+    /// integrated at it disagreed with the wheels and vision every time, so no Consistent verdict
+    /// ever refreshed it.
     consistent_gyro_bias: Option<Vec3F64>,
     /// Local BA updates refused for an implausible bias in a row; see
     /// [`BIAS_REFUSALS_BEFORE_DROP`].
@@ -975,6 +1045,10 @@ pub struct Tracker {
     /// relocalization moves the pose, since every frame predicted from that keyframe would carry
     /// the same stale prediction. Frame indices only grow, so the next keyframe ends it.
     fusion_suspended_on: Option<usize>,
+    /// The last keyframe the parked gate counted a withheld keyframe after: once the policy's
+    /// frame budget has passed it asks again on EVERY frame, and each of those is the same
+    /// withheld keyframe, so `parked_keyframes_skipped` counts once per keyframe interval.
+    parked_skip_counted_for: Option<usize>,
     /// The last tracked frame's PnP pose and the pose it was given (fused, or the same):
     /// `(frame idx, vision, published)`. What the keyframe motion check records as vision's word.
     vision_pose: Option<(usize, Pose3d, Pose3d)>,
@@ -1021,10 +1095,31 @@ pub struct Tracker {
 /// How long a coast's covariance is integrated from one origin before it re-bases on its own
 /// value. The wheel interval it integrates must stay in the readings ring (it is held there,
 /// `prune`), and a minutes-long blind coast would otherwise pin minutes of readings. Each re-base
-/// restarts the interval's floors and its systematic heading term, which a 1 s chunk barely
-/// feels next to the per-metre growth it adds; the mount term does not restart, it is carried
-/// as the total motion since the measured origin ([`CoastOrigin`]).
+/// of a MOVING coast restarts the interval's floors and its systematic heading term, which a 1 s
+/// chunk barely feels next to the per-metre growth it adds; a parked chunk's floors are not
+/// re-added ([`CoastOrigin::held`]), since next to no growth they are all there is. The mount
+/// term does not restart, it is carried as the total motion since the measured origin
+/// ([`CoastOrigin`]).
 const COAST_REBASE_NS: u64 = 1_000_000_000;
+
+/// The rotation sigma a gyro-driven coast has picked up from its bias, radians per axis: the
+/// bias's uncertainty (`bias_sigma`, rad/s) times the time since the last measured origin. A bias
+/// error is systematic, so this grows LINEARLY and is recomputed from the total time, never
+/// summed per chunk (a root sum would claim ~sqrt(60) x 1 mrad over a minute where a 3 mrad/s
+/// bias turns 0.18 rad).
+fn gyro_bias_coast_sigma(bias_sigma: f64, measured_ns: u64, stamp_ns: u64) -> f64 {
+    bias_sigma * stamp_ns.saturating_sub(measured_ns) as f64 * 1e-9
+}
+
+/// Wheel path under which a coast chunk counts as parked ([`CoastOrigin::held`]), metres and
+/// radians: a tenth of the 1 mm / 1 mrad per-interval floors, so encoder jitter on a standing
+/// base still reads as parked and any real motion does not.
+const COAST_PARKED_PATH: f64 = 1e-4;
+
+/// Whether the wheels measured the base standing still over `d`.
+fn chunk_is_parked(d: &crate::wheel::WheelDelta) -> bool {
+    d.path_m <= COAST_PARKED_PATH && d.path_rad <= COAST_PARKED_PATH
+}
 
 /// How fast a coast's covariance grows over an interval the wheels did not measure, 1 sigma per
 /// second of it, metres and radians: a base driven blind at a brisk walk, turning a radian a
@@ -1060,6 +1155,9 @@ struct CoastOrigin {
     accumulated: Cov6,
     /// Base motion from the last measured origin to `stamp_ns`: the chunks' deltas composed.
     since_measured: Pose3d,
+    /// Stamp of the last measured origin: how long a gyro-driven coast has been integrating at
+    /// an uncorrected bias ([`gyro_bias_coast_sigma`]).
+    measured_ns: u64,
 }
 
 impl CoastOrigin {
@@ -1071,6 +1169,7 @@ impl CoastOrigin {
             cov,
             accumulated: cov,
             since_measured: Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(0.0, 0.0, 0.0)),
+            measured_ns: stamp_ns,
         }
     }
 
@@ -1094,6 +1193,37 @@ impl CoastOrigin {
             cov: covariance::add(&accumulated, &covariance::congruence(&ad, &mount)),
             accumulated,
             since_measured,
+            measured_ns: self.measured_ns,
+        }
+    }
+
+    /// Advanced to `stamp_ns` by a chunk the wheels measured as PARKED ([`chunk_is_parked`]):
+    /// its noise is all floors and out-of-plane stiffness (1 mm, 1 mrad, `z_sigma`,
+    /// `tilt_sigma`), which bound the error of the base standing still and do not grow with
+    /// time. Counted once, in `cov`, and NOT folded into `accumulated`: folded, every 1 s
+    /// re-base of a parked coast added another full set, a random walk to ~0.6 rad of tilt and
+    /// ~0.6 m of height after an hour for a robot that never moved.
+    fn held(
+        &self,
+        stamp_ns: u64,
+        noise: &Cov6,
+        delta: &Pose3d,
+        t_wb: &Pose3d,
+        extrinsic: [f64; 2],
+    ) -> Self {
+        let since_measured = self.since_measured.compose(delta);
+        let ad = covariance::pose_adjoint(t_wb);
+        let mount = crate::fusion::extrinsic_covariance(&since_measured, extrinsic);
+        let once = covariance::add(
+            &covariance::congruence(&ad, noise),
+            &covariance::congruence(&ad, &mount),
+        );
+        Self {
+            stamp_ns,
+            cov: covariance::add(&self.accumulated, &once),
+            accumulated: self.accumulated,
+            since_measured,
+            measured_ns: self.measured_ns,
         }
     }
 
@@ -1245,8 +1375,12 @@ impl Tracker {
         }
 
         let inertial = config.inertial.clone().map(|mut c| {
-            c.buffer_capacity =
-                imu_ring_capacity(&c, config.wheel_odom.as_ref(), config.keyframe_max_interval);
+            c.buffer_capacity = imu_ring_capacity(
+                &c,
+                config.wheel_odom.as_ref(),
+                config.keyframe_max_interval,
+                config.keyframe_policy.max_frames_between,
+            );
             InertialState::new(c)
         });
         if let Some(inert) = &inertial {
@@ -1305,6 +1439,7 @@ impl Tracker {
             live_map_points_key: (0, 0, 0),
             wheel,
             frame_on_wheels: false,
+            frame_on_gyro: false,
             world_anchored: false,
             map_carried: false,
             kf_tracked_poses: std::collections::VecDeque::new(),
@@ -1328,6 +1463,7 @@ impl Tracker {
             },
             fusion_preint: None,
             fusion_suspended_on: None,
+            parked_skip_counted_for: None,
             vision_pose: None,
             publish_hold: None,
             publish_hold_target: None,
@@ -1491,6 +1627,7 @@ impl Tracker {
         // No `ImuInit` arm: see [`SystemMode`] for why this tracker never parks there.
         let frame_idx = frame.idx;
         self.frame_on_wheels = false;
+        self.frame_on_gyro = false;
         // Set when this frame anchors a map at a propagated pose rather than a measured one.
         let mut coast_anchor = false;
         let status = match self.state.mode {
@@ -1762,6 +1899,17 @@ impl Tracker {
         Some(cap.saturating_mul(self.config.orb.n_keypoints))
     }
 
+    /// Whether the inertial path still needs its keyframes' IMU edges as they are: on, and its
+    /// initialization question not yet answered. Answered is initialized, or, with
+    /// `enable_inertial_ba` off, a dry run that latched its acceptance
+    /// ([`InertialState::dry_run_accepted`]): nothing is ever applied there, so without the latch
+    /// the parked keyframe gate and culling stayed off for the whole dry run.
+    fn inertial_unsettled(&self) -> bool {
+        self.inertial
+            .as_ref()
+            .is_some_and(|i| !self.state.imu_initialized && !i.dry_run_accepted)
+    }
+
     /// Removes redundant keyframes ([`TrackerConfig::keyframe_culling`]); returns how many.
     ///
     /// Not a reset: the world, its generation (`reset_epoch`), the pose, the coast origin and
@@ -1772,8 +1920,10 @@ impl Tracker {
     ///
     /// Nothing is culled while the inertial path is on but not yet settled: before the
     /// initialization (its window is the keyframes' IMU edges, and a merged edge is one the
-    /// still window and the motion solve were never tuned on) and while a refinement is
-    /// pending outside a stationary hold (it solves over the window from `start_kf_idx`). The
+    /// still window and the motion solve were never tuned on; a latched dry run counts as
+    /// settled) and while a refinement is pending outside a stationary hold (it solves over the
+    /// window from `start_kf_idx`; one whose schedule ran out is no longer pending,
+    /// [`InertialState::refinements_lapsed`]). The
     /// map bound drops the map then, as before. A stationary hold does NOT stop culling: it
     /// keeps the held keyframe's pose, and its refinements are re-armed at the keyframes
     /// present when the robot moves. A robot parked from boot stays in the hold, and refusing
@@ -1783,8 +1933,10 @@ impl Tracker {
             return 0;
         };
         if let Some(inert) = self.inertial.as_ref()
-            && (!self.state.imu_initialized
-                || (inert.static_hold.is_none()
+            && (self.inertial_unsettled()
+                || (self.state.imu_initialized
+                    && inert.static_hold.is_none()
+                    && !inert.refinements_lapsed
                     && !(inert.stats.first_refinement_done && inert.stats.second_refinement_done)))
         {
             debug!(
@@ -2116,6 +2268,9 @@ impl Tracker {
             inert.stats.bias_rejected += 1;
         }
         let keep_calibration_bias = keep_calibration && bias_plausible;
+        if !keep_calibration_bias {
+            self.consistent_gyro_bias = None;
+        }
         // A carried world keeps its gravity, so an initialized inertial path carries too.
         let carry_alignment = carry && self.state.imu_initialized && bias_plausible;
         let carried_stamp = self.last_frame_stamp_ns;
@@ -2151,10 +2306,11 @@ impl Tracker {
         // prunes what is older than itself.
         if let Some(inert) = self.inertial.as_mut() {
             let gravity_world = inert.gravity_world;
+            let progress = inert.progress();
             inert.reset(keep_calibration_bias);
             if carry_alignment {
                 inert.gravity_world = gravity_world;
-                inert.carried_alignment = true;
+                inert.carried_alignment = Some(progress);
             }
         }
         self.stats = TrackerStats::default();
@@ -2230,7 +2386,11 @@ impl Tracker {
         // it the velocity measured now. With none measurable the alignment is dropped and the
         // still window or the motion solve initializes again, as a loss always did before the
         // carry existed.
-        let carried = if self.inertial.as_ref().is_some_and(|i| i.carried_alignment) {
+        let carried = if self
+            .inertial
+            .as_ref()
+            .is_some_and(|i| i.carried_alignment.is_some())
+        {
             let v = self.carried_velocity(stamp_ns, curr_frame.pose_world_to_cam);
             if v.is_none() {
                 self.drop_carried_alignment(curr_frame.idx);
@@ -2319,6 +2479,7 @@ impl Tracker {
         inert.last_window_log = None;
         inert.static_hold = None;
         inert.static_map_refused_at = None;
+        inert.refinements_lapsed = false;
         inert.stats.first_refinement_done = false;
         inert.stats.second_refinement_done = false;
         // Samples older than the anchor can never bound an interval again.
@@ -2457,6 +2618,7 @@ impl Tracker {
             candidate_pose =
                 rotate_about_centre(candidate_pose, d.transpose() * pose_before.rotation);
         }
+        self.frame_on_gyro = gyro_delta.is_some();
         (candidate_pose, gyro_delta)
     }
 
@@ -2817,7 +2979,7 @@ impl Tracker {
                     let carried = self.state.imu_initialized;
                     self.state.reset();
                     if let (true, Some(inert)) = (carried, self.inertial.as_mut()) {
-                        inert.carried_alignment = true;
+                        inert.carried_alignment = Some(inert.progress());
                     }
                     self.world_generation += 1;
                 }
@@ -3140,8 +3302,14 @@ impl Tracker {
         };
         let noise: Cov6 = std::array::from_fn(|k| f.covariance[k]);
         let t_wb = pose_cw.inverse().compose(&t_cb_to);
+        let step = if chunk_is_parked(&d) {
+            CoastOrigin::held
+        } else {
+            CoastOrigin::advanced
+        };
         (
-            origin.advanced(
+            step(
+                &origin,
                 stamp_ns,
                 &noise,
                 &measurement.delta_pose(),
@@ -3150,6 +3318,31 @@ impl Tracker {
             ),
             false,
         )
+    }
+
+    /// The covariance to publish for a coast at `o`: `o.cov`, plus, when the gyro turned this
+    /// frame (`frame_on_gyro`), the drift of its bias since the measured origin
+    /// ([`gyro_bias_coast_sigma`]). Added here and never stored in a re-based origin, so each
+    /// frame recomputes it from the total time instead of stacking it. Not after an unmeasured
+    /// interval, whose worst-case rate already dwarfs it and which restarts the origin.
+    fn coast_published_cov(&self, o: &CoastOrigin, unmeasured: bool, pose_cw: &Pose3d) -> Cov6 {
+        if !self.frame_on_gyro || unmeasured || self.coast_origin.is_none() {
+            return o.cov;
+        }
+        let bias_sigma = if self.state.imu_initialized {
+            KF_GYRO_BIAS_SIGMA
+        } else {
+            UNINITIALIZED_GYRO_BIAS_SIGMA
+        };
+        let s = gyro_bias_coast_sigma(bias_sigma, o.measured_ns, o.stamp_ns);
+        let mut cam = [0.0; 36];
+        for k in 3..6 {
+            cam[k * 7] = s * s;
+        }
+        // A rotation about the camera centre is a right perturbation of `T_wc`: in the world
+        // through its adjoint.
+        let ad = covariance::pose_adjoint(&pose_cw.inverse());
+        covariance::add(&o.cov, &covariance::congruence(&ad, &cam))
     }
 
     /// Counts a coast frame's covariance as measured or not and says so when not, rate-limited
@@ -3212,22 +3405,24 @@ impl Tracker {
             // re-bootstrap) or at the start of a world: the coast's covariance, which is zero for
             // a world that starts here. The anchor is the next coast's origin.
             let (o, unmeasured) = self.coast_covariance(stamp_ns, &pose_cw);
+            let c = self.coast_published_cov(&o, unmeasured, &pose_cw);
             self.note_coast(unmeasured, frame_idx, stamp_ns);
-            self.coast_origin = Some(CoastOrigin::measured(stamp_ns, o.cov));
-            Some(o.cov)
+            self.coast_origin = Some(CoastOrigin::measured(stamp_ns, c));
+            Some(c)
         } else if status == TrackingStatus::Skipped
             && self.wheel.is_some()
             && self.world_anchored
             && self.frame_on_wheels
         {
             let (o, unmeasured) = self.coast_covariance(stamp_ns, &pose_cw);
+            let c = self.coast_published_cov(&o, unmeasured, &pose_cw);
             self.note_coast(unmeasured, frame_idx, stamp_ns);
             if let Some(t0) = self.coast_origin.map(|o| o.stamp_ns)
                 && stamp_ns.saturating_sub(t0) >= COAST_REBASE_NS
             {
                 self.coast_origin = Some(o);
             }
-            Some(o.cov)
+            Some(c)
         } else {
             None
         };
@@ -3376,7 +3571,8 @@ impl Tracker {
     /// keyframe is under the parked floors; and the camera is within
     /// [`PARKED_CAMERA_TRANSLATION_M`] / [`PARKED_CAMERA_ROTATION_RAD`] of it, so a head re-tilt or
     /// a pan the wheels cannot see is motion. Anything missing (no wheels, no readings, no
-    /// keyframe) inserts as before, and so does an inertial path not yet initialized: the still
+    /// keyframe) inserts as before, and so does an inertial path not yet initialized (or dry run
+    /// not yet accepted; [`Self::inertial_unsettled`]): the still
     /// window is built from keyframe IMU edges, and withholding them kept a robot parked 9 s
     /// uninitialized into its first drive (replay of a 2026-10-11 capture). So does a fusion
     /// suspended on the last keyframe, which waits for the next one.
@@ -3392,7 +3588,7 @@ impl Tracker {
         let Some(interval) = w.cfg.parked_keyframe_interval else {
             return false;
         };
-        if self.inertial.is_some() && !self.state.imu_initialized {
+        if self.inertial_unsettled() {
             return false;
         }
         let (Some(kf_ns), Some(kf_idx)) =
@@ -3425,8 +3621,11 @@ impl Tracker {
         if !(moved <= PARKED_CAMERA_TRANSLATION_M && turned <= PARKED_CAMERA_ROTATION_RAD) {
             return false;
         }
-        if let Some(w) = self.wheel.as_mut() {
-            w.stats.parked_keyframes_skipped += 1;
+        if self.parked_skip_counted_for != Some(kf_idx) {
+            self.parked_skip_counted_for = Some(kf_idx);
+            if let Some(w) = self.wheel.as_mut() {
+                w.stats.parked_keyframes_skipped += 1;
+            }
         }
         true
     }
@@ -4425,6 +4624,18 @@ impl Tracker {
         // Past 50 s the window is far too large for a single joint solve to be worth attempting;
         // this mirrors the removed `SlamPipeline`'s own ceiling.
         if init_elapsed >= 50.0 {
+            let refined = inert.stats.first_refinement_done && inert.stats.second_refinement_done;
+            if !(inert.refinements_lapsed || refined) {
+                inert.refinements_lapsed = true;
+                warning!(
+                    "inertial: refinement schedule ran out with a refinement never run; the \
+                     stage stays, culling is no longer held for it: refine1_done={} \
+                     refine2_done={} window_s={}",
+                    inert.stats.first_refinement_done,
+                    inert.stats.second_refinement_done,
+                    init_elapsed
+                );
+            }
             return;
         }
         let (prior_g, stage) = if !inert.stats.first_refinement_done && init_elapsed > 5.0 {
@@ -4517,7 +4728,6 @@ impl Tracker {
                 return false;
             }
         };
-        inert.stats.static_accepted += 1;
         info!(
             "inertial: still window found: first_kf={} kf={} span_s={} samples={} accel_rms={} \
              gyro_rms={} gyro_mean={}",
@@ -4545,6 +4755,14 @@ impl Tracker {
             init.velocities_world.clear();
         }
         self.accept_inertial_init(inert, init, apply_from, now_sec, InitStage::Static);
+        // Counted only once the gate has spoken: a still window the bias limit or the map then
+        // refuses is a refusal, and counting it accepted pointed the stop line away from the
+        // cause while the stage stayed Uninitialized.
+        if self.state.imu_initialized || inert.dry_run_accepted {
+            inert.stats.static_accepted += 1;
+        } else {
+            inert.stats.static_refused += 1;
+        }
         if self.state.imu_initialized {
             inert.static_hold = self.map.get_keyframe(newest).map(|kf| StaticHold {
                 kf_idx: newest,
@@ -4607,11 +4825,14 @@ impl Tracker {
     /// Whether the refinements held by a stationary initialization may run: the camera has moved
     /// [`STATIC_REFINE_MOTION_M`] or turned [`STATIC_REFINE_MOTION_RAD`] from the still window's
     /// newest keyframe. On release the refinement window is re-armed at the newest keyframe's
-    /// predecessor (the edge into it spans the start of the motion), so the 5 s / 15 s schedule
-    /// counts from when the robot started moving and the solve does not span the whole stop.
+    /// predecessor (the edge into it spans the start of the motion), so the solve does not span
+    /// the whole stop, and the 5 s / 15 s schedule counts from the releasing keyframe's own stamp.
+    /// Not from the start of that edge: a parked edge can be longer than 5 s
+    /// (`parked_keyframe_interval_s`), and Refine1 then fired on the releasing keyframe itself,
+    /// over a two-keyframe window of parked data that the solve refuses, spending the stage.
     ///
-    /// Returns `true` only on the keyframe that releases it; that keyframe is the window's
-    /// second, so the refinement branch it falls into has nothing scheduled yet anyway.
+    /// Returns `true` only on the keyframe that releases it; the refinement branch it falls into
+    /// has nothing scheduled yet (0 s into the re-armed window).
     fn release_static_hold(&self, inert: &mut InertialState, now_sec: f64) -> bool {
         let Some(hold) = inert.static_hold else {
             return true;
@@ -4629,16 +4850,17 @@ impl Tracker {
             return false;
         }
         let newest_idx = newest.frame.idx;
-        let (start, t0) = self
+        let start = self
             .map
             .imu_factors()
             .iter()
             .rev()
             .find(|f| f.curr_kf_idx == newest_idx)
-            .map_or((newest_idx, now_sec), |f| (f.prev_kf_idx, f.t0));
+            .map_or(newest_idx, |f| f.prev_kf_idx);
         inert.static_hold = None;
+        inert.refinements_lapsed = false;
         inert.start_kf_idx = Some(start);
-        inert.window_start_sec = Some(t0);
+        inert.window_start_sec = Some(now_sec);
         info!(
             "inertial: motion after the stationary initialization; refinements scheduled from \
              here: held_kf={} start_kf={} kf={}",
@@ -4739,7 +4961,7 @@ impl Tracker {
         let Some(inert) = self.inertial.as_mut() else {
             return;
         };
-        inert.carried_alignment = false;
+        inert.carried_alignment = None;
         inert.stats.carry_dropped += 1;
         warning!(
             "inertial: carried alignment dropped, no wheel velocity at the re-bootstrap; the \
@@ -4754,8 +4976,10 @@ impl Tracker {
     /// so the tracker is initialized from its first keyframe with no rotation and no extra
     /// world-generation bump.
     ///
-    /// The refinements are marked spent: each one rotates the world, and a carried world is
-    /// already the product of the initialization (and refinements) that aligned it.
+    /// The staged initialization resumes where the dropped map left it ([`CarriedProgress`]):
+    /// spent refinements stay spent (each one rotates the world), a pending one is scheduled on
+    /// the new map's window, 5 s / 15 s from this bootstrap, and a stationary hold keeps holding
+    /// on the pose it was taken at (the world did not change, so neither did that pose).
     fn adopt_carried_alignment(&mut self, carried: Option<Vec3F64>, timestamp_sec: f64) {
         let Some(inert) = self.inertial.as_mut() else {
             return;
@@ -4763,16 +4987,21 @@ impl Tracker {
         let Some(velocity) = carried else {
             return;
         };
-        inert.carried_alignment = false;
-        inert.static_hold = None;
+        let Some(progress) = inert.carried_alignment.take() else {
+            return;
+        };
+        inert.static_hold = progress.static_hold;
+        inert.applied_stage = progress.applied_stage;
         self.state.imu_init_timestamp_sec = Some(timestamp_sec);
-        inert.stats.first_refinement_done = true;
-        inert.stats.second_refinement_done = true;
+        inert.stats.first_refinement_done = progress.first_refinement_done;
+        inert.stats.second_refinement_done = progress.second_refinement_done;
         info!(
             "inertial: alignment carried into the new map; gravity and bias kept, no \
-             re-initialization: speed_mps={} gyro_bias={}",
+             re-initialization: speed_mps={} gyro_bias={} refined={} held={}",
             velocity.length(),
-            inert.bias.gyro.length()
+            inert.bias.gyro.length(),
+            u8::from(progress.first_refinement_done) + u8::from(progress.second_refinement_done),
+            progress.static_hold.is_some()
         );
     }
 
@@ -4930,12 +5159,19 @@ impl Tracker {
         );
     }
 
-    /// Moves every held covariance into the world an inertial alignment just produced: the
-    /// alignment is one rigid motion of the world (`T_new_old`, read off `reference`, a keyframe's
-    /// world-to-camera pose before it, against the same keyframe now), and a world left
-    /// perturbation crosses a change of world by `Ad(T_new_old)`. Its scale (one, to the
-    /// stereo baseline's accuracy) is not applied.
-    fn realign_covariances(&mut self, reference: Option<(usize, Pose3d)>) {
+    /// Moves everything held in world coordinates into the world an inertial alignment just
+    /// produced: the alignment is one rigid motion of the world (`T_new_old`, read off
+    /// `reference`, a keyframe's world-to-camera pose before it, against the same keyframe now,
+    /// repivot included), and a world left perturbation crosses a change of world by
+    /// `Ad(T_new_old)`. Its scale (one, to the stereo baseline's accuracy) is not applied.
+    ///
+    /// Held, besides the keyframe covariances and the coast origin, by the frame being processed:
+    /// the base covariance `tracking_step` copied into `frame_rel` before this same frame's
+    /// keyframe triggered the alignment (else `record_covariance` adds an old-world base to a
+    /// relative term mapped through the new-world pose, and the keyframe keeps the mix), and the
+    /// coast target `publish_hold_target` (else the hold's offset holds the whole change of world
+    /// and the published pose blends the two worlds for seconds after the `reset_epoch` bump).
+    fn realign_into_new_world(&mut self, reference: Option<(usize, Pose3d)>) {
         let Some((idx, old_cw)) = reference else {
             return;
         };
@@ -4946,9 +5182,17 @@ impl Tracker {
         else {
             return;
         };
-        let ad = covariance::pose_adjoint(&new_cw.inverse().compose(&old_cw));
+        let new_old = new_cw.inverse().compose(&old_cw);
+        let ad = covariance::pose_adjoint(&new_old);
         for c in self.kf_cov.values_mut() {
             *c = covariance::congruence(&ad, c);
+        }
+        if let Some((Some(base), _)) = self.frame_rel.as_mut() {
+            *base = covariance::congruence(&ad, base);
+        }
+        if let Some(target) = self.publish_hold_target.as_mut() {
+            // `T_cw_new = T_cw_old T_old_new`.
+            *target = target.compose(&new_old.inverse());
         }
         if let Some(o) = self.coast_origin.as_mut() {
             // Both world covariances; the motion since the measured origin is the base's own.
@@ -4986,7 +5230,7 @@ impl Tracker {
             })
             .flatten();
         // A keyframe's pose before the alignment moves the world, to read off afterwards what the
-        // alignment did to it, so the covariances follow (`realign_covariances`).
+        // alignment did to it, so the covariances follow (`realign_into_new_world`).
         let reference = self
             .map
             .keyframes()
@@ -5002,11 +5246,13 @@ impl Tracker {
         match applied {
             Ok(Some(mut aligned)) => {
                 inert.applied_stage = Some(stage);
+                // The bias the motion check last agreed on is the one this solve replaced.
+                self.consistent_gyro_bias = None;
                 if let Some((idx, centre)) = pivot {
                     aligned.pose_world_to_cam =
                         self.repivot_map(idx, centre, aligned.pose_world_to_cam);
                 }
-                self.realign_covariances(reference);
+                self.realign_into_new_world(reference);
                 self.state.adopt_inertial_initialization(aligned)
             }
             // `apply_inertial_alignment` refuses an empty velocity list, and a non-empty one
@@ -7764,6 +8010,88 @@ mod tests {
         assert_eq!(o.cov, o.accumulated);
     }
 
+    /// A parked coast re-based every second for an hour: the floors and the out-of-plane
+    /// stiffness are counted once, not 3600 times.
+    ///
+    /// Mutation: `coast_covariance` advancing a parked chunk like a moving one (`advanced`, not
+    /// `held`) is the random walk this pins; replacing `held`'s body with `advanced` turned this
+    /// red at sqrt(3600) x the floor.
+    #[test]
+    fn a_parked_coast_counts_its_floors_once() {
+        let mut noise = [0.0; 36];
+        for k in 0..6 {
+            noise[k * 7] = 1e-4;
+        }
+        let measured = diag_cov(1e-6);
+        let id = CoastOrigin::measured(0, measured).since_measured;
+        let mut o = CoastOrigin::measured(0, measured);
+        for k in 1..=3600 {
+            o = o.held(k * COAST_REBASE_NS, &noise, &id, &id, [0.0, 0.0]);
+        }
+        assert_eq!(o.accumulated, measured);
+        assert_cov_close(
+            &o.cov,
+            &covariance::add(&measured, &noise),
+            "one set of floors",
+        );
+        // Moving again: the chunk's noise accumulates from the measured origin, not from an
+        // hour of floors.
+        let moved = o.advanced(3601 * COAST_REBASE_NS, &noise, &id, &id, [0.0, 0.0]);
+        assert_cov_close(&moved.cov, &covariance::add(&measured, &noise), "one chunk");
+        // The parked test itself.
+        let parked = crate::wheel::WheelDelta {
+            delta: [0.0; 3],
+            path_m: 0.0,
+            path_rad: 0.0,
+            covariance: [[0.0; 3]; 3],
+            speed_m_s: [0.0; 2],
+            rate_rad_s: [0.0; 2],
+        };
+        assert!(chunk_is_parked(&parked));
+        assert!(!chunk_is_parked(&crate::wheel::WheelDelta {
+            path_m: 0.002,
+            ..parked
+        }));
+        assert!(!chunk_is_parked(&crate::wheel::WheelDelta {
+            path_rad: 0.002,
+            ..parked
+        }));
+    }
+
+    /// A coast the gyro turns carries its bias's drift, linear in the time since the measured
+    /// origin: 60 s at the uninitialized 1e-2 rad/s is 0.6 rad, at the keyframe 1e-3 0.06 rad.
+    /// Not stored in the re-based origin, and absent when the wheels turned the frame.
+    ///
+    /// Mutation: dropping the gyro term from `coast_published_cov` turned this red.
+    #[test]
+    fn a_gyro_driven_coast_carries_its_bias_drift() {
+        let mut config = TrackerConfig::new(Length::new::<meter>(0.075));
+        config.inertial = Some(inertial_config());
+        let mut tracker = Tracker::new(rectified_camera(), config);
+        let origin = CoastOrigin::measured(0, [0.0; 36]);
+        tracker.coast_origin = Some(origin);
+        let at_60 = CoastOrigin {
+            stamp_ns: 60 * COAST_REBASE_NS,
+            ..origin
+        };
+        let pose = Pose3d::IDENTITY;
+        assert_eq!(tracker.coast_published_cov(&at_60, false, &pose), [0.0; 36]);
+        tracker.frame_on_gyro = true;
+        for (initialized, want) in [(false, 0.6f64), (true, 0.06)] {
+            tracker.state.imu_initialized = initialized;
+            let c = tracker.coast_published_cov(&at_60, false, &pose);
+            for k in 0..6 {
+                let expect = if k < 3 { 0.0 } else { want * want };
+                assert!(
+                    (c[k * 7] - expect).abs() < 1e-12,
+                    "initialized={initialized} axis {k}: {}",
+                    c[k * 7]
+                );
+            }
+        }
+        assert_eq!(tracker.coast_published_cov(&at_60, true, &pose), [0.0; 36]);
+    }
+
     /// An interval the wheels did not measure grows the covariance at the worst-case rate for
     /// its length, on top of everything so far (the mount term of the motion before it
     /// included), and the next chunk restarts from there.
@@ -8168,6 +8496,68 @@ mod tests {
         }
     }
 
+    /// A still window whose bias the limit then refuses is a refusal, not an acceptance: the stop
+    /// line must not read "static N accepted" while the stage stays Uninitialized.
+    ///
+    /// Mutation: counting `static_accepted` when the window is found (before the gate) turned
+    /// this red.
+    #[test]
+    fn test_a_still_window_the_bias_limit_refuses_is_not_counted_accepted() {
+        let mut tracker = scene_tracker_with(|c| {
+            let mut i = static_inertial_config();
+            // Under the parked rig's 3.7 mrad/s bias: every still window's bias is refused.
+            i.bias_limit.gyro_rad_s = 0.002;
+            c.inertial = Some(i);
+            c.wheel_odom = Some(scene_wheel_config());
+        });
+        for seq in 0..45 {
+            feed_parked(&mut tracker, seq, &no_extra, &parked_wheels);
+        }
+        let inert = tracker.inertial.as_ref().unwrap();
+        assert!(!tracker.state.imu_initialized);
+        assert!(inert.stats.bias_rejected > 0, "the limit never spoke");
+        assert_eq!(inert.stats.static_accepted, 0);
+        assert!(inert.stats.static_refused > 0);
+    }
+
+    /// The motion check's agreed bias does not outlive the bias it was taken at: an applied
+    /// initialization supersedes it, and a requested reset (a re-calibration) starts it over. A
+    /// map drop that keeps the bias keeps it.
+    ///
+    /// Mutation: not clearing it in `apply_inertial_init` turned the first half red; not
+    /// clearing it in `reset_inner` the second.
+    #[test]
+    fn test_the_motion_check_bias_is_dropped_with_the_bias_it_came_from() {
+        let stale = Vec3F64::new(1.0, 1.0, 1.0);
+        let mut tracker = scene_tracker_with(|c| {
+            c.inertial = Some(static_inertial_config());
+            c.wheel_odom = Some(scene_wheel_config());
+        });
+        tracker.consistent_gyro_bias = Some(stale);
+        for seq in 0..60 {
+            feed_parked(&mut tracker, seq, &no_extra, &parked_wheels);
+            if tracker.state.imu_initialized {
+                break;
+            }
+        }
+        assert!(tracker.state.imu_initialized, "never initialized");
+        assert_ne!(
+            tracker.consistent_gyro_bias,
+            Some(stale),
+            "outlived the init"
+        );
+
+        tracker.consistent_gyro_bias = Some(stale);
+        tracker.reset_keeping_calibration();
+        assert_eq!(
+            tracker.consistent_gyro_bias,
+            Some(stale),
+            "the bias was kept"
+        );
+        tracker.reset();
+        assert_eq!(tracker.consistent_gyro_bias, None, "a re-calibration");
+    }
+
     /// Static init must not block the motion solve: a window that is not still falls through to
     /// it on the same keyframe.
     ///
@@ -8213,7 +8603,8 @@ mod tests {
     /// the still window runs again.
     ///
     /// Mutation: not setting `carried_alignment` in `reset_inner` turned the wheel case red
-    /// (a second static init, generation 3).
+    /// (a second static init, generation 3). Marking the refinements spent and dropping the hold
+    /// in `adopt_carried_alignment` (the old behaviour) turned it red too.
     #[test]
     fn test_a_map_drop_carries_the_alignment_or_re_runs_the_still_window() {
         for wheels in [true, false] {
@@ -8246,7 +8637,17 @@ mod tests {
                 assert_eq!(kfs, 1, "inertial from the new map's anchor keyframe");
                 assert_eq!(inert.stats.static_accepted, 1, "no second still window");
                 assert_eq!(tracker.world_generation(), 2, "init + drop, nothing else");
-                assert!(inert.stats.first_refinement_done && inert.stats.second_refinement_done);
+                // The drop came under the stationary hold: it is carried, so the refinements
+                // still wait for motion, and the stage still reads Static, not Refine2.
+                assert!(
+                    inert.static_hold.is_some(),
+                    "the hold was dropped by the carry"
+                );
+                assert!(
+                    !inert.stats.first_refinement_done && !inert.stats.second_refinement_done,
+                    "the carry spent the refinements"
+                );
+                assert_eq!(tracker.inertial_diag().0, InertialStage::Static);
             } else {
                 assert_eq!(inert.stats.static_accepted, 2, "the still window re-ran");
                 assert_eq!(tracker.world_generation(), 3, "init + drop + re-init");
@@ -8254,6 +8655,46 @@ mod tests {
             assert_eq!(tracker.ba_updates_refused(), 0, "wheels={wheels}");
         }
     }
+    /// A carried world that only had the motion solve keeps its refinements pending: the stage
+    /// reads Initial (IMU position rows off) and Refine1 is scheduled on the new map's window.
+    /// One that was fully refined stays refined.
+    ///
+    /// Mutation: setting both refinement flags to `true` in `adopt_carried_alignment` turned the
+    /// first case red.
+    #[test]
+    fn test_a_carried_alignment_keeps_the_refinement_stage_it_had() {
+        for (r1, r2, expected) in [
+            (false, false, InertialStage::Initial),
+            (true, false, InertialStage::Refine1),
+            (true, true, InertialStage::Refine2),
+        ] {
+            let mut config = TrackerConfig::new(Length::new::<meter>(0.075));
+            config.inertial = Some(static_inertial_config());
+            let mut tracker = Tracker::new(rectified_camera(), config);
+            tracker.state.imu_initialized = true;
+            {
+                let inert = tracker.inertial.as_mut().unwrap();
+                inert.applied_stage = Some(InitStage::Initial);
+                inert.stats.first_refinement_done = r1;
+                inert.stats.second_refinement_done = r2;
+                let progress = inert.progress();
+                inert.reset(true);
+                inert.carried_alignment = Some(progress);
+            }
+            tracker.arm_inertial_window(0, 10.0, EPOCH_NS);
+            tracker.adopt_carried_alignment(Some(Vec3F64::ZERO), 10.0);
+            let inert = tracker.inertial.as_ref().unwrap();
+            assert!(inert.carried_alignment.is_none());
+            assert_eq!(inert.stats.first_refinement_done, r1);
+            assert_eq!(inert.stats.second_refinement_done, r2);
+            assert_eq!(tracker.inertial_diag().0, expected, "{r1} {r2}");
+            assert_eq!(
+                imu_position_trusted(tracker.inertial_diag().0),
+                expected == InertialStage::Refine2
+            );
+        }
+    }
+
     /// How far the IMU runs ahead of the frame being processed on the robot: the task drains
     /// the IMU queue right before the solve, by which time the samples of the ~60 ms the frame
     /// spent in capture, transfer and queueing are already in. 2026-10-09 loop test: every drop
@@ -8452,7 +8893,10 @@ mod tests {
         let inert = tracker.inertial.as_ref().unwrap();
         assert_eq!(inert.bias.gyro, inert.cfg.initial_bias.gyro);
         assert_eq!(inert.bias.accel, inert.cfg.initial_bias.accel);
-        assert!(!inert.carried_alignment, "the alignment rode along");
+        assert!(
+            inert.carried_alignment.is_none(),
+            "the alignment rode along"
+        );
         assert_eq!(inert.stats.bias_rejected, 1);
     }
 
@@ -8502,12 +8946,12 @@ mod tests {
     }
 
     /// The hold's release: the camera moving 0.2 m from the still window's newest keyframe
-    /// re-arms the refinement window at the moving keyframe's predecessor, stamped at its edge's
-    /// start, so the 5 s / 15 s schedule counts from the motion. Below the threshold nothing
-    /// changes.
+    /// re-arms the refinement window at the moving keyframe's predecessor, with the 5 s / 15 s
+    /// clock started at the moving keyframe's own stamp. Below the threshold nothing changes.
     ///
     /// Mutation: re-arming at the held keyframe instead of the edge into the newest turned this
-    /// red.
+    /// red; so did starting the clock at the edge's start (`t0`), which let a parked edge longer
+    /// than 5 s fire Refine1 on the releasing keyframe.
     #[test]
     fn test_motion_releases_the_static_hold_and_restarts_the_refinement_clock() {
         let mut tracker = tracker_with_inertial_ba(true);
@@ -8546,7 +8990,8 @@ mod tests {
         assert_eq!(inert.static_hold.map(|h| h.kf_idx), Some(1));
         assert_eq!(inert.start_kf_idx, Some(0));
 
-        // Keyframe 3: 0.4 m away. Released, re-armed at keyframe 2 from t = 2.0.
+        // Keyframe 3: 0.4 m away. Released, re-armed at keyframe 2, the clock from keyframe 3's
+        // own stamp (t = 3.0), not from the start of the edge into it.
         tracker
             .map
             .insert_keyframe(bare_keyframe(3, Vec3F64::new(0.4, 0.0, 0.0)))
@@ -8561,7 +9006,7 @@ mod tests {
         assert!(tracker.release_static_hold(&mut inert, 3.0));
         assert!(inert.static_hold.is_none());
         assert_eq!(inert.start_kf_idx, Some(2));
-        assert_eq!(inert.window_start_sec, Some(2.0));
+        assert_eq!(inert.window_start_sec, Some(3.0));
     }
 
     /// Finding 2: a carried alignment does not carry a velocity from before the drop. A robot
@@ -8992,6 +9437,12 @@ mod tests {
         // One per 4 s over 10 s: never none, at most 3.
         assert!((1..=3).contains(&on), "parked keyframes {on} (off: {off})");
         assert!(on_skipped > 0);
+        // Once per withheld interval, not once per frame the policy re-asks: at most one per
+        // keyframe interval (the parked keyframes plus the open interval after the last).
+        assert!(
+            on_skipped <= on as u64 + 1,
+            "{on_skipped} skipped over {on} parked keyframes"
+        );
     }
 
     /// The gate withholds only while ALL still signals hold: wheels driving a few millimetres a
@@ -10450,6 +10901,49 @@ mod tests {
         tracker
     }
 
+    /// A dry run that latched its acceptance (`enable_inertial_ba` off) has answered the
+    /// initialization question: culling and the parked gate run, where they used to stay off for
+    /// the whole dry run because `imu_initialized` is never set there.
+    ///
+    /// Mutation: `inertial_unsettled` ignoring `dry_run_accepted` turned this red.
+    #[test]
+    fn a_latched_dry_run_lets_culling_run() {
+        let mut tracker = parked_map(Some(inertial_config()), 100);
+        assert!(!tracker.state.imu_initialized);
+        assert_eq!(tracker.cull_for_room(), 0, "the question is still open");
+        tracker.inertial.as_mut().unwrap().dry_run_accepted = true;
+        assert!(!tracker.inertial_unsettled());
+        assert!(
+            tracker.cull_for_room() > 0,
+            "the latched dry run still blocks"
+        );
+    }
+
+    /// A refinement whose schedule ran out (50 s into the window) is no longer pending: culling
+    /// runs, the stage stays where it was, and nothing claims the refinements ran.
+    ///
+    /// Mutation: not latching `refinements_lapsed` in `run_inertial_init` turned this red.
+    #[test]
+    fn a_lapsed_refinement_schedule_lets_culling_run() {
+        let mut tracker = parked_map(Some(inertial_config()), 100);
+        tracker.state.imu_initialized = true;
+        let first = tracker.map().keyframes().first().unwrap().frame.idx;
+        {
+            let inert = tracker.inertial.as_mut().unwrap();
+            inert.applied_stage = Some(InitStage::Initial);
+            inert.start_kf_idx = Some(first);
+            inert.window_start_sec = Some(0.0);
+        }
+        assert_eq!(tracker.cull_for_room(), 0, "refinements pending");
+        let mut inert = tracker.inertial.take().unwrap();
+        tracker.run_inertial_init(&mut inert, 51.0);
+        assert!(inert.refinements_lapsed);
+        assert!(!inert.stats.first_refinement_done && !inert.stats.second_refinement_done);
+        tracker.inertial = Some(inert);
+        assert_eq!(tracker.inertial_diag().0, InertialStage::Initial);
+        assert!(tracker.cull_for_room() > 0);
+    }
+
     /// With the inertial path on, nothing is culled before the initialization, nor while a
     /// refinement is pending outside a stationary hold. Under a hold (parked since the static
     /// initialization, refinements waiting for motion) the map culls, the held keyframe
@@ -10611,6 +11105,53 @@ mod tests {
         std::array::from_fn(|k| if k % 7 == 0 { v } else { 0.0 })
     }
 
+    /// An alignment applied on the frame being processed moves what that frame already holds:
+    /// the base covariance `frame_rel` copied before the insertion, exactly as the keyframe's own
+    /// `kf_cov` entry, and the coast target the publish hold is set from, into the new world.
+    ///
+    /// Mutation: leaving `frame_rel` out of `realign_into_new_world` turned this red; so did
+    /// leaving `publish_hold_target` out.
+    #[test]
+    fn an_alignment_moves_the_frame_s_held_base_covariance_and_hold_target() {
+        let mut config = TrackerConfig::new(Length::new::<meter>(0.075));
+        config.inertial = Some(inertial_config());
+        let mut tracker = Tracker::new(rectified_camera(), config);
+        tracker
+            .map
+            .insert_keyframe(bare_keyframe(0, Vec3F64::ZERO))
+            .expect("a fresh keyframe id");
+        // An anisotropic covariance (vertical tight, horizontal loose), so a rotation shows.
+        let base: Cov6 = std::array::from_fn(|k| match k {
+            0 | 14 => 1e-2,
+            7 => 1e-6,
+            k if k % 7 == 0 => 1e-4,
+            _ => 0.0,
+        });
+        tracker.kf_cov.insert(0, base);
+        tracker.set_frame_rel(Some(0), diag_cov(1e-6));
+        let target = Pose3d::from_rt(Mat3F64::IDENTITY, Vec3F64::new(0.1, 0.2, 0.3));
+        tracker.publish_hold_target = Some(target);
+        // The keyframe sat 23 deg about x before the alignment; it is at identity now.
+        let old_cw = Pose3d::from_rt(
+            SO3F64::exp(Vec3F64::new(23f64.to_radians(), 0.0, 0.0)).matrix(),
+            Vec3F64::ZERO,
+        );
+        tracker.realign_into_new_world(Some((0, old_cw)));
+        let moved = tracker.kf_cov[&0];
+        assert!(
+            (moved[7] - base[7]).abs() > 1e-4,
+            "the test rotated nothing"
+        );
+        let (held, _) = tracker.frame_rel.expect("still held");
+        assert_cov_close(&held.expect("a base"), &moved, "frame_rel's base");
+        let want = target.compose(&old_cw.inverse());
+        let got = tracker.publish_hold_target.expect("still held");
+        assert!((got.translation - want.translation).length() < 1e-12);
+        let r = got.rotation * want.rotation.transpose();
+        assert!((r.x_axis.x + r.y_axis.y + r.z_axis.z - 3.0).abs() < 1e-12);
+        assert!(pose_differs(&got, &target), "the target was not moved");
+    }
+
     /// A frame chains from its base keyframe's covariance as it was when the base was chosen:
     /// the same frame's insertion can cull that keyframe (it is old and redundant, exactly what
     /// `chain_base` prefers on a parked robot) before `record_covariance` runs, and the relative
@@ -10697,31 +11238,42 @@ mod tests {
     /// The IMU ring spans the longest keyframe interval the config allows: a motion-only
     /// policy's `keyframe_max_interval` as much as a parked interval.
     ///
-    /// Mutation: leaving `keyframe_max_interval` out of `imu_ring_capacity` turned this red.
+    /// Mutation: leaving `keyframe_max_interval` out of `imu_ring_capacity` turned this red; so
+    /// did leaving the frame-count bound out.
     #[test]
     fn the_imu_ring_spans_the_policy_s_keyframe_interval() {
         let inertial = inertial_config();
         let rate = inertial.gates.nominal_rate.get::<hertz>();
         let need =
             |interval_s: f64| ((interval_s + PARKED_IMU_RING_MARGIN_S) * rate).ceil() as usize;
+        const MO: usize = usize::MAX; // motion-only: no frame-count bound
         assert_eq!(
-            imu_ring_capacity(&inertial, None, None),
+            imu_ring_capacity(&inertial, None, None, MO),
             inertial.buffer_capacity
         );
         let long = Some(Time::new::<second>(12.0));
-        assert_eq!(imu_ring_capacity(&inertial, None, long), need(12.0));
+        assert_eq!(imu_ring_capacity(&inertial, None, long, MO), need(12.0));
         let mut wheel = scene_wheel_config();
         wheel.parked_keyframe_interval = Some(Time::new::<second>(11.0));
-        assert_eq!(imu_ring_capacity(&inertial, Some(&wheel), None), need(11.0));
         assert_eq!(
-            imu_ring_capacity(&inertial, Some(&wheel), long),
+            imu_ring_capacity(&inertial, Some(&wheel), None, MO),
+            need(11.0)
+        );
+        assert_eq!(
+            imu_ring_capacity(&inertial, Some(&wheel), long, MO),
             need(12.0),
             "the longer of the two"
         );
         assert_eq!(
-            imu_ring_capacity(&inertial, None, Some(Time::new::<second>(1.0))),
+            imu_ring_capacity(&inertial, None, Some(Time::new::<second>(1.0)), 8),
             inertial.buffer_capacity,
             "never below the configured ring"
+        );
+        // A frame-count bound alone spaces a parked robot's keyframes too: 300 frames at the
+        // slowest frame period is 42 s, past the default ring.
+        assert_eq!(
+            imu_ring_capacity(&inertial, None, None, 300),
+            need(300.0 * SLOWEST_FRAME_PERIOD_S)
         );
     }
 

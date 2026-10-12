@@ -394,18 +394,39 @@ impl CuTask for StereoVio {
         // longer than `max_merged_imu_span_sec`. Past half of it no parked keyframe is ever culled
         // (`kept_for_edges`), the stops give no room and the map drops at the bound as before.
         // The spacing is the interval plus up to a frame, so exactly half is already too long.
+        //
+        // The spacing is the LONGER of the parked gate's interval and the policy's own bound
+        // (the sooner of `max_interval_s` and `max_frames_between` at the slowest frame period;
+        // parallax and the reference ratio never fire on a parked robot): the gate only withholds
+        // keyframes, it never asks for one the policy would not.
+        let policy_spacing = crate::track::policy_keyframe_bound_s(
+            keyframe_insertion.policy.max_frames_between,
+            keyframe_insertion.max_interval,
+        )
+        .map(|s| {
+            let key = if keyframe_insertion
+                .max_interval
+                .is_some_and(|t| t.get::<cu29::units::si::time::second>() <= s)
+            {
+                "keyframe_policy.max_interval_s"
+            } else {
+                "keyframe_policy.max_frames_between"
+            };
+            (s, key)
+        });
         let parked_spacing = wheel_odom
             .as_ref()
             .and_then(|ron| ron.to_config().ok().flatten())
             .and_then(|w| w.parked_keyframe_interval)
-            .map(|t| (t, "wheel_odom.parked_keyframe_interval_s"))
-            .or_else(|| {
-                (keyframe_insertion.policy.max_frames_between == usize::MAX)
-                    .then_some(keyframe_insertion.max_interval)
-                    .flatten()
-                    .map(|t| (t, "keyframe_policy.max_interval_s"))
+            .map(|t| {
+                (
+                    t.get::<cu29::units::si::time::second>(),
+                    "wheel_odom.parked_keyframe_interval_s",
+                )
             })
-            .map(|(t, key)| (t.get::<cu29::units::si::time::second>(), key));
+            .into_iter()
+            .chain(policy_spacing)
+            .reduce(|a, b| if b.0 > a.0 { b } else { a });
         if inertial.is_some()
             && let Some(cull) = keyframe_culling.as_ref()
             && let Some((interval_s, key)) = parked_spacing
@@ -1281,6 +1302,13 @@ mod tests {
                 .is_err(),
             "min_keyframes 21 is not below 20"
         );
+        assert!(
+            vio_with_entries(
+                r#""max_keyframes": 120, "keyframe_culling": (enabled: true, protect_newest: 150)"#
+            )
+            .is_err(),
+            "protecting more keyframes than the bound can never cull"
+        );
         vio_with_entries(r#""max_keyframes": 120, "keyframe_culling": (enabled: true)"#)
             .expect("valid");
         let inertial = r#""inertial": (
@@ -1310,7 +1338,9 @@ mod tests {
     /// spacing on each side): it could never cull one, and the stops are where the room is.
     ///
     /// Mutation: dropping the startup check turned this red (the 5 s parked interval accepted);
-    /// so did dropping `PARKED_SPACING_SLACK_S` from it (1.5 s against 3 s accepted).
+    /// so did dropping `PARKED_SPACING_SLACK_S` from it (1.5 s against 3 s accepted), taking the
+    /// parked interval before the policy's bound instead of the longer of the two, and leaving
+    /// the frame-count bound out.
     #[test]
     fn test_culling_is_refused_when_no_parked_keyframe_could_be_culled() {
         let inertial = r#""inertial": (
@@ -1377,6 +1407,37 @@ mod tests {
             "{inertial}, {motion}, max_interval_s: 1.0), {cull})"
         ))
         .expect("1 s each side");
+
+        // Both set: a parked robot waits for the LONGER of the two, since the gate only
+        // withholds. A 2 s gate under a 5 s motion-only bound is 5 s each side.
+        let refused = with_wheel(&format!(
+            "{inertial}, {motion}, max_interval_s: 5.0), {}, {cull}, max_merged_imu_span_s: 5.0)",
+            parked(2.0)
+        ))
+        .err()
+        .expect("the policy's 5 s spacing, not the gate's 2 s")
+        .to_string();
+        assert!(
+            refused.contains("keyframe_policy.max_interval_s"),
+            "{refused}"
+        );
+
+        // A frame-count bound alone spaces a parked robot's keyframes as well: 300 frames is
+        // tens of seconds, and passed every check before.
+        let refused = vio_with_entries(&format!(
+            r#"{inertial}, "keyframe_policy": (max_frames_between: 300), {cull})"#
+        ))
+        .err()
+        .expect("300 frames each side")
+        .to_string();
+        assert!(
+            refused.contains("keyframe_policy.max_frames_between"),
+            "{refused}"
+        );
+        vio_with_entries(&format!(
+            r#"{inertial}, "keyframe_policy": (max_frames_between: 8), {cull})"#
+        ))
+        .expect("the default 8 frames fits the default 3 s merge");
     }
 
     #[test]

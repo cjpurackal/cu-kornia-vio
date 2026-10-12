@@ -770,9 +770,11 @@ pub struct InertialStats {
     /// initialization, and that refinement is not retried.
     pub init_apply_refused: u64,
     /// Initializations taken from a still window ([`crate::stationary`]), applied or dry. Also
-    /// counted in `init_accepted` when applied.
+    /// counted in `init_accepted` when applied. A window found but then refused (the bias
+    /// limit, the map) counts in `static_refused` instead.
     pub static_accepted: u64,
-    /// Keyframes on which a still window was looked for and not found, or refused.
+    /// Keyframes on which a still window was looked for and not found, or found and then refused
+    /// by the bias limit or the map.
     pub static_refused: u64,
     /// Carried alignments given up at the re-bootstrap because no wheel velocity was available
     /// for the new anchor; each one is followed by a fresh initialization.
