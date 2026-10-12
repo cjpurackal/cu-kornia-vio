@@ -599,6 +599,8 @@ impl StationaryEdgesRon {
 ///   motion_fraction: 0.2,       // bound growth per radian turned / metre driven since then
 ///   recovery_frames: 5,         // agreeing frames in a row before vision is accepted again
 ///   recovery_timeout_s: 3.0,    // then the map is re-anchored at the dead-reckoned pose
+///   rotation_window_s: 5.0,     // cumulative check: rotation against trusted poses this old
+///   translation_window_s: 0.5,  // and translation (short: frozen vision and wheel spin look alike)
 /// ),
 /// ```
 ///
@@ -624,6 +626,10 @@ pub(crate) struct MotionVetoRon {
     pub recovery_frames: Option<u32>,
     #[serde(default)]
     pub recovery_timeout_s: Option<f64>,
+    #[serde(default)]
+    pub rotation_window_s: Option<f64>,
+    #[serde(default)]
+    pub translation_window_s: Option<f64>,
 }
 
 fn default_true() -> bool {
@@ -654,6 +660,12 @@ impl MotionVetoRon {
         }
         if let Some(v) = self.recovery_timeout_s {
             cfg.recovery_timeout_s = v;
+        }
+        if let Some(v) = self.rotation_window_s {
+            cfg.rotation_window_s = v;
+        }
+        if let Some(v) = self.translation_window_s {
+            cfg.translation_window_s = v;
         }
         cfg.validate()?;
         Ok(self.enabled.then_some(cfg))
@@ -1696,7 +1708,7 @@ mod tests {
         let c = motion_veto(
             r#""motion_veto": (rotation_deg: 20.0, translation_m: 0.5, rotation_deg_per_s: 1.0,
                 translation_m_per_s: 0.05, motion_fraction: 0.1, recovery_frames: 8,
-                recovery_timeout_s: 4.0)"#,
+                recovery_timeout_s: 4.0, rotation_window_s: 8.0, translation_window_s: 1.0)"#,
         )
         .unwrap()
         .unwrap();
@@ -1707,6 +1719,8 @@ mod tests {
         assert_eq!(c.motion_fraction, 0.1);
         assert_eq!(c.recovery_frames, 8);
         assert_eq!(c.recovery_timeout_s, 4.0);
+        assert_eq!(c.rotation_window_s, 8.0);
+        assert_eq!(c.translation_window_s, 1.0);
         assert_eq!(
             motion_veto(r#""motion_veto": (enabled: false)"#).unwrap(),
             None
@@ -1714,6 +1728,7 @@ mod tests {
         for bad in [
             r#""motion_veto": (rotation_deg: 0.0)"#,
             r#""motion_veto": (recovery_frames: 0)"#,
+            r#""motion_veto": (translation_window_s: 0.0)"#,
             r#""motion_veto": (enabled: false, translation_m: -1.0)"#,
             r#""motion_veto": (rotation_degs: 10.0)"#,
         ] {

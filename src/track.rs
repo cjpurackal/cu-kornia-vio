@@ -1150,6 +1150,9 @@ pub struct Tracker {
     frame_pred_motion: (f64, f64),
     /// When the veto line last spoke; see [`should_log_throttled`].
     last_veto_log: Option<(f64, bool)>,
+    /// The veto decided on a candidate this frame ([`Tracker::veto_gate`] ran): a recovering
+    /// frame that never got that far broke the agreeing run.
+    frame_veto_decided: bool,
     /// Set when the map must be dropped and re-anchored at the current (dead-reckoned or pre-BA)
     /// pose: a recovery that timed out, or a local BA that moved the newest keyframe past the
     /// veto's bounds. Acted on at the top of the next frame.
@@ -1157,17 +1160,36 @@ pub struct Tracker {
     /// The last published pose and the world generation it was published in: what the
     /// `publish step` line measures each published pose against.
     last_published: Option<(u64, u64, Pose3d)>,
-    /// Test-only: a pose change applied to the newest keyframe right after its local BA is
-    /// applied, standing in for a solve that moved it (the 2026-10-12 incident).
+    /// Test-only: a pose change applied right after the local BA is applied, standing in for a
+    /// solve that moved keyframes (the 2026-10-12 incident moved the newest one).
     #[cfg(test)]
     inject_ba_move: Option<Pose3d>,
+    /// Test-only: which keyframes [`Self::inject_ba_move`] moves.
+    #[cfg(test)]
+    inject_ba_scope: BaMoveScope,
     /// Test-only: replaces the next tracked frame's PnP pose (vision that tracked to garbage).
     #[cfg(test)]
     inject_vision_pose: Option<Pose3d>,
+    /// Test-only: replaces the next tracked frame's per-frame fusion outcome, standing in for a
+    /// fusion whose factors share vision's (moved) anchor and so accept it, or reject it.
+    #[cfg(test)]
+    inject_fusion: Option<FusionOutcome>,
     /// Test-only: the next keyframe ask is a tracking-quality one (what a passer-by occluding
     /// the view produces), so a simulation can insert parked keyframes at will.
     #[cfg(test)]
     force_quality_keyframe: bool,
+}
+
+/// Test-only: the keyframes an injected BA move applies to.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaMoveScope {
+    /// The newest keyframe only.
+    Newest,
+    /// The keyframe this many places before the newest only.
+    Older(usize),
+    /// Every keyframe (and so every landmark): the whole world moved.
+    All,
 }
 
 /// Why the map is dropped and re-anchored by the veto.
@@ -1638,12 +1660,17 @@ impl Tracker {
             veto: VetoState::default(),
             frame_pred_motion: (0.0, 0.0),
             last_veto_log: None,
+            frame_veto_decided: false,
             pending_veto_rebootstrap: None,
             last_published: None,
             #[cfg(test)]
             inject_ba_move: None,
             #[cfg(test)]
+            inject_ba_scope: BaMoveScope::Newest,
+            #[cfg(test)]
             inject_vision_pose: None,
+            #[cfg(test)]
+            inject_fusion: None,
             #[cfg(test)]
             force_quality_keyframe: false,
         }
@@ -1771,6 +1798,7 @@ impl Tracker {
         self.frame_rel = None;
         self.frame_cov = None;
         self.frame_pred_motion = (0.0, 0.0);
+        self.frame_veto_decided = false;
         self.apply_pending_map_reset();
         self.apply_pending_veto_rebootstrap();
 
@@ -1831,7 +1859,8 @@ impl Tracker {
                 coast_anchor = seeded && status == TrackingStatus::KeyframeAccepted;
                 if status == TrackingStatus::KeyframeAccepted {
                     // The anchor is what the next frames are measured against.
-                    self.veto.trust(stamp_ns);
+                    let anchor = self.state.pose_world_to_cam;
+                    self.veto.trust(stamp_ns, &anchor, self.world_generation);
                     self.frame_report.pose_source = PoseSource::Anchor;
                 }
                 if status == TrackingStatus::KeyframeAccepted
@@ -1863,6 +1892,11 @@ impl Tracker {
         }
         if status == TrackingStatus::Skipped && self.frame_report.pose_source == PoseSource::None {
             self.frame_report.pose_source = PoseSource::Coast;
+        }
+        // A recovering frame vision could not place breaks the agreeing run: the N frames that
+        // end a recovery are consecutive, not N agreeing frames among lost ones.
+        if status == TrackingStatus::Skipped && !self.frame_veto_decided {
+            self.veto.note_unplaced();
         }
 
         // EVERY path, not just `tracking_step`: a frame handled by `bootstrap_stereo` that left
@@ -1966,7 +2000,19 @@ impl Tracker {
                 // A frame whose vision the fusion rejected, or the veto refused, is the motion
                 // sensors' prediction: a coast, not a measurement, so it neither clears the
                 // failure count nor leaves as Tracked.
-                if self.frame_report.vision_rejected || self.dead_reckoned_frame() {
+                if self.dead_reckoned_frame()
+                    && !(self.wheel.is_some() && self.world_anchored && self.frame_on_wheels)
+                {
+                    // The veto's dead reckoning without the wheels: the translation is the
+                    // constant-velocity guess and only the gyro measured anything, the Skipped
+                    // path's NotLocalized case, not a wheel-backed coast.
+                    self.stats.consecutive_failures =
+                        self.stats.consecutive_failures.saturating_add(1);
+                    TrackStatus::NotLocalized(TrackedPose {
+                        keyframe: false,
+                        ..pose
+                    })
+                } else if self.frame_report.vision_rejected || self.dead_reckoned_frame() {
                     self.stats.consecutive_failures =
                         self.stats.consecutive_failures.saturating_add(1);
                     TrackStatus::Coasting(TrackedPose {
@@ -2465,11 +2511,6 @@ impl Tracker {
         self.culled_keyframes
     }
 
-    /// Drop the map if the last insertion tripped [`TrackerConfig::max_keyframes`].
-    ///
-    /// DEFERRED from the keyframe that tripped it: resetting there would wipe the state the
-    /// caller is still reading that frame's pose out of. Bumps `world_generation` like any
-    /// other reset, so a consumer re-anchors on `reset_epoch`.
     /// Drops the map the veto asked to drop ([`Tracker::pending_veto_rebootstrap`]), keeping the
     /// calibration and, with wheels, the world: the next bootstrap anchors at the current pose
     /// carried on the wheels, which is the dead reckoning (a timed-out recovery) or the pre-BA
@@ -2482,11 +2523,13 @@ impl Tracker {
             self.veto.stats.rebootstraps += 1;
         }
         warning!(
-            "motion veto: dropping the map and re-anchoring at the dead-reckoned pose ({}): \
+            "motion veto: dropping the map and re-anchoring at {}: \
              keyframes={} world_continuous={} rebootstraps={} ba_refused={}",
             match why {
-                VetoRebootstrap::RecoveryTimeout => "vision never agreed again",
-                VetoRebootstrap::BaMove => "a local BA moved the newest keyframe",
+                VetoRebootstrap::RecoveryTimeout => {
+                    "the dead-reckoned pose (vision never agreed again)"
+                }
+                VetoRebootstrap::BaMove => "the pre-BA tracked pose (a local BA moved the map)",
             }
             .to_string(),
             self.map.keyframes().len(),
@@ -2497,6 +2540,11 @@ impl Tracker {
         self.reset_keeping_calibration();
     }
 
+    /// Drop the map if the last insertion tripped [`TrackerConfig::max_keyframes`].
+    ///
+    /// DEFERRED from the keyframe that tripped it: resetting there would wipe the state the
+    /// caller is still reading that frame's pose out of. Bumps `world_generation` like any
+    /// other reset, so a consumer re-anchors on `reset_epoch`.
     fn apply_pending_map_reset(&mut self) {
         if !std::mem::take(&mut self.pending_map_reset) {
             return;
@@ -3131,6 +3179,16 @@ impl Tracker {
         );
         self.veto
             .accumulate(self.frame_pred_motion.0, self.frame_pred_motion.1);
+        if let Some(cfg) = self.config.motion_veto {
+            // Every anchor of the cumulative check carried by this frame's dead reckoning.
+            self.veto.advance(
+                &Pose3d::between(&pose_before, &candidate_pose),
+                self.frame_on_gyro,
+                self.frame_on_wheels,
+                self.world_generation,
+            );
+            self.veto.prune(&cfg, stamp_ns);
+        }
 
         // Widen the search in proportion to how long we have been failing: a
         // pose compounded over seconds of loss carries far more uncertainty
@@ -3208,6 +3266,10 @@ impl Tracker {
                 let mut fused =
                     self.fuse_frame(&frame, &estimate.pose, &matches, &candidate_pose, stamp_ns);
                 fusion_us = self.fusion.last_cost_us;
+                #[cfg(test)]
+                if let Some(o) = self.inject_fusion.take() {
+                    fused = Some(o);
+                }
                 let was_coasting = self.fusion.consecutive_rejects > 0;
                 if fused.is_some_and(|o| o.rejected)
                     && self.fusion.consecutive_rejects >= MAX_CONSECUTIVE_REJECTS
@@ -3245,7 +3307,11 @@ impl Tracker {
                 // window, a rejection run that just expired): the pose about to be adopted
                 // against the gyro and the wheels since the last published pose.
                 let was_recovering = self.veto.recovering_since_ns.is_some();
-                let (gate, d) = self.veto_gate(&pose, &candidate_pose, stamp_ns);
+                // While re-localizing it is VISION that must agree, not what the fusion made of
+                // it: a frame the fusion rejected is its own prediction, which agrees with the
+                // dead reckoning by construction and would end the recovery unchecked.
+                let gated = if was_recovering { estimate.pose } else { pose };
+                let (gate, d) = self.veto_gate(&gated, &candidate_pose, stamp_ns);
                 if gate != Gate::Accept {
                     self.adopt_dead_reckoning(
                         gate,
@@ -3258,7 +3324,7 @@ impl Tracker {
                     self.classify_matches(&estimate.matches, &[]);
                     return self.finish_dead_reckoned_frame(timestamp_sec, estimate.inliers);
                 }
-                self.veto.trust(stamp_ns);
+                self.veto.trust(stamp_ns, &pose, self.world_generation);
                 if was_recovering {
                     warning!(
                         "motion veto: vision agreed with the dead reckoning for {} frames; \
@@ -3304,7 +3370,11 @@ impl Tracker {
                 }
                 self.vision_pose = Some((frame.idx, estimate.pose, pose));
                 self.state.pose_world_to_cam = pose;
-                self.state.velocity = Some(Pose3d::between(&pose_before, &pose));
+                // Not on the frame that ends a recovery: `pose_before` is the dead reckoning, and
+                // the step from it to vision is the recovery's offset, not a frame of motion (the
+                // relocalization path drops the velocity for the same reason).
+                self.state.velocity =
+                    (!was_recovering).then(|| Pose3d::between(&pose_before, &pose));
                 if rejected {
                     // The IMU and the wheels outvoted this frame's matches: published as a coast
                     // (process_frame), and none of the matches reaches the map, so a bad frame
@@ -3441,12 +3511,14 @@ impl Tracker {
                     self.log_veto("relocalization", frame_idx, stamp_ns, &d);
                 }
                 if gate != Gate::Accept {
+                    // The frame stays a coast: published from the dead reckoning.
                     self.frame_report.recovering = true;
+                    self.veto.stats.dead_reckoned += 1;
                 }
                 gate == Gate::Accept
             });
             if let Some((pose, inliers, kf_idx)) = relocalized {
-                self.veto.trust(stamp_ns);
+                self.veto.trust(stamp_ns, &pose, self.world_generation);
                 self.frame_report.pose_source = PoseSource::Relocalized;
                 warning!(
                     "relocalized against the existing map: frame={} inliers={} kf={} lost_for_sec={}",
@@ -3769,7 +3841,16 @@ impl Tracker {
             .veto
             .since_trusted_s(stamp_ns, self.last_frame_stamp_ns);
         let bounds = cfg.bounds(dt, self.veto.turned_rad, self.veto.driven_m);
-        let d = Disagreement::measure(candidate, prediction, sensors, bounds);
+        let mut d = Disagreement::measure(candidate, prediction, sensors, bounds);
+        // The cumulative check: every trusted pose of the windows carried to this frame.
+        if let Some(a) = self
+            .veto
+            .against_anchors(&cfg, candidate, stamp_ns, self.world_generation)
+            && a.ratio() > d.ratio()
+        {
+            d = a;
+        }
+        self.frame_veto_decided = true;
         let gate = self.veto.decide(&cfg, &d, stamp_ns);
         (gate, d)
     }
@@ -4699,21 +4780,26 @@ impl Tracker {
         let ba_window_ready =
             self.config.enable_local_ba && self.map.keyframes().len() > BA_ACTIVE_KEYFRAMES;
         let suspect_in_window = self.vision_suspect_in_ba_window();
-        self.note_vision_degraded(suspect_in_window, frame.idx);
+        self.note_vision_degraded(suspect_in_window, frame.idx, stamp_ns);
         let vision_suspect = ba_window_ready && suspect_in_window;
         if vision_suspect {
             self.consistency.ba_skipped += 1;
         }
         let ran_ba = ba_window_ready && !vision_suspect;
-        // Set when the solve moved the newest keyframe past the veto's bounds.
+        // Set when the solve moved a keyframe past the veto's bounds.
         let mut ba_breach = false;
         if ran_ba {
-            // The newest keyframe as tracking (and the veto) left it, before the solve.
-            let pre_ba = self
-                .map
-                .keyframes()
-                .last()
-                .map(|k| k.frame.pose_world_to_cam);
+            // Every keyframe as tracking (and the veto) left it, before the solve: the gate below
+            // holds each one's shift, not only the newest's.
+            let pre_ba: Vec<(usize, Pose3d)> = if self.config.motion_veto.is_some() {
+                self.map
+                    .keyframes()
+                    .iter()
+                    .map(|k| (k.frame.idx, k.frame.pose_world_to_cam))
+                    .collect()
+            } else {
+                Vec::new()
+            };
             // Every keyframe tracked from here on is tracked against a map a solve has held.
             self.map_settled = true;
             // kornia-slam's only BA entry points solve a `BaSnapshot` and hand back an update
@@ -4843,45 +4929,88 @@ impl Tracker {
                     .map(|k| (k.frame.idx, k.frame.pose_world_to_cam))
                     .unzip();
                 let mut after = before.clone();
-                if let Some(last) = after.last_mut() {
-                    *last = m.compose(last);
+                let n = after.len();
+                for (i, p) in after.iter_mut().enumerate() {
+                    let moved = match self.inject_ba_scope {
+                        BaMoveScope::Newest => i + 1 == n,
+                        BaMoveScope::Older(k) => i + 1 + k == n,
+                        BaMoveScope::All => true,
+                    };
+                    if moved {
+                        *p = m.compose(p);
+                    }
                 }
                 self.map
                     .apply_pose_graph_correction(&idx, &before, &after)
                     .expect("the injected BA move applies");
             }
-            // THE BA GATE: a solve that moved the newest keyframe past the veto's bounds (with no
-            // time and no motion to grow them: the keyframe is the same instant) is refused. The
-            // map already holds it (kornia-slam's update is opaque until applied, and nothing can
-            // write its pre-solve state back), so the map is dropped next frame and re-anchored at
-            // the pre-BA pose, which is the one kept and published here. 2026-10-12 21:53:38: a
-            // local BA moved the newest keyframe 2.18 m and 92 deg; the sync-back below published
-            // it and the world stayed rotated.
-            if let (Some(cfg), Some(pre), Some(post)) = (
-                self.config.motion_veto,
-                pre_ba,
-                self.map
-                    .keyframes()
-                    .last()
-                    .map(|k| k.frame.pose_world_to_cam),
-            ) {
+            // THE BA GATE. 2026-10-12 21:53:38: a local BA moved the newest keyframe 2.18 m and
+            // 92 deg; the sync-back below published it and the world stayed rotated. A solve is
+            // refused when it moved ANY keyframe past the veto's bounds (with no time and no
+            // motion to grow them: each keyframe is the same instant before and after), or when
+            // the newest keyframe's new pose disagrees with the gyro and wheel dead reckoning from
+            // the trusted poses of the veto's windows (what the per-frame veto cannot see: the
+            // next frame is predicted from, and tracked in, the moved map). The latter is what
+            // stops repeated sub-bound moves adding up. The map already holds the solve
+            // (kornia-slam's update is opaque until applied, and nothing can write its pre-solve
+            // state back), so it is dropped next frame and re-anchored at the pre-BA pose, which
+            // is the one kept and published here.
+            if let Some(cfg) = self.config.motion_veto {
                 let both = Sensors {
                     gyro: true,
                     wheels: true,
                 };
-                let d = Disagreement::measure(&post, &pre, both, cfg.bounds(0.0, 0.0, 0.0));
-                if d.vetoed() {
+                let zero = cfg.bounds(0.0, 0.0, 0.0);
+                // (keyframe, disagreement, against the dead reckoning)
+                let mut worst: Option<(usize, Disagreement, bool)> = None;
+                let mut consider = |idx: usize, d: Disagreement, dead_reckoned: bool| {
+                    if worst.is_none_or(|(_, w, _)| d.ratio() > w.ratio()) {
+                        worst = Some((idx, d, dead_reckoned));
+                    }
+                };
+                for k in self.map.keyframes() {
+                    if let Some((_, pre)) = pre_ba.iter().find(|(i, _)| *i == k.frame.idx) {
+                        let post = k.frame.pose_world_to_cam;
+                        consider(
+                            k.frame.idx,
+                            Disagreement::measure(&post, pre, both, zero),
+                            false,
+                        );
+                    }
+                }
+                if let Some(newest) = self.map.keyframes().last()
+                    && let Some(d) = self.veto.against_anchors(
+                        &cfg,
+                        &newest.frame.pose_world_to_cam,
+                        stamp_ns,
+                        self.world_generation,
+                    )
+                {
+                    consider(newest.frame.idx, d, true);
+                }
+                if let Some((kf, d, dead_reckoned)) = worst
+                    && d.vetoed()
+                {
                     ba_breach = true;
                     self.veto.stats.ba_refused += 1;
                     self.frame_report.ba_refused = true;
                     self.pending_veto_rebootstrap = Some(VetoRebootstrap::BaMove);
                     warning!(
-                        "motion veto: local BA moved the newest keyframe past the bounds; refused \
-                         (pose kept, map dropped and re-anchored next frame): frame={} \
-                         moved_deg={} moved_mm={} ba_refused={}",
+                        "motion veto: local BA refused (pose kept, map dropped and re-anchored \
+                         next frame): frame={} kf={} against={} moved_deg={} bound_deg={} \
+                         moved_mm={} bound_mm={} ba_refused={}",
                         frame.idx,
+                        kf,
+                        if dead_reckoned {
+                            "the gyro and wheel dead reckoning"
+                        } else {
+                            "its pre-BA pose"
+                        }
+                        .to_string(),
                         d.rotation_rad.to_degrees(),
+                        d.rotation_bound_rad.to_degrees(),
                         d.translation_m * 1e3,
+                        d.translation_bound_m * 1e3,
                         self.veto.stats.ba_refused
                     );
                 }
@@ -5061,27 +5190,43 @@ impl Tracker {
     }
 
     /// Edge-logs the degraded state: a vision-suspect interval entering or leaving the local BA
-    /// window. The published pose stays vision's while degraded (so it may be frozen); what
-    /// changes is that no solve bends the map or the bias to agree with it.
-    fn note_vision_degraded(&mut self, suspect_in_window: bool, frame_idx: usize) {
+    /// window. While one is in it no solve bends the map or the bias to agree with vision.
+    ///
+    /// With the motion veto on, entering DEGRADED also starts the veto's recovery
+    /// ([`crate::veto`]): the dead reckoning is published from the next frame, vision is accepted
+    /// again only after `recovery_frames` consecutive frames agree with it, and if it never does
+    /// the map is re-anchored at the dead-reckoned pose. The suspect interval leaving the window
+    /// only lets local BA run again: it never recovers the pose in place. With the veto off the
+    /// published pose stays vision's (so it may be frozen).
+    fn note_vision_degraded(&mut self, suspect_in_window: bool, frame_idx: usize, stamp_ns: u64) {
         if suspect_in_window == self.vision_degraded {
             return;
         }
         self.vision_degraded = suspect_in_window;
         if suspect_in_window {
             self.consistency.degraded_entries += 1;
+            let recovering = self.config.motion_veto.is_some();
+            if recovering {
+                self.veto.begin_recovery(stamp_ns);
+            }
             warning!(
                 "tracking DEGRADED: vision disagrees with the wheels and the gyro (frozen or \
-                 self-tracking view); local BA held off, the published pose is vision's and may \
-                 be frozen frame={} times_degraded={}",
+                 self-tracking view); local BA held off, {} frame={} times_degraded={}",
+                if recovering {
+                    "publishing the dead reckoning until vision agrees with it again"
+                } else {
+                    "the published pose is vision's and may be frozen"
+                }
+                .to_string(),
                 frame_idx,
                 self.consistency.degraded_entries
             );
         } else {
             info!(
-                "tracking RECOVERED: no vision-suspect interval left in the local BA window \
-                 frame={}",
-                frame_idx
+                "local BA resumes: no vision-suspect interval left in the window frame={} \
+                 veto_recovering={}",
+                frame_idx,
+                self.veto.recovering_since_ns.is_some()
             );
         }
     }
@@ -10188,6 +10333,11 @@ mod tests {
     /// keyframe of the frozen turn keeps the pose vision tracked, and the bias the next edge is
     /// linearized at is the parked one.
     ///
+    /// The motion veto is OFF here: with it on, the frozen turn is vetoed within a second and
+    /// no keyframe of it is inserted at all
+    /// (`test_a_frozen_view_in_a_turn_is_vetoed_by_the_cumulative_check`). This is the BA hold,
+    /// the layer underneath.
+    ///
     /// Mutation: running local BA regardless (`ran_ba = ba_window_ready`) turned this red (the
     /// solves moved the turn's keyframes off their tracked poses).
     #[test]
@@ -10196,6 +10346,7 @@ mod tests {
         let mut tracker = scene_tracker_with(|c| {
             c.inertial = Some(static_inertial_config());
             c.wheel_odom = Some(scene_wheel_config());
+            c.motion_veto = None;
         });
         let start = park_until_static_init(&mut tracker);
         let refused_before = tracker.ba_updates_refused();
@@ -13044,32 +13195,55 @@ mod tests {
     /// Every fusion state the incident could have met (2026-10-12 21:53:38).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum VetoCase {
-        /// Per-frame fusion running.
+        /// Per-frame fusion running and ACCEPTING the jump (its factors share vision's moved
+        /// anchor, as on 2026-10-12): the fused pose is the jump.
         Fused,
+        /// The fusion rejected vision but kept its rotation (its 3-DOF block passed): the
+        /// published rotation is vision's.
+        RotationKept,
         /// Fusion suspended on the last keyframe (an expired run or a relocalization).
         Suspended,
         /// Fusion off: no factors to fuse, vision's pose unfused (the `None` paths).
         NoFusion,
-        /// The frame that ends a 15-frame rejection run (the expiry used to accept vision).
+        /// The frame that ends a 15-frame rejection run: the expiry adopts VISION's pose.
         AfterRejectRun,
         /// The inertial path not initialized yet (the gyro integrates at the initial bias).
         ImuUninitialized,
-        /// The wheels stale: the veto is the gyro's alone, on rotation.
+        /// The wheels missed the frame's reading.
         WheelsStale,
+    }
+
+    /// A per-frame fusion outcome for [`Tracker::inject_fusion`].
+    fn fusion_outcome(pose: Pose3d, rejected: bool, rotation_kept: bool) -> FusionOutcome {
+        FusionOutcome {
+            pose,
+            rejected,
+            rotation_kept,
+            dropped: None,
+            chi2: 1.0,
+            dof: 6,
+            covariance_cw: None,
+        }
     }
 
     /// THE VETO: a vision pose 92 deg / 2.18 m off while the gyro and the wheels say the robot
     /// stood still is never published, in every fusion state: the published pose is the dead
     /// reckoning (within a few mm and a fraction of a degree of the last one), the frame leaves
-    /// as Coasting with `VisionVetoed`, and it neither becomes a keyframe nor adds a landmark.
+    /// as a coast with `VisionVetoed`, and it neither becomes a keyframe nor adds a landmark.
     ///
-    /// Mutation (core rule): `motion_veto: None` is the control arm below; with it, every case
-    /// but the rejecting ones publishes the jump.
+    /// The fused, rotation-kept and reject-run cases get their fusion outcome injected
+    /// ([`Tracker::inject_fusion`]): a real solve on the swapped PnP pose loses every match to
+    /// the outlier gate and returns `None`, which would leave all of them on the unfused path.
+    ///
+    /// Mutation (core rule): `motion_veto: None` is the control arm below, where EVERY case
+    /// publishes the jump. Moving the veto into the `else` of the reject-run expiry (skipped on
+    /// the expiry frame) turned the `AfterRejectRun` case red.
     #[test]
     fn test_vision_two_sensors_contradict_is_vetoed_in_every_fusion_state() {
         use VetoCase::*;
         for case in [
             Fused,
+            RotationKept,
             Suspended,
             NoFusion,
             AfterRejectRun,
@@ -13097,31 +13271,53 @@ mod tests {
                     before = published(&feed_moving(&mut t, seq, &still, 0.0, &Pose3d::IDENTITY));
                     seq += 1;
                 }
+                let bad = incident_vision(&t.state.pose_world_to_cam);
                 match case {
                     Suspended => t.fusion_suspended_on = t.state.last_keyframe_idx,
                     AfterRejectRun => {
                         t.fusion.consecutive_rejects = MAX_CONSECUTIVE_REJECTS;
+                        // The fusion rejects this frame too, publishing its prediction; the
+                        // expiry then adopts vision instead.
+                        t.inject_fusion =
+                            Some(fusion_outcome(t.state.pose_world_to_cam, true, false));
+                    }
+                    Fused => t.inject_fusion = Some(fusion_outcome(bad, false, false)),
+                    RotationKept => {
+                        t.inject_fusion = Some(fusion_outcome(
+                            rotate_about_centre(t.state.pose_world_to_cam, bad.rotation),
+                            true,
+                            true,
+                        ));
                     }
                     _ => {}
                 }
+                let expired0 = t.fusion.reject_runs_expired;
                 let (kfs, points) = (t.map.keyframes().len(), t.map.num_map_points());
                 if veto {
                     t.config.keyframe_policy.min_frames_between = 0;
                     t.force_quality_keyframe = true;
                 }
-                t.inject_vision_pose = Some(incident_vision(&t.state.pose_world_to_cam));
+                t.inject_vision_pose = Some(bad);
                 let wheel = (case != WheelsStale).then_some([0.0, 0.0, 0.0]);
                 let status = feed_moving_opt(&mut t, seq, &still, wheel, &Pose3d::IDENTITY);
                 let report = t.frame_report();
                 let (mm, deg) = pose_gap(&published(&status), &before);
+                if case == AfterRejectRun {
+                    assert_eq!(
+                        t.fusion.reject_runs_expired,
+                        expired0 + 1,
+                        "{case:?}: the expiry did not run"
+                    );
+                }
                 if !veto {
-                    // Control: without the veto the unfused path publishes it.
-                    if case == NoFusion {
-                        assert!(
-                            mm > 1000.0 || deg > 45.0,
-                            "{case:?} control: {mm} mm {deg} deg"
-                        );
-                    }
+                    // Control: without the veto every one of these paths ADOPTS the jump (the
+                    // reject-run expiry publishes it through the hold, closing on it over the
+                    // next frames rather than in this one).
+                    let (amm, adeg) = pose_gap(&t.state.pose_world_to_cam, &before);
+                    assert!(
+                        amm > 1000.0 || adeg > 45.0,
+                        "{case:?} control: adopted {amm} mm {adeg} deg"
+                    );
                     continue;
                 }
                 assert!(
@@ -13168,7 +13364,8 @@ mod tests {
     /// held for `recovery_frames - 1` frames (Coasting, the dead reckoning published, nothing
     /// written) and accepted on the next; the published pose then stays continuous.
     ///
-    /// Mutation: `recovery_frames` 1 (accept at once) turned this red.
+    /// Mutations: `recovery_frames` 1 (accept at once) turned this red; so did keeping the
+    /// velocity `between(dead reckoning, vision)` on the accepting frame.
     #[test]
     fn test_after_a_veto_vision_is_accepted_only_after_n_agreeing_frames() {
         let mut t = fusion_tracker(true);
@@ -13207,6 +13404,8 @@ mod tests {
         let status = feed_moving(&mut t, seq, &still, 0.0, &Pose3d::IDENTITY);
         assert!(matches!(status, TrackStatus::Tracked(_)), "{status:?}");
         assert!(!t.veto_recovering());
+        // The step from the dead reckoning to vision is the recovery's offset, not a velocity.
+        assert!(t.state.velocity.is_none(), "{:?}", t.state.velocity);
         let v = t.veto_stats();
         assert_eq!(
             (v.vetoes, v.relocalizations, v.rebootstraps),
@@ -13490,5 +13689,274 @@ mod tests {
             "only {fused_before_kf} moving frames before a keyframe"
         );
         assert_eq!(t.veto_stats().vetoes, 0);
+    }
+
+    /// A camera turning about its vertical at `rate` rad/s from `t_start` s, through the wheel
+    /// mount `t_cb` (the turn test's scene): `(camera at t, wheel theta at t)`.
+    fn turning(
+        rate: f64,
+        t_start: f64,
+        t_cb: Pose3d,
+    ) -> (impl Fn(f64) -> Pose3d, impl Fn(f64) -> f64) {
+        let theta = move |t: f64| rate * (t - t_start).max(0.0);
+        let cam_at = move |t: f64| {
+            let rz = Pose3d::new(
+                SO3F64::exp(Vec3F64::new(0.0, 0.0, theta(t))).matrix(),
+                Vec3F64::ZERO,
+            );
+            t_cb.compose(&rz).compose(&t_cb.inverse())
+        };
+        (cam_at, theta)
+    }
+
+    fn t_of(seq: u32) -> f64 {
+        f64::from(seq) * FRAME_NS as f64 * 1e-9
+    }
+
+    /// THE CUMULATIVE CHECK (no wheels, no fusion: the gyro alone, and no keyframe-level motion
+    /// check to help). A frozen view while the robot turns at 0.25 rad/s: vision says 0 deg per
+    /// frame and the gyro ~1 deg, far under the 10 deg per-frame bound, so a per-frame check
+    /// accepts every frame and the published pose stays frozen while the robot turns. Against
+    /// the trusted poses of the last seconds carried by the gyro it is vetoed within ~1.3 s,
+    /// and the dead reckoning (turning with the gyro) is published from then on, as
+    /// NotLocalized: without the wheels its translation is a guess.
+    ///
+    /// Mutations: `against_anchors` returning `None` (per-frame only) turned this red (never
+    /// vetoed); dropping the no-wheel NotLocalized branch turned it red (Coasting).
+    #[test]
+    fn test_a_frozen_view_in_a_turn_is_vetoed_by_the_cumulative_check() {
+        for veto in [true, false] {
+            let mut t = scene_tracker_with(|c| {
+                c.inertial = Some(static_inertial_config());
+            });
+            if !veto {
+                t.config.motion_veto = None;
+            }
+            let still = |_t: f64| Pose3d::IDENTITY;
+            for seq in 0..6 {
+                feed_moving_opt(&mut t, seq, &still, None, &Pose3d::IDENTITY);
+            }
+            let start = 6u32;
+            let t_cb = scene_wheel_config().t_cb;
+            let (cam_at, _) = turning(0.25, t_of(start), t_cb);
+            let mut first_veto = None;
+            // (frame, published) of every dead-reckoned frame after the veto.
+            let mut dead_reckoned = Vec::new();
+            let mut last = Pose3d::IDENTITY;
+            for (i, seq) in (start..start + 40).enumerate() {
+                // The view stays where the turn started: a frozen camera.
+                let status = feed_moving_opt(&mut t, seq, &cam_at, None, &Pose3d::IDENTITY);
+                if t.frame_report().vision_vetoed && first_veto.is_none() {
+                    first_veto = Some(i);
+                    assert!(
+                        matches!(status, TrackStatus::NotLocalized(_)),
+                        "a gyro-only dead reckoning: {status:?}"
+                    );
+                }
+                // Untracked: the dead-reckoned seed has turned away from the frozen view, and
+                // without the wheels an unplaced frame publishes nothing.
+                if matches!(status, TrackStatus::Untracked) {
+                    continue;
+                }
+                last = published(&status);
+                if first_veto.is_some() && t.frame_report().pose_source == PoseSource::Vetoed {
+                    dead_reckoned.push((i, last));
+                }
+            }
+            if !veto {
+                assert!(first_veto.is_none());
+                let (_, turned_deg) = pose_gap(&last, &Pose3d::IDENTITY);
+                assert!(
+                    turned_deg < 3.0,
+                    "control: the frozen view turned {turned_deg} deg"
+                );
+                continue;
+            }
+            let i = first_veto.expect("a frozen view in a turn was never vetoed");
+            assert!(i <= 20, "vetoed only {i} frames into the turn");
+            // From the veto on, the published pose turns with the gyro (0.95 deg per frame).
+            let ((i0, p0), (i1, p1)) = (dead_reckoned[0], *dead_reckoned.last().unwrap());
+            assert!(i1 >= i0 + 3, "{} dead-reckoned frames", dead_reckoned.len());
+            let per_frame = pose_gap(&p1, &p0).1 / (i1 - i0) as f64;
+            let gyro = (0.25 * FRAME_NS as f64 * 1e-9).to_degrees();
+            assert!(
+                (per_frame - gyro).abs() < 0.25 * gyro,
+                "published {per_frame} deg per frame, the gyro {gyro}"
+            );
+        }
+    }
+
+    /// A tracking DEGRADED verdict (the keyframe-level motion check: vision disagreed with the
+    /// wheels and the gyro) starts the veto's recovery: the dead reckoning is published, the
+    /// suspect interval leaving the BA window does NOT end it, and vision is accepted again only
+    /// after `recovery_frames` agreeing frames. With the veto off it changes nothing published.
+    ///
+    /// Mutation: dropping `begin_recovery` from `note_vision_degraded` turned this red.
+    #[test]
+    fn test_a_degraded_verdict_publishes_the_dead_reckoning_until_vision_agrees() {
+        for veto in [true, false] {
+            let mut t = fusion_tracker(true);
+            if !veto {
+                t.config.motion_veto = None;
+            }
+            let n = MotionVetoConfig::default().recovery_frames;
+            let still = |_t: f64| Pose3d::IDENTITY;
+            let mut seq = park_until_static_init(&mut t);
+            for _ in 0..3 {
+                feed_moving(&mut t, seq, &still, 0.0, &Pose3d::IDENTITY);
+                seq += 1;
+            }
+            let stamp = EPOCH_NS + u64::from(seq - 1) * FRAME_NS;
+            t.note_vision_degraded(true, 0, stamp);
+            if !veto {
+                assert!(!t.veto_recovering());
+                let status = feed_moving(&mut t, seq, &still, 0.0, &Pose3d::IDENTITY);
+                assert!(matches!(status, TrackStatus::Tracked(_)), "{status:?}");
+                continue;
+            }
+            assert!(t.veto_recovering());
+            assert_eq!(t.veto_stats().degraded_recoveries, 1);
+            for i in 1..n {
+                let status = feed_moving(&mut t, seq, &still, 0.0, &Pose3d::IDENTITY);
+                seq += 1;
+                assert!(
+                    matches!(status, TrackStatus::Coasting(_)),
+                    "hold {i}: {status:?}"
+                );
+                assert_eq!(t.frame_report().pose_source, PoseSource::Recovering);
+                // The window emptying is not a recovery.
+                t.note_vision_degraded(false, 0, stamp);
+                assert!(t.veto_recovering(), "hold {i}: recovered in place");
+            }
+            let status = feed_moving(&mut t, seq, &still, 0.0, &Pose3d::IDENTITY);
+            assert!(matches!(status, TrackStatus::Tracked(_)), "{status:?}");
+            assert!(!t.veto_recovering());
+            assert_eq!(t.veto_stats().relocalizations, 1);
+        }
+    }
+
+    /// While re-localizing it is VISION that is checked: a frame the fusion rejects publishes
+    /// its prediction, which agrees with the dead reckoning by construction. Vision 7 deg off
+    /// (under the 10 deg veto, past the 5 deg agreement band) with the fusion rejecting it every
+    /// frame must not end the recovery.
+    ///
+    /// Mutation: gating the fusion's output instead of vision during a recovery turned this red
+    /// (accepted after `recovery_frames` rejected frames, `relocalizations` 1).
+    #[test]
+    fn test_a_recovery_is_not_ended_by_frames_the_fusion_rejected() {
+        let mut t = fusion_tracker(true);
+        let n = t.config.motion_veto.unwrap().recovery_frames;
+        let still = |_t: f64| Pose3d::IDENTITY;
+        let mut seq = park_until_static_init(&mut t);
+        for _ in 0..3 {
+            feed_moving(&mut t, seq, &still, 0.0, &Pose3d::IDENTITY);
+            seq += 1;
+        }
+        t.inject_vision_pose = Some(incident_vision(&t.state.pose_world_to_cam));
+        feed_moving(&mut t, seq, &still, 0.0, &Pose3d::IDENTITY);
+        seq += 1;
+        assert!(t.frame_report().vision_vetoed);
+        let yaw7 = SO3F64::exp(Vec3F64::new(0.0, 7f64.to_radians(), 0.0)).matrix();
+        for i in 0..n + 3 {
+            let p = t.state.pose_world_to_cam;
+            t.inject_vision_pose = Some(rotate_about_centre(p, yaw7 * p.rotation));
+            t.inject_fusion = Some(fusion_outcome(p, true, false));
+            let status = feed_moving(&mut t, seq, &still, 0.0, &Pose3d::IDENTITY);
+            seq += 1;
+            assert!(
+                t.veto_recovering(),
+                "frame {i}: the recovery ended on fusion-rejected frames: {status:?} {:?}",
+                t.veto_stats()
+            );
+            assert!(!matches!(status, TrackStatus::Tracked(_)), "frame {i}");
+        }
+        assert_eq!(t.veto_stats().relocalizations, 0);
+    }
+
+    /// Up to the keyframe whose local BA gets `t.inject_ba_move`; that keyframe's status.
+    fn run_to_injected_ba(t: &mut Tracker, seq: &mut u32) -> TrackStatus {
+        let still = |_t: f64| Pose3d::IDENTITY;
+        loop {
+            let status = feed_moving(t, *seq, &still, 0.0, &Pose3d::IDENTITY);
+            *seq += 1;
+            if t.inject_ba_move.is_none() {
+                break status;
+            }
+            assert!(*seq < 600, "no keyframe with a BA");
+        }
+    }
+
+    /// A tracker with a full local BA window, parked still.
+    fn ba_window_tracker() -> (Tracker, u32) {
+        let mut t = fusion_tracker(true);
+        let still = |_t: f64| Pose3d::IDENTITY;
+        let mut seq = park_until_static_init(&mut t);
+        t.config.keyframe_policy.min_frames_between = 0;
+        while t.map.keyframes().len() <= BA_ACTIVE_KEYFRAMES + 1 {
+            t.force_quality_keyframe = true;
+            feed_moving(&mut t, seq, &still, 0.0, &Pose3d::IDENTITY);
+            seq += 1;
+            assert!(seq < 300, "no BA window");
+        }
+        (t, seq)
+    }
+
+    /// Sub-bound BA moves that ADD UP are refused: a solve that rotates the whole world 7 deg
+    /// (every keyframe within the 10 deg bound of its pre-BA pose) is kept, and the next one,
+    /// another 7 deg, is refused, because the newest keyframe is then 14 deg from where the gyro
+    /// carried the trusted poses of the last seconds. The per-frame veto cannot see either: the
+    /// next frames are predicted from, and tracked in, the moved map.
+    ///
+    /// Mutation: dropping the dead-reckoning (anchor) term from the BA gate turned this red
+    /// (both moves kept).
+    #[test]
+    fn test_repeated_sub_bound_ba_moves_are_refused_once_they_add_up() {
+        let (mut t, mut seq) = ba_window_tracker();
+        let yaw7 = Pose3d::new(
+            SO3F64::exp(Vec3F64::new(0.0, 7f64.to_radians(), 0.0)).matrix(),
+            Vec3F64::ZERO,
+        );
+        t.inject_ba_scope = BaMoveScope::All;
+        t.inject_ba_move = Some(yaw7);
+        t.force_quality_keyframe = true;
+        run_to_injected_ba(&mut t, &mut seq);
+        assert!(
+            !t.frame_report().ba_refused,
+            "the first 7 deg move was refused"
+        );
+        assert_eq!(t.veto_stats().ba_refused, 0);
+        t.inject_ba_move = Some(yaw7);
+        t.force_quality_keyframe = true;
+        run_to_injected_ba(&mut t, &mut seq);
+        assert!(
+            t.frame_report().ba_refused,
+            "14 deg of BA moves kept: {:?}",
+            t.veto_stats()
+        );
+        assert_eq!(t.veto_stats().ba_refused, 1);
+    }
+
+    /// A solve that rotates an OLDER keyframe of the window 30 deg while the newest stays put is
+    /// refused: every keyframe's shift is held to the bounds, not only the newest's.
+    ///
+    /// Mutation: checking only the newest keyframe's shift turned this red.
+    #[test]
+    fn test_a_local_ba_that_moves_an_older_keyframe_is_refused() {
+        let (mut t, mut seq) = ba_window_tracker();
+        let yaw30 = Pose3d::new(
+            SO3F64::exp(Vec3F64::new(0.0, 30f64.to_radians(), 0.0)).matrix(),
+            Vec3F64::ZERO,
+        );
+        t.inject_ba_scope = BaMoveScope::Older(2);
+        t.inject_ba_move = Some(yaw30);
+        t.force_quality_keyframe = true;
+        let drops0 = t.map_drops();
+        let before = t.state.pose_world_to_cam;
+        let status = run_to_injected_ba(&mut t, &mut seq);
+        assert!(t.frame_report().ba_refused, "{:?}", t.veto_stats());
+        let (mm, deg) = pose_gap(&published(&status), &before);
+        assert!(mm < 5.0 && deg < 0.5, "{mm} mm {deg} deg");
+        feed_moving(&mut t, seq, &|_t| Pose3d::IDENTITY, 0.0, &Pose3d::IDENTITY);
+        assert_eq!(t.map_drops(), drops0 + 1, "the moved map was kept");
     }
 }
