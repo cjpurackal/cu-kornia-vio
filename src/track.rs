@@ -86,10 +86,10 @@ use kornia_imgproc::resize::resize_fast_mono;
 use kornia_sensors::imu::{GRAVITY_MAGNITUDE, ImuBias, PreintegratedImu};
 use kornia_slam::Frame;
 use kornia_slam::TrackingStatus;
-use kornia_slam::initialization::two_view::TwoViewInitConfig;
-use kornia_slam::initialization::{
+use kornia_slam::inertial::{
     AlignedTrackingState, ImuInitResult, ImuInitializer, ImuWindowStats, StationaryInitError,
 };
+use kornia_slam::initialization::two_view::TwoViewInitConfig;
 use kornia_slam::mapping::bundle_adjustment::{local_window, run_local_ba, run_local_inertial_ba};
 use kornia_slam::mapping::culling::{
     KeyframeCullingConfig, cull_landmarks, cull_redundant_keyframes,
@@ -309,11 +309,10 @@ pub struct TrackerConfig {
 impl TrackerConfig {
     /// Builds a config for a rectified pair with the given metric baseline.
     pub fn new(baseline: Length) -> Self {
-        // Upstream's `SlamConfig::default` tightens two triangulation
-        // thresholds relative to kornia-3d's defaults; both feed the growth pass.
-        let mut two_view_init = TwoViewInitConfig::default();
-        two_view_init.triangulation_config.max_midpoint_gap = 0.25;
-        two_view_init.triangulation_config.max_reprojection_error = 3.0;
+        // Upstream's `TwoViewInitConfig::default` carries the runtime's
+        // triangulation gates (`max_midpoint_gap` 0.25, `max_reprojection_error`
+        // 3.0), tighter than kornia-3d's; both feed the growth pass.
+        let two_view_init = TwoViewInitConfig::default();
 
         Self {
             baseline,
@@ -5826,6 +5825,16 @@ mod tests {
             .expect("densification enabled")
             .get::<meter>();
         assert!((close - 2.625).abs() < 1e-12, "got {close}");
+    }
+
+    /// The growth pass runs on the triangulation gates the tracker always used; they now come
+    /// from upstream's `TwoViewInitConfig::default`, so a change there must show up here.
+    #[test]
+    fn test_triangulation_gates_are_the_runtime_ones() {
+        let cfg = TrackerConfig::new(Length::new::<meter>(0.075));
+        let t = &cfg.two_view_init.triangulation_config;
+        assert_eq!(t.max_midpoint_gap, 0.25);
+        assert_eq!(t.max_reprojection_error, 3.0);
     }
 
     #[test]

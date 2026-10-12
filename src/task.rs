@@ -541,7 +541,7 @@ impl CuTask for StereoVio {
                 config.reset_map_on_loss =
                     matches!(self.on_tracking_loss, OnTrackingLoss::ResetMap);
                 config.max_keyframes = self.max_keyframes;
-                config.keyframe_policy = self.keyframe_insertion.policy.clone();
+                config.keyframe_policy = self.keyframe_insertion.policy;
                 config.keyframe_max_interval = self.keyframe_insertion.max_interval;
                 config.keyframe_culling = self.keyframe_culling.clone();
                 if let Some(n) = self.orb_keypoints {

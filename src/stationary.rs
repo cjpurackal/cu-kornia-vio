@@ -24,7 +24,7 @@ use cu29::units::si::frequency::hertz;
 use cu29::units::si::time::second;
 use kornia_3d::pose::Pose3d;
 use kornia_sensors::imu::ImuCalib;
-use kornia_slam::initialization::ImuWindowStats;
+use kornia_slam::inertial::ImuWindowStats;
 
 use crate::wheel::WheelDelta;
 

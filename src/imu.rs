@@ -49,7 +49,7 @@ use cu29::units::si::time::second;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3F64, Vec3F64};
 use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
-use kornia_slam::initialization::ImuInitConfig;
+use kornia_slam::inertial::ImuInitConfig;
 
 use crate::error::VioError;
 use crate::stationary::StaticInitConfig;
