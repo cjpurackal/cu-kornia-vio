@@ -12260,7 +12260,7 @@ mod tests {
         // 12 frames (0.8 s) with the IMU but no wheel reading.
         for _ in 0..12 {
             let stamp = stamp_of(seq);
-            let samples = parked_imu(&t, Some(stamp_of(seq - 1)), stamp, &no_extra);
+            let samples = parked_imu(&t, Some(stamp_of(seq - 1)), stamp, no_extra);
             t.push_raw_imu(samples, 0, false).unwrap();
             let status = t
                 .process_frame(frame.clone(), CuTime::from_nanos(stamp))
