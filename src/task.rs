@@ -236,6 +236,10 @@ pub struct StereoVio {
     /// `inertial`; `None` leaves parked keyframes as they were.
     #[reflect(ignore)]
     stationary_edges: Option<crate::parked::StationaryEdgeConfig>,
+    /// The `motion_veto` block, read and validated in `new`: on with its defaults when absent,
+    /// `None` only when `enabled: false`.
+    #[reflect(ignore)]
+    motion_veto: Option<crate::veto::MotionVetoConfig>,
     /// The bus's wheel queue, when `wheel_odom` is enabled. Bound and armed only then.
     #[reflect(ignore)]
     wheel: Option<Arc<WheelQueue>>,
@@ -498,6 +502,7 @@ impl CuTask for StereoVio {
             keyframe_insertion,
             keyframe_culling,
             stationary_edges,
+            motion_veto: crate::config::optional_motion_veto(config)?,
             wheel,
             coasted: 0,
             not_localized: 0,
@@ -623,6 +628,7 @@ impl CuTask for StereoVio {
                 };
                 config.per_frame_fusion = self.per_frame_fusion;
                 config.stationary_edges = self.stationary_edges;
+                config.motion_veto = self.motion_veto;
                 none.insert(Tracker::new(camera, config))
             }
         };

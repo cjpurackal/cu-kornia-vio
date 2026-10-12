@@ -30,6 +30,9 @@
 //!   as the IMU. It constrains local BA, replaces the constant-velocity prior, carries the pose
 //!   through a vision loss, and keeps the world continuous across a map drop. Off unless the
 //!   `wheel_odom` block enables it.
+//! * [`veto`]: the hard motion veto, the last gate before a pose is published: a pose the gyro
+//!   or the wheels contradict past hard bounds since the last published one is never published
+//!   and never touches the map; the wheel and gyro dead reckoning is published instead.
 //! * [`fusion`]: optional per-frame fused tracking: each frame's pose optimized against its map
 //!   matches, the IMU and the wheels together, with a Mahalanobis gate that publishes the motion
 //!   sensors' prediction when vision disagrees with them. Off unless `per_frame_fusion` enables it.
@@ -59,6 +62,7 @@ pub mod tap;
 pub mod task;
 pub mod task_error;
 pub mod track;
+pub mod veto;
 pub mod wheel;
 pub mod wheel_channel;
 pub mod wheel_feed;
@@ -80,6 +84,7 @@ pub use task_error::{Eye, TaskError};
 pub use track::{
     FrameReport, SystemMode, TrackStatus, TrackedPose, Tracker, TrackerConfig, TrackerStats,
 };
+pub use veto::{MotionVetoConfig, VetoStats};
 pub use wheel::{WheelOdomConfig, WheelSample, WheelStats};
 pub use wheel_channel::WheelQueue;
 pub use wheel_feed::{MountFeed, WheelFeed};

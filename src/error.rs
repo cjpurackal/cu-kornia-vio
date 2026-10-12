@@ -189,6 +189,15 @@ pub enum VioError {
         value: f64,
     },
 
+    /// A `motion_veto` parameter is out of range.
+    #[error("motion_veto parameter `{field}` is out of range, got {value}")]
+    VetoParamInvalid {
+        /// Which parameter.
+        field: &'static str,
+        /// The offending value (radians for the angle bounds).
+        value: f64,
+    },
+
     /// A `per_frame_fusion` parameter is not a usable positive number.
     #[error("per_frame_fusion parameter `{field}` must be finite and > 0, got {value}")]
     FusionParamInvalid {

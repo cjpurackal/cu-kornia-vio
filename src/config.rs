@@ -587,6 +587,96 @@ impl StationaryEdgesRon {
     }
 }
 
+/// The `motion_veto` block of a `vio` component config: the hard motion veto ([`crate::veto`]).
+///
+/// ```ron
+/// "motion_veto": (
+///   enabled: true,              // default true: absent is ON with these defaults
+///   rotation_deg: 10.0,         // vision vs the gyro since the last published pose
+///   translation_m: 0.3,         // vision vs the wheels (camera centre)
+///   rotation_deg_per_s: 2.0,    // bound growth per second since the last trusted pose
+///   translation_m_per_s: 0.1,
+///   motion_fraction: 0.2,       // bound growth per radian turned / metre driven since then
+///   recovery_frames: 5,         // agreeing frames in a row before vision is accepted again
+///   recovery_timeout_s: 3.0,    // then the map is re-anchored at the dead-reckoned pose
+/// ),
+/// ```
+///
+/// It acts only through the gyro (`inertial`) and the wheels (`wheel_odom`): with neither it
+/// checks nothing. Validated even when disabled.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MotionVetoRon {
+    /// On unless set false.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub rotation_deg: Option<f64>,
+    #[serde(default)]
+    pub translation_m: Option<f64>,
+    #[serde(default)]
+    pub rotation_deg_per_s: Option<f64>,
+    #[serde(default)]
+    pub translation_m_per_s: Option<f64>,
+    #[serde(default)]
+    pub motion_fraction: Option<f64>,
+    #[serde(default)]
+    pub recovery_frames: Option<u32>,
+    #[serde(default)]
+    pub recovery_timeout_s: Option<f64>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl MotionVetoRon {
+    /// The tracker's config, or `None` when disabled. Validated either way.
+    pub fn to_config(&self) -> Result<Option<crate::veto::MotionVetoConfig>, VioError> {
+        let mut cfg = crate::veto::MotionVetoConfig::default();
+        if let Some(v) = self.rotation_deg {
+            cfg.rotation_rad = v.to_radians();
+        }
+        if let Some(v) = self.translation_m {
+            cfg.translation_m = v;
+        }
+        if let Some(v) = self.rotation_deg_per_s {
+            cfg.rotation_rad_per_s = v.to_radians();
+        }
+        if let Some(v) = self.translation_m_per_s {
+            cfg.translation_m_per_s = v;
+        }
+        if let Some(v) = self.motion_fraction {
+            cfg.motion_fraction = v;
+        }
+        if let Some(v) = self.recovery_frames {
+            cfg.recovery_frames = v;
+        }
+        if let Some(v) = self.recovery_timeout_s {
+            cfg.recovery_timeout_s = v;
+        }
+        cfg.validate()?;
+        Ok(self.enabled.then_some(cfg))
+    }
+}
+
+/// Reads and validates the optional `motion_veto` block: absent is ON with the defaults
+/// (validated), malformed is a hard error.
+pub(crate) fn optional_motion_veto(
+    config: Option<&ComponentConfig>,
+) -> CuResult<Option<crate::veto::MotionVetoConfig>> {
+    let ron = config
+        .map(|c| c.get_value::<MotionVetoRon>(MOTION_VETO))
+        .transpose()?
+        .flatten();
+    match ron {
+        Some(r) => r
+            .to_config()
+            .map_err(|e| format!("`{MOTION_VETO}`: {e}").into()),
+        None => Ok(Some(crate::veto::MotionVetoConfig::default())),
+    }
+}
+
 /// Reads and validates the optional `stationary_edges` block; malformed is a hard error.
 pub(crate) fn optional_stationary_edges(
     config: Option<&ComponentConfig>,
@@ -910,6 +1000,7 @@ config_keys! {
     KEYFRAME_POLICY => "keyframe_policy",
     KEYFRAME_CULLING => "keyframe_culling",
     STATIONARY_EDGES => "stationary_edges",
+    MOTION_VETO => "motion_veto",
 }
 
 /// Refuses a config key `task` does not read.
@@ -1589,6 +1680,46 @@ mod tests {
         ] {
             assert!(stationary(bad).is_err(), "{bad} accepted");
         }
+    }
+
+    fn motion_veto(entries: &str) -> CuResult<Option<crate::veto::MotionVetoConfig>> {
+        optional_motion_veto(Some(&node_config(entries)))
+    }
+
+    /// Absent is ON with the defaults; each key overrides; `enabled: false` is off; an
+    /// out-of-range value and an unknown field are refused at startup.
+    #[test]
+    fn test_the_motion_veto_block() {
+        let d = crate::veto::MotionVetoConfig::default();
+        assert_eq!(optional_motion_veto(None).unwrap(), Some(d));
+        assert_eq!(motion_veto("").unwrap(), Some(d));
+        let c = motion_veto(
+            r#""motion_veto": (rotation_deg: 20.0, translation_m: 0.5, rotation_deg_per_s: 1.0,
+                translation_m_per_s: 0.05, motion_fraction: 0.1, recovery_frames: 8,
+                recovery_timeout_s: 4.0)"#,
+        )
+        .unwrap()
+        .unwrap();
+        assert!((c.rotation_rad - 20f64.to_radians()).abs() < 1e-12);
+        assert_eq!(c.translation_m, 0.5);
+        assert!((c.rotation_rad_per_s - 1f64.to_radians()).abs() < 1e-12);
+        assert_eq!(c.translation_m_per_s, 0.05);
+        assert_eq!(c.motion_fraction, 0.1);
+        assert_eq!(c.recovery_frames, 8);
+        assert_eq!(c.recovery_timeout_s, 4.0);
+        assert_eq!(
+            motion_veto(r#""motion_veto": (enabled: false)"#).unwrap(),
+            None
+        );
+        for bad in [
+            r#""motion_veto": (rotation_deg: 0.0)"#,
+            r#""motion_veto": (recovery_frames: 0)"#,
+            r#""motion_veto": (enabled: false, translation_m: -1.0)"#,
+            r#""motion_veto": (rotation_degs: 10.0)"#,
+        ] {
+            assert!(motion_veto(bad).is_err(), "{bad}");
+        }
+        assert!(CONFIG_KEYS.contains(&MOTION_VETO));
     }
 
     fn cfg(keys: &[&str]) -> ComponentConfig {

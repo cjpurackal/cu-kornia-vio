@@ -4,7 +4,7 @@
 //! record ([`frame_diagnostics`]) is everything else read off the tracker, all of it cached or
 //! O(1) per frame.
 
-use cu_stereo_payloads::{FusionCheck, StationaryCheck, TrackingState, VioDiagnostics};
+use cu_stereo_payloads::{FusionCheck, StationaryCheck, TrackingState, VetoCheck, VioDiagnostics};
 
 use crate::covariance::{horizontal_sigmas, ros_from_left};
 use crate::track::{FrameReport, SystemMode, TrackStatus, Tracker};
@@ -118,6 +118,22 @@ pub fn frame_diagnostics(
         pose_sigma_xy_m,
         pose_sigma_yaw_rad,
         stationary: stationary_check(tracker),
+        veto: veto_check(tracker),
+    }
+}
+
+/// The hard motion veto's counters and this frame's verdict; all zero with it off.
+fn veto_check(tracker: &Tracker) -> VetoCheck {
+    let v = tracker.veto_stats();
+    let report = tracker.frame_report();
+    VetoCheck {
+        vetoes: v.vetoes,
+        dead_reckoned: v.dead_reckoned,
+        relocalizations: v.relocalizations,
+        rebootstraps: v.rebootstraps,
+        ba_refused: v.ba_refused,
+        vetoed: report.vision_vetoed,
+        recovering: tracker.veto_recovering(),
     }
 }
 
