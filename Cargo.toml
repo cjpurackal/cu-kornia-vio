@@ -68,7 +68,7 @@ cu-stereo-payloads = { path = "crates/cu-stereo-payloads" }
 #   factor, stationary IMU init, parallax keyframes, keyframe culling), which this crate needs and
 #   which is not on `main` yet. Pinned to that rev until the PR merges, then to a `main` rev, then
 #   to crates.io at the first release that carries it (v0.1.0 lacks all of it).
-kornia-slam = { git = "https://github.com/kornia/kornia-slam", rev = "512520e5446184d01b3ced70dc5a6bf088477d8e" }
+kornia-slam = { git = "https://github.com/kornia/kornia-slam", rev = "483000313ee229500928dadba4ace569c50ef44c" }
 # The IMU types (`ImuMeasurement`, `ImuBias`, `ImuCalib`, `PreintegratedImu`) are NOT re-exported
 # by kornia-slam — `ImuFactor::{preintegrated, raw_samples}` (inserted via `Map::apply_insertion`)
 # and `ImuInitializer::{try_initialize, apply_initialization}` name them from this crate, so naming
@@ -76,7 +76,7 @@ kornia-slam = { git = "https://github.com/kornia/kornia-slam", rev = "512520e544
 # so the spec string MUST be spelled exactly as the line above: a different spelling is a
 # different cargo source, which would make `ImuBias` here a DIFFERENT type from the `ImuBias` in
 # `ImuFactor`, with a type error that names the same path twice.
-kornia-sensors = { git = "https://github.com/kornia/kornia-slam", rev = "512520e5446184d01b3ced70dc5a6bf088477d8e" }
+kornia-sensors = { git = "https://github.com/kornia/kornia-slam", rev = "483000313ee229500928dadba4ace569c50ef44c" }
 kornia-image = "0.2.0"
 kornia-3d = "0.2.0"
 kornia-algebra = "0.2.0"
