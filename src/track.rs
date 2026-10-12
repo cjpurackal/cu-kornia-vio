@@ -548,6 +548,14 @@ impl SystemState {
 /// gravity direction and the staged initialization's progress live nowhere in the library —
 /// `SlamSystem` owns them privately, and this tracker does not use `SlamSystem`. This struct is
 /// that ownership.
+/// The keyframe a stationary initialization holds the refinements at, and its pose then. See
+/// [`InertialState::static_hold`].
+#[derive(Debug, Clone, Copy)]
+struct StaticHold {
+    kf_idx: usize,
+    pose_world_to_cam: Pose3d,
+}
+
 struct InertialState {
     cfg: InertialConfig,
     buffer: ImuBuffer,
@@ -602,7 +610,9 @@ struct InertialState {
     /// each stage runs once, so both would be spent before the robot moved. Cleared, with the
     /// refinement window re-armed at that moment, once the camera has moved
     /// [`STATIC_REFINE_MOTION_M`] or turned [`STATIC_REFINE_MOTION_RAD`] from that keyframe.
-    static_hold: Option<usize>,
+    /// Holds the keyframe's pose, not only its id, so culling may remove the keyframe while
+    /// the robot stays parked: a robot parked from boot never leaves the hold.
+    static_hold: Option<StaticHold>,
     /// When the map last refused a stationary initialization: the still window is not searched
     /// again for `init_retry`, as the motion solve is throttled after its own refusals. Without
     /// it a refused alignment re-ran the search and the apply, and warned, on every keyframe.
@@ -1763,18 +1773,20 @@ impl Tracker {
     ///
     /// Nothing is culled while the inertial path is on but not yet settled: before the
     /// initialization (its window is the keyframes' IMU edges, and a merged edge is one the
-    /// still window and the motion solve were never tuned on), under a stationary hold (it
-    /// names the keyframe the robot must move away from) and until both refinements ran (they
-    /// solve over the window from `start_kf_idx`). The map bound drops the map then, as before.
+    /// still window and the motion solve were never tuned on) and while a refinement is
+    /// pending outside a stationary hold (it solves over the window from `start_kf_idx`). The
+    /// map bound drops the map then, as before. A stationary hold does NOT stop culling: it
+    /// keeps the held keyframe's pose, and its refinements are re-armed at the keyframes
+    /// present when the robot moves. A robot parked from boot stays in the hold, and refusing
+    /// there dropped its first map at the bound (robot, 2026-10-12).
     fn cull_for_room(&mut self) -> usize {
         let Some(cfg) = self.config.keyframe_culling.as_ref() else {
             return 0;
         };
         if let Some(inert) = self.inertial.as_ref()
             && (!self.state.imu_initialized
-                || inert.static_hold.is_some()
-                || !inert.stats.first_refinement_done
-                || !inert.stats.second_refinement_done)
+                || (inert.static_hold.is_none()
+                    && !(inert.stats.first_refinement_done && inert.stats.second_refinement_done)))
         {
             debug!(
                 "keyframe culling: the inertial path is not settled, nothing culled keyframes={}",
@@ -4535,7 +4547,10 @@ impl Tracker {
         }
         self.accept_inertial_init(inert, init, apply_from, now_sec, InitStage::Static);
         if self.state.imu_initialized {
-            inert.static_hold = Some(newest);
+            inert.static_hold = self.map.get_keyframe(newest).map(|kf| StaticHold {
+                kf_idx: newest,
+                pose_world_to_cam: kf.frame.pose_world_to_cam,
+            });
             inert.stats.first_refinement_done = false;
             inert.stats.second_refinement_done = false;
         } else if !inert.dry_run_accepted {
@@ -4605,18 +4620,15 @@ impl Tracker {
         let Some(newest) = self.map.keyframes().last() else {
             return false;
         };
-        if let Some(held) = self.map.get_keyframe(hold) {
-            let (p0, p1) = (held.frame.pose_world_to_cam, newest.frame.pose_world_to_cam);
-            let moved = (p1.inverse().translation - p0.inverse().translation).length();
-            let r = p1.rotation * p0.rotation.transpose();
-            let cos = ((r.x_axis.x + r.y_axis.y + r.z_axis.z) - 1.0) * 0.5;
-            let turned = cos.clamp(-1.0, 1.0).acos();
-            #[allow(clippy::neg_cmp_op_on_partial_ord)] // a NaN pose is not motion
-            if !(moved >= STATIC_REFINE_MOTION_M || turned >= STATIC_REFINE_MOTION_RAD) {
-                return false;
-            }
+        let (p0, p1) = (hold.pose_world_to_cam, newest.frame.pose_world_to_cam);
+        let moved = (p1.inverse().translation - p0.inverse().translation).length();
+        let r = p1.rotation * p0.rotation.transpose();
+        let cos = ((r.x_axis.x + r.y_axis.y + r.z_axis.z) - 1.0) * 0.5;
+        let turned = cos.clamp(-1.0, 1.0).acos();
+        #[allow(clippy::neg_cmp_op_on_partial_ord)] // a NaN pose is not motion
+        if !(moved >= STATIC_REFINE_MOTION_M || turned >= STATIC_REFINE_MOTION_RAD) {
+            return false;
         }
-        // Held keyframe gone (a reset clears the hold, so this is defensive): release as well.
         let newest_idx = newest.frame.idx;
         let (start, t0) = self
             .map
@@ -4631,7 +4643,7 @@ impl Tracker {
         info!(
             "inertial: motion after the stationary initialization; refinements scheduled from \
              here: held_kf={} start_kf={} kf={}",
-            hold, start, newest_idx
+            hold.kf_idx, start, newest_idx
         );
         true
     }
@@ -8506,7 +8518,10 @@ mod tests {
             t1,
         };
         let mut inert = tracker.inertial.take().unwrap();
-        inert.static_hold = Some(1);
+        inert.static_hold = Some(StaticHold {
+            kf_idx: 1,
+            pose_world_to_cam: tracker.map.get_keyframe(1).unwrap().frame.pose_world_to_cam,
+        });
         inert.start_kf_idx = Some(0);
         inert.window_start_sec = Some(0.0);
 
@@ -8519,7 +8534,7 @@ mod tests {
             })
             .unwrap();
         assert!(!tracker.release_static_hold(&mut inert, 2.0));
-        assert_eq!(inert.static_hold, Some(1));
+        assert_eq!(inert.static_hold.map(|h| h.kf_idx), Some(1));
         assert_eq!(inert.start_kf_idx, Some(0));
 
         // Keyframe 3: 0.4 m away. Released, re-armed at keyframe 2 from t = 2.0.
@@ -8535,7 +8550,7 @@ mod tests {
             })
             .unwrap();
         assert!(tracker.release_static_hold(&mut inert, 3.0));
-        assert_eq!(inert.static_hold, None);
+        assert!(inert.static_hold.is_none());
         assert_eq!(inert.start_kf_idx, Some(2));
         assert_eq!(inert.window_start_sec, Some(2.0));
     }
@@ -10426,11 +10441,14 @@ mod tests {
         tracker
     }
 
-    /// With the inertial path on, nothing is culled until it is settled: initialized, out of a
-    /// stationary hold, and past both refinements. Then the same map culls.
+    /// With the inertial path on, nothing is culled before the initialization, nor while a
+    /// refinement is pending outside a stationary hold. Under a hold (parked since the static
+    /// initialization, refinements waiting for motion) the map culls, the held keyframe
+    /// included, and the hold still releases on motion from the held pose.
     ///
-    /// Mutation: dropping the `static_hold` conjunct turned this red; so did dropping
-    /// `imu_initialized`, and dropping the refinement conjuncts.
+    /// Mutation: dropping `imu_initialized` turned this red; so did dropping the refinement
+    /// conjuncts, and refusing under a stationary hold (the robot's first map dropped,
+    /// 2026-10-12).
     #[test]
     fn culling_waits_for_a_settled_inertial_path() {
         let mut tracker = parked_map(Some(inertial_config()), 100);
@@ -10440,22 +10458,51 @@ mod tests {
             inert.stats.first_refinement_done = done;
             inert.stats.second_refinement_done = done;
         };
-        // Each condition alone, the others met.
+        // Each refusing condition alone, the others met.
         set_refined(&mut tracker, true);
         assert_eq!(tracker.cull_for_room(), 0, "not initialized");
         tracker.state.imu_initialized = true;
         set_refined(&mut tracker, false);
         assert_eq!(tracker.cull_for_room(), 0, "refinements pending");
-        set_refined(&mut tracker, true);
-        tracker.inertial.as_mut().unwrap().static_hold = Some(0);
-        assert_eq!(tracker.cull_for_room(), 0, "under a stationary hold");
-        tracker.inertial.as_mut().unwrap().static_hold = None;
+
+        // The state a static initialization leaves: refinements pending, held at the oldest
+        // keyframe (the one most likely to be culled).
+        let held = tracker.map().keyframes().first().unwrap().frame.idx;
+        let held_pose = tracker
+            .map()
+            .keyframes()
+            .first()
+            .unwrap()
+            .frame
+            .pose_world_to_cam;
+        tracker.inertial.as_mut().unwrap().static_hold = Some(StaticHold {
+            kf_idx: held,
+            pose_world_to_cam: held_pose,
+        });
         let before = tracker.map().keyframes().len();
         let culled = tracker.cull_for_room();
-        assert!(culled > 0, "a settled path culls");
+        assert!(culled > 0, "a stationary hold culls");
         assert_eq!(tracker.map().keyframes().len(), before - culled);
         assert_eq!(tracker.culled_keyframes(), culled as u64);
         assert_eq!(tracker.world_generation(), generation);
+
+        // Still parked: held. The held keyframe being gone does not release it.
+        let mut inert = tracker.inertial.take().unwrap();
+        assert!(!tracker.release_static_hold(&mut inert, 1e6));
+        assert_eq!(inert.static_hold.map(|h| h.kf_idx), Some(held));
+        // Moved 0.4 m from the held pose: released.
+        let id = tracker.map().keyframes().last().unwrap().frame.idx + 1;
+        let at = held_pose.inverse().translation + Vec3F64::new(0.4, 0.0, 0.0);
+        // Same orientation as the held pose, so only the translation can release it.
+        let mut moved = bare_keyframe(id, at);
+        moved.frame.pose_world_to_cam =
+            Pose3d::from_rt(held_pose.rotation, -(held_pose.rotation * at));
+        tracker
+            .map
+            .insert_keyframe(moved)
+            .expect("a fresh keyframe id");
+        assert!(tracker.release_static_hold(&mut inert, 1e6));
+        assert!(inert.static_hold.is_none());
     }
 
     /// Keyframes looked up by id later are never culled: here the tracking reference, pointed at
