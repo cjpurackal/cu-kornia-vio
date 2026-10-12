@@ -11,25 +11,34 @@
 //! settled:
 //!
 //! * a keyframe a parked robot's policy asks for on its TIME bound (the frame-count bound,
-//!   `keyframe_policy.max_interval_s`) is withheld for as long as the robot stays parked, with
-//!   no interval; tracking-quality triggers (the tracked ratio dropping, parallax, an empty
-//!   reference) still insert, so a changed scene is still mapped;
+//!   `keyframe_policy.max_interval_s`) is withheld while the robot stays parked, up to
+//!   [`PARKED_REFRESH_NS`] (30 s) after the last keyframe; tracking-quality triggers (the tracked
+//!   ratio dropping, parallax, an empty reference) still insert, so a changed scene is still
+//!   mapped. The refresh keyframe is linked by a stationary factor, so the stop's gyro mean
+//!   reaches VI-BA every 30 s and at most 30 s of it is lost when the stop ends in motion;
 //! * a keyframe whose interval since the last one was verified still is joined to it by a
 //!   kornia-slam `StationaryFactor` (zero relative pose, zero velocity, bias continuity and the
 //!   mean gyro rate), not by an IMU edge. It has no span limit, and culling composes it across a
-//!   removed keyframe indefinitely;
+//!   removed keyframe indefinitely; a keyframe where it meets an IMU edge is culled too (the
+//!   factor dropped, the IMU edge moved onto the still neighbour);
 //! * a keyframe after a still stretch that ended in motion gets an IMU edge over the TAIL only
 //!   (from [`STATIONARY_TAIL_MIN_S`] before the motion's start), its bias link widened for the
-//!   elided time: given zero velocity and an unchanged pose up to the tail's start, that is
-//!   exactly the edge from the keyframe;
+//!   elided time, which the edge records so a merge or a repropagation keeps it: given zero
+//!   velocity and an unchanged pose up to the tail's start, that is exactly the edge from the
+//!   keyframe;
 //! * the IMU and wheel rings are pruned every frame to that anchor, so no keyframe for an hour
 //!   holds a few hundred samples, not an hour of them.
 //!
-//! "Still" is the [`StationaryRun`]: from each keyframe on, every chunk of IMU samples passes the
-//! stationary initialization's per-sample checks (accelerometer and gyroscope spread, mean rate)
-//! and the wheels' cumulative path stays under the parked floors. Any failure, a hole in the IMU
-//! samples or a gap in the wheel readings closes the run for good; the next keyframe restarts it.
-//! A keyframe also needs the camera within 1 cm / 0.5 deg of the last one to be linked as still.
+//! "Still" is the [`StationaryRun`]: from each keyframe on, the IMU samples are checked in chunks
+//! against the stationary initialization's per-sample checks (accelerometer and gyroscope spread,
+//! mean rate), and two failing chunks in a row close the run (one is a disturbance: a door,
+//! footsteps); the wheel path stays under the parked floors per 5 s window, as the interval gate
+//! judged it, and the net displacement since the keyframe under the same floors. A hole in the
+//! IMU samples or a discontinuity in the wheel readings closes the run for good; a gap in the
+//! wheel readings (a stale head/body link) is bridged once the IMU has verified the stretch. The
+//! next keyframe restarts the run. A keyframe also needs the camera within 1 cm / 0.5 deg of the
+//! last one AND of the first keyframe of the stationary chain to be linked as still, so a slow
+//! creep cannot end up under one composed zero-motion factor.
 //!
 //! Before the inertial path is initialized, and while a refinement of it is pending, nothing
 //! changes: the still window and the refinements are built from IMU edges, and the parked
@@ -45,7 +54,7 @@ use kornia_slam::mapping::stationary::{StationaryFactor, StationaryGyro};
 use crate::error::VioError;
 use crate::imu::{ImuBuffer, ImuGates};
 use crate::stationary::{StaticInitConfig, check_imu_stats};
-use crate::wheel::{PARKED_PATH_M, PARKED_PATH_RAD, WheelState};
+use crate::wheel::{PARKED_PATH_M, PARKED_PATH_RAD, WheelState, WheelWindowError};
 
 /// IMU kept before a stationary anchor and the shortest tail edge, seconds: enough samples for
 /// the ring's coverage gates. Also the floor on [`StationaryEdgeConfig::min_span`].
@@ -61,6 +70,24 @@ pub(crate) const RUN_CHUNK_NS: u64 = 250_000_000;
 
 /// Fewest samples in a checked chunk.
 const RUN_CHUNK_MIN_SAMPLES: usize = 10;
+
+/// The window the wheel path floors apply to, nanoseconds: the 5 s interval
+/// `WheelState::parked_between` judged them over, so an hour of encoder jitter does not add up to
+/// motion. Creep slower than the floors per window is caught by the net displacement since the
+/// keyframe instead.
+pub(crate) const RUN_WHEEL_WINDOW_NS: u64 = 5_000_000_000;
+
+/// How far past the verified end of a still run that is still open a time-bound keyframe stays
+/// withheld, nanoseconds, beyond the wheel `max_gap`: the wheel readings cross the head/body link,
+/// which goes stale rather than applying backpressure, and a stall is not motion. Past it nothing
+/// vouches for the robot and the keyframe is inserted.
+pub(crate) const SENSOR_LAG_HOLD_NS: u64 = 2_000_000_000;
+
+/// Longest a parked robot goes without a keyframe, seconds: past it a time-bound keyframe is
+/// inserted (and linked by a stationary factor), so the gyro mean of a long stop reaches the
+/// estimator every interval instead of being lost when the stop ends in motion, and VI-BA
+/// refines the bias meanwhile. Culling composes these factors, so they cost no map room.
+pub(crate) const PARKED_REFRESH_NS: u64 = 30_000_000_000;
 
 /// Most stationary factors held. Culling composes them and a map drop clears them, so this is
 /// never reached with `max_keyframes` set; without it it bounds a map that is never culled.
@@ -156,13 +183,17 @@ pub struct StationaryStats {
     pub edges_added: u64,
     /// Stationary factors composed across a culled keyframe, lifetime.
     pub edges_merged: u64,
+    /// Keyframes culled at a boundary between a stationary factor and an IMU edge (the factor
+    /// dropped, the IMU edge moved onto the still neighbour), lifetime.
+    pub boundaries_removed: u64,
     /// Keyframes after a still stretch linked by an IMU edge over the tail only, lifetime.
     pub tail_edges: u64,
     /// Time-bound keyframes withheld while parked, once per keyframe interval, lifetime.
     pub keyframes_withheld: u64,
-    /// Still runs closed by the IMU (motion, or a hole in the samples), lifetime.
+    /// Still runs closed by the IMU (two failing chunks in a row, or a hole in the samples),
+    /// lifetime.
     pub runs_closed_imu: u64,
-    /// Still runs closed by the wheels (motion, or a gap in the readings), lifetime.
+    /// Still runs closed by the wheels (motion, or a discontinuity in the readings), lifetime.
     pub runs_closed_wheels: u64,
     /// Stationary factors held now.
     pub factors: usize,
@@ -198,9 +229,15 @@ pub(crate) struct StationaryRun {
     /// `sum(mean gyro * chunk span)` and the span, over the still chunks.
     gyro_dt_sum: Vec3F64,
     covered_s: f64,
-    /// Cumulative wheel path since the keyframe.
+    /// End of a chunk that failed the stillness checks, while the next one has not been judged:
+    /// one failing chunk is a disturbance (a door, footsteps), two in a row close the run.
+    suspect_end_ns: Option<u64>,
+    /// Start of the current wheel window ([`RUN_WHEEL_WINDOW_NS`]) and the wheel path in it.
+    window_start_ns: u64,
     path_m: f64,
     path_rad: f64,
+    /// Net base motion since the keyframe, `(x, y, theta)` in the base at the keyframe.
+    net: [f64; 3],
     /// Why it closed, once it did.
     pub closed_by: Option<RunClose>,
     /// The newest anchor the rings were pruned to; never decreases. Once past the keyframe the
@@ -219,8 +256,11 @@ impl StationaryRun {
             wheel_end_ns: start_ns,
             gyro_dt_sum: Vec3F64::ZERO,
             covered_s: 0.0,
+            suspect_end_ns: None,
+            window_start_ns: start_ns,
             path_m: 0.0,
             path_rad: 0.0,
+            net: [0.0; 3],
             closed_by: None,
             committed_ns: start_ns,
         }
@@ -243,6 +283,18 @@ impl StationaryRun {
         self.open && stamp_ns <= self.end_ns().saturating_add(max_gap_ns)
     }
 
+    /// Whether a time-bound keyframe at `stamp_ns` stays withheld: the run is open (nothing has
+    /// shown motion) and the stamp is within the wheel gap plus [`SENSOR_LAG_HOLD_NS`] of the
+    /// verified end. Looser than [`Self::covers`], which decides what the keyframe is linked by.
+    pub fn holds(&self, stamp_ns: u64, max_gap_ns: u64) -> bool {
+        self.open
+            && stamp_ns
+                <= self
+                    .end_ns()
+                    .saturating_add(max_gap_ns)
+                    .saturating_add(SENSOR_LAG_HOLD_NS)
+    }
+
     /// The mean raw gyro rate over the still chunks, if any were checked.
     pub fn gyro(&self) -> Option<StationaryGyro> {
         (self.covered_s > 0.0).then(|| StationaryGyro {
@@ -257,8 +309,11 @@ impl StationaryRun {
         Some(why)
     }
 
-    /// Checks the IMU samples that arrived since the verified end, once at least
-    /// [`RUN_CHUNK_NS`] of them are buffered. Returns the reason when this call closed the run.
+    /// Checks the IMU samples that arrived since the verified end (or since a suspect chunk),
+    /// once at least [`RUN_CHUNK_NS`] of them are buffered. A chunk failing the stillness checks
+    /// makes the run suspect without moving its end; the next chunk passing clears it (the
+    /// disturbance is left out of the gyro mean), failing too closes the run at the end before
+    /// the first. A hole closes it at once. Returns the reason when this call closed the run.
     pub fn advance_imu(
         &mut self,
         buffer: &ImuBuffer,
@@ -269,11 +324,12 @@ impl StationaryRun {
         if !self.open {
             return None;
         }
+        let from = self.suspect_end_ns.unwrap_or(self.imu_end_ns);
         let newest = buffer.newest_stamp_ns()?;
-        if newest < self.imu_end_ns.saturating_add(RUN_CHUNK_NS) {
+        if newest < from.saturating_add(RUN_CHUNK_NS) {
             return None;
         }
-        let Ok(window) = buffer.window(self.imu_end_ns, newest, gates) else {
+        let Ok(window) = buffer.window(from, newest, gates) else {
             return self.close(RunClose::ImuHole);
         };
         let samples: Vec<ImuMeasurement> = window.map(|s| s.to_measurement(epoch_ns)).collect();
@@ -284,17 +340,25 @@ impl StationaryRun {
             return self.close(RunClose::ImuHole);
         };
         if check_imu_stats(&stats, cfg).is_err() {
-            return self.close(RunClose::Imu);
+            if self.suspect_end_ns.is_some() {
+                return self.close(RunClose::Imu);
+            }
+            self.suspect_end_ns = Some(newest);
+            return None;
         }
-        let span_s = (newest - self.imu_end_ns) as f64 * 1e-9;
+        let span_s = (newest - from) as f64 * 1e-9;
         self.gyro_dt_sum += stats.mean_gyro * span_s;
         self.covered_s += span_s;
+        self.suspect_end_ns = None;
         self.imu_end_ns = newest;
         None
     }
 
-    /// Adds the wheel path since the verified end. Returns the reason when this call closed the
-    /// run.
+    /// Adds the wheel motion since the verified end. The path floors apply per
+    /// [`RUN_WHEEL_WINDOW_NS`] window, the same floors to the net displacement since the keyframe.
+    /// A gap in the readings is bridged once the IMU has verified the stretch still (until then
+    /// the end waits); a discontinuity closes the run. Returns the reason when this call closed
+    /// it.
     pub fn advance_wheels(&mut self, wheels: &WheelState) -> Option<RunClose> {
         if !self.open {
             return None;
@@ -303,16 +367,41 @@ impl StationaryRun {
         if newest <= self.wheel_end_ns {
             return None;
         }
-        let Ok(d) = wheels.delta(self.wheel_end_ns, newest, 0) else {
-            return self.close(RunClose::WheelGap);
+        let d = match wheels.delta(self.wheel_end_ns, newest, 0) {
+            Ok(d) => d,
+            Err(WheelWindowError::Gap) if self.imu_end_ns < newest => return None,
+            Err(WheelWindowError::Gap) => match wheels.delta_across_gaps(self.wheel_end_ns, newest)
+            {
+                Ok(d) => d,
+                Err(_) => return self.close(RunClose::WheelGap),
+            },
+            Err(_) => return self.close(RunClose::WheelGap),
         };
         self.path_m += d.path_m;
         self.path_rad += d.path_rad;
+        let [x, y, theta] = self.net;
+        let (sin, cos) = theta.sin_cos();
+        let [dx, dy, dtheta] = d.delta;
+        self.net = [
+            x + cos * dx - sin * dy,
+            y + sin * dx + cos * dy,
+            theta + dtheta,
+        ];
+        let net_m = self.net[0].hypot(self.net[1]);
         // A NaN path is not parked.
-        if !(self.path_m <= PARKED_PATH_M && self.path_rad <= PARKED_PATH_RAD) {
+        if !(self.path_m <= PARKED_PATH_M
+            && self.path_rad <= PARKED_PATH_RAD
+            && net_m <= PARKED_PATH_M
+            && self.net[2].abs() <= PARKED_PATH_RAD)
+        {
             return self.close(RunClose::Wheels);
         }
         self.wheel_end_ns = newest;
+        if newest - self.window_start_ns >= RUN_WHEEL_WINDOW_NS {
+            self.window_start_ns = newest;
+            self.path_m = 0.0;
+            self.path_rad = 0.0;
+        }
         None
     }
 }
@@ -481,11 +570,13 @@ mod tests {
     }
 
     /// Still samples keep the run open to the newest one, with the gyro mean the bias and the
-    /// covered time the chunks'; a gyro spread, a slow turn, an accelerometer spread and a hole
-    /// each close it, at the chunk that carried it.
+    /// covered time the chunks'; a gyro spread, a slow turn and an accelerometer spread over two
+    /// chunks each close it, frozen before the first; one disturbed chunk does not; a hole
+    /// closes it at once.
     ///
-    /// Mutation: accumulating the chunk mean without its span (`covered_s += 1`) turned the
-    /// covered-time assert red.
+    /// Mutations (each turned this red): accumulating the chunk mean without its span
+    /// (`covered_s += 1`), the covered-time assert; closing on the first failing chunk, the
+    /// knock.
     #[test]
     fn the_imu_side_closes_on_each_kind_of_motion_and_on_a_hole() {
         let mut run = StationaryRun::new(1, T0);
@@ -540,6 +631,22 @@ mod tests {
             assert!(!run.covers(T0 + 5_000 * MS, 0));
         }
 
+        // One disturbed chunk (a 50 ms knock inside the 5.4-5.7 s chunk) is not motion: the run
+        // stays open, its end passes the knock, and the knock stays out of the gyro mean.
+        let knock = |k: u64| {
+            let on = (1_100..1_110).contains(&k);
+            (
+                [if on { 2.0 } else { 0.0 }, 0.0, 0.0],
+                [0.0, 0.0, if on { 0.5 } else { 0.0 }],
+            )
+        };
+        let mut run = StationaryRun::new(1, T0);
+        assert_eq!(run_imu(&mut run, imu(0, 10_005, knock)), None);
+        assert!(run.is_open());
+        assert!(run.imu_end_ns > T0 + 9_700 * MS);
+        let g = run.gyro().expect("chunks checked");
+        assert!((g.mean.z - BIAS[2]).abs() < 2e-4, "{}", g.mean.z);
+
         // A 100 ms hole in the samples.
         let mut holed = imu(0, 4_000, still);
         holed.extend(imu(4_100, 8_000, still));
@@ -547,32 +654,69 @@ mod tests {
         assert_eq!(run_imu(&mut run, holed), Some(RunClose::ImuHole));
     }
 
-    /// The wheel side: jitter-free parked readings keep it open, a creep that adds up past the
-    /// parked floor over many small steps closes it (the path is cumulative, not per chunk), and
-    /// a gap in the readings closes it.
+    /// The wheel side: jitter-free parked readings keep it open; a creep past the parked floor
+    /// within one 5 s window closes it; so does a creep too slow for any window whose NET
+    /// displacement passes the floor; encoder jitter (one tick back and forth on every reading)
+    /// for ten minutes does not, though its summed path is metres.
     ///
-    /// Mutation: comparing each chunk's path instead of the cumulative one turned the creep red.
+    /// Mutations (each turned this red): dropping the net check (the slow creep stayed open);
+    /// never resetting the window path (the jitter closed the run, as the run-long sum did).
     #[test]
-    fn the_wheel_side_closes_on_cumulative_creep_and_on_a_gap() {
+    fn the_wheel_side_judges_the_path_per_window_and_the_net_since_the_keyframe() {
         let mut run = StationaryRun::new(1, T0);
         let parked: Vec<(u64, f64)> = (0..40).map(|i| (i * 250, 0.0)).collect();
         let w = wheels(&parked);
         assert_eq!(run.advance_wheels(&w), None);
         assert_eq!(run.wheel_end_ns, T0 + 39 * 250 * MS);
 
-        // 0.5 mm per reading: each chunk is far under 5 mm, the sum is not.
-        let mut run = StationaryRun::new(1, T0);
-        let mut closed = None;
-        let mut creep = Vec::new();
-        for i in 0..40u64 {
-            creep.push((i * 250, 0.0005 * i as f64));
-            closed = closed.or(run.advance_wheels(&wheels(&creep)));
-        }
-        assert_eq!(closed, Some(RunClose::Wheels));
+        // Fed one reading at a time, like the tracker; the closure, if any.
+        let feed = |x: &dyn Fn(u64) -> f64, n: u64| {
+            let mut run = StationaryRun::new(1, T0);
+            let mut w = wheels(&[]);
+            let mut closed = None;
+            for i in 0..n {
+                w.push([WheelSample {
+                    stamp_ns: T0 + i * 250 * MS,
+                    x: x(i),
+                    y: 0.0,
+                    theta: 0.0,
+                }]);
+                closed = closed.or(run.advance_wheels(&w));
+            }
+            closed
+        };
+        // 2 mm/s: 10 mm in a 5 s window.
+        assert_eq!(feed(&|i| 0.0005 * i as f64, 40), Some(RunClose::Wheels));
+        // 0.4 mm/s: 2 mm per window, 6 mm net after 15 s.
+        assert_eq!(feed(&|i| 0.0001 * i as f64, 80), Some(RunClose::Wheels));
+        // 0.1 mm back and forth every 250 ms: 2 mm per window, 0 net, 240 mm summed.
+        assert_eq!(
+            feed(&|i| if i % 2 == 0 { 0.0 } else { 0.0001 }, 2_400),
+            None
+        );
+    }
 
-        let mut run = StationaryRun::new(1, T0);
+    /// A gap in the wheel readings (a stale head/body link) waits for the IMU and is bridged once
+    /// the IMU has verified the stretch still; motion across the gap still closes the run.
+    ///
+    /// Mutation: closing on every gap (the old `WheelGap`) turned the bridged case red.
+    #[test]
+    fn a_wheel_gap_is_bridged_once_the_imu_vouches_for_it() {
         let gap = wheels(&[(0, 0.0), (250, 0.0), (2_000, 0.0)]);
-        assert_eq!(run.advance_wheels(&gap), Some(RunClose::WheelGap));
+        let mut run = StationaryRun::new(1, T0);
+        run.imu_end_ns = T0 + 1_000 * MS;
+        assert_eq!(run.advance_wheels(&gap), None);
+        assert!(run.is_open());
+        assert_eq!(run.wheel_end_ns, T0, "the end waits for the IMU");
+        run.imu_end_ns = T0 + 2_100 * MS;
+        assert_eq!(run.advance_wheels(&gap), None);
+        assert!(run.is_open());
+        assert_eq!(run.wheel_end_ns, T0 + 2_000 * MS, "bridged");
+
+        let moved = wheels(&[(0, 0.0), (250, 0.0), (2_000, 0.02)]);
+        let mut run = StationaryRun::new(1, T0);
+        run.imu_end_ns = T0 + 2_100 * MS;
+        assert_eq!(run.advance_wheels(&moved), Some(RunClose::Wheels));
     }
 
     fn open_run(end_ms: u64) -> StationaryRun {

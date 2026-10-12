@@ -128,8 +128,8 @@ use crate::imu::{
     preintegration_is_finite, ts_sec, window_excitation,
 };
 use crate::parked::{
-    EdgeAnchor, MAX_STATIONARY_FACTORS, PRUNE_MARGIN_NS, StationaryEdgeConfig, StationaryRun,
-    StationaryStats, edge_anchor,
+    EdgeAnchor, MAX_STATIONARY_FACTORS, PARKED_REFRESH_NS, PRUNE_MARGIN_NS, StationaryEdgeConfig,
+    StationaryRun, StationaryStats, edge_anchor,
 };
 use crate::stationary::{NotStill, StaticInitConfig, check_camera, check_imu, check_wheels};
 use crate::wheel::{WheelOdomConfig, WheelSample, WheelState, WheelStats, WheelWindowError};
@@ -2037,6 +2037,29 @@ impl Tracker {
         moved <= PARKED_CAMERA_TRANSLATION_M && turned <= PARKED_CAMERA_ROTATION_RAD
     }
 
+    /// Whether the camera is within the parked floors of keyframe `kf_idx` AND of the first
+    /// keyframe of the stationary chain ending there. Culling composes the chain into one factor
+    /// claiming zero motion end to end, so a creep under the floors per keyframe must not add up
+    /// past them over the stop.
+    fn camera_still_since(&self, kf_idx: usize) -> bool {
+        let root = self.stationary_chain_root(kf_idx);
+        self.camera_near_keyframe(kf_idx) && (root == kf_idx || self.camera_near_keyframe(root))
+    }
+
+    /// The first keyframe of the chain of stationary factors ending at `kf_idx`; `kf_idx` itself
+    /// when no factor ends there.
+    fn stationary_chain_root(&self, kf_idx: usize) -> usize {
+        let mut root = kf_idx;
+        // Bounded by the factor count: the chain is a path, but a malformed one must not spin.
+        for _ in 0..self.stationary_factors.len() {
+            match self.stationary_factors.iter().find(|f| f.to_idx == root) {
+                Some(f) => root = f.from_idx,
+                None => break,
+            }
+        }
+        root
+    }
+
     /// The edge a keyframe at `stamp_ns` would get from keyframe `(kf_idx, kf_ns)`; see
     /// [`crate::parked::edge_anchor`].
     fn edge_anchor_from(
@@ -2209,6 +2232,7 @@ impl Tracker {
                 .then_some(&mut self.stationary_factors),
         );
         self.stationary.edges_merged += report.stationary_edges_merged as u64;
+        self.stationary.boundaries_removed += report.stationary_boundaries_removed as u64;
         debug_assert!(self.stationary_factors.iter().all(|f| {
             self.map.get_keyframe(f.from_idx).is_some() && self.map.get_keyframe(f.to_idx).is_some()
         }));
@@ -2226,14 +2250,15 @@ impl Tracker {
         self.culled_keyframes += removed.len() as u64;
         info!(
             "keyframe culling: removed={} keyframes={} -> {} imu_edges_merged={} \
-             wheel_edges_merged={} stationary_edges_merged={} kept_for_edges={} \
-             landmarks_retired={} culled_total={}",
+             wheel_edges_merged={} stationary_edges_merged={} stationary_boundaries_removed={} \
+             kept_for_edges={} landmarks_retired={} culled_total={}",
             removed.len(),
             before,
             self.map.keyframes().len(),
             report.imu_edges_merged,
             report.wheel_edges_merged,
             report.stationary_edges_merged,
+            report.stationary_boundaries_removed,
             report.kept_for_edges,
             report.landmarks_retired,
             self.culled_keyframes
@@ -3828,9 +3853,9 @@ impl Tracker {
     /// suspended on the last keyframe, which waits for the next one.
     ///
     /// In stationary mode ([`Self::stationary_active`], [`crate::parked`]) the rule changes: only
-    /// a keyframe the policy wants on its TIME bound ([`KeyframeWant::Bound`]) is withheld, for
-    /// as long as the still run from the last keyframe covers the frame and the camera stays
-    /// within the floors, with no interval; a tracking-quality ask always inserts.
+    /// a keyframe the policy wants on its TIME bound ([`KeyframeWant::Bound`]) is withheld, while
+    /// the still run from the last keyframe is open and the camera stays within the floors, up
+    /// to [`PARKED_REFRESH_NS`]; a tracking-quality ask always inserts.
     fn parked_keyframe_suppressed(
         &mut self,
         stamp_ns: u64,
@@ -3898,10 +3923,11 @@ impl Tracker {
     }
 
     /// The stationary-mode gate: withholds a time-bound keyframe while the still run from the
-    /// last keyframe covers `stamp_ns`, tracking is strong and the camera has not moved. No
-    /// interval: the next keyframe of a robot that stays parked comes from a tracking-quality
-    /// trigger, or from the motion that ends the stop. A fusion suspended on the last keyframe
-    /// still gets its keyframe.
+    /// last keyframe holds `stamp_ns` ([`StationaryRun::holds`]: open, and the sensors no more
+    /// than a stall behind), tracking is strong and the camera has not moved since the last
+    /// keyframe or the start of the stationary chain. Past [`PARKED_REFRESH_NS`] since the last
+    /// keyframe it inserts, so a long stop feeds its gyro mean to VI-BA every interval. A fusion
+    /// suspended on the last keyframe still gets its keyframe.
     fn stationary_keyframe_withheld(
         &mut self,
         stamp_ns: u64,
@@ -3919,16 +3945,20 @@ impl Tracker {
         ) else {
             return false;
         };
-        if self.fusion_suspended_on == Some(kf_idx) {
+        if self.fusion_suspended_on == Some(kf_idx)
+            || stamp_ns.saturating_sub(kf_ns) >= PARKED_REFRESH_NS
+        {
             return false;
         }
-        let covered = self.stationary_run.as_ref().is_some_and(|r| {
-            r.kf_idx == kf_idx && r.start_ns == kf_ns && r.covers(stamp_ns, w.cfg.max_gap_ns())
+        // Held while the run is open, not only while it covers the frame: a stale wheel link or
+        // a suspect IMU chunk delays the verified end but shows no motion.
+        let held = self.stationary_run.as_ref().is_some_and(|r| {
+            r.kf_idx == kf_idx && r.start_ns == kf_ns && r.holds(stamp_ns, w.cfg.max_gap_ns())
         });
         let strong = n_ref_map_points > 0
             && tracked_inliers as f64
                 >= n_ref_map_points as f64 * self.config.keyframe_policy.ref_ratio;
-        if !(covered && strong && self.camera_near_keyframe(kf_idx)) {
+        if !(held && strong && self.camera_still_since(kf_idx)) {
             return false;
         }
         self.count_parked_skip(kf_idx);
@@ -4055,7 +4085,7 @@ impl Tracker {
         // last keyframe, a stationary factor, or an IMU edge over the tail of a still stretch.
         // Decided before the state below moves on, against the pose this frame was tracked at.
         let anchor = prev_edge.map(|(prev_idx, prev_ns)| {
-            let still = self.camera_near_keyframe(prev_idx);
+            let still = self.camera_still_since(prev_idx);
             (
                 prev_idx,
                 self.edge_anchor_from(prev_idx, prev_ns, stamp_ns, still),
@@ -4884,14 +4914,10 @@ impl Tracker {
             PreintegratedImu::from_measurements(inert.bias, inert.cfg.calib, &raw, t0, t1);
         // A tail edge ([`crate::parked`]) starts after a still stretch of `elided_s`: the pose,
         // velocity and motion terms are the whole interval's (nothing moved before the tail), but
-        // the bias wandered over all of it, so its link is widened by the elided time.
-        if elided_s > 0.0 {
-            let c = inert.cfg.calib;
-            for i in 0..3 {
-                preint.bias_covariance[i * 7] += c.gyro_bias_noise.powi(2) * elided_s;
-                preint.bias_covariance[(i + 3) * 7] += c.accel_bias_noise.powi(2) * elided_s;
-            }
-        }
+        // the bias wandered over all of it, so its link is widened by the elided time. The edge
+        // records it (`bias_walk_extra_s`), so a culling merge or a BA repropagation, which
+        // re-preintegrate from the samples, widen it again.
+        preint.widen_bias_walk(elided_s);
 
         // Negated on purpose: a NaN `dt` must be refused too, which `dt <= 0.0` would let through.
         #[allow(clippy::neg_cmp_op_on_partial_ord)]
@@ -4942,6 +4968,7 @@ impl Tracker {
             raw_samples: raw,
             t0,
             t1,
+            bias_walk_extra_s: elided_s.max(0.0),
         };
         if let Err(e) = self.map.apply_insertion(MapInsertion {
             imu_factors: vec![factor],
@@ -9398,6 +9425,7 @@ mod tests {
             raw_samples: Vec::new(),
             t0,
             t1,
+            bias_walk_extra_s: 0.0,
         };
         let mut inert = tracker.inertial.take().unwrap();
         inert.static_hold = Some(StaticHold {
@@ -12003,15 +12031,17 @@ mod tests {
             .unwrap();
     }
 
-    /// Fix 2: once initialized, a parked robot inserts NO keyframe on the time bound, however
-    /// long it stays (60 s here), where the interval gate alone inserts one every 5 s; the
-    /// withheld keyframe is counted once; the IMU ring holds the tail, not the minute.
+    /// Fix 2: once initialized, a parked robot withholds time-bound keyframes for 30 s
+    /// ([`PARKED_REFRESH_NS`]), where the interval gate alone inserts one every 5 s; each refresh
+    /// keyframe is linked by a stationary factor carrying the gyro mean, never an IMU edge; the
+    /// withheld keyframes are counted once per interval; the IMU ring holds the tail, not the
+    /// minute.
     ///
     /// Mutations (each turned this red): dropping `stationary_active` from the gate (the
     /// interval gate everywhere); dropping the per-frame prune to the anchor (the ring filled to
-    /// its 2048-sample capacity).
+    /// its 2048-sample capacity); dropping the refresh (no keyframe in the minute).
     #[test]
-    fn test_a_parked_robot_withholds_time_bound_keyframes_without_an_interval() {
+    fn test_a_parked_robot_withholds_time_bound_keyframes_up_to_the_refresh() {
         let frames = 900; // 60 s at 15 Hz after the initialization
         let run = |stationary: bool| {
             let mut t = stationary_tracker(|c| {
@@ -12036,9 +12066,21 @@ mod tests {
         let (on, on_ring, t) = run(true);
         let (off, _, _) = run(false);
         assert!(off >= 10, "the interval gate's keyframes: {off}");
-        assert_eq!(on, 0, "time-bound keyframes inserted while parked: {on}");
+        assert!(
+            (1..=2).contains(&on),
+            "time-bound keyframes inserted in a parked minute: {on}"
+        );
         let st = t.stationary_stats().unwrap();
-        assert_eq!(st.keyframes_withheld, 1, "once per keyframe interval");
+        assert_eq!(st.edges_added, on as u64, "{st:?}");
+        assert_eq!(st.tail_edges, 0, "{st:?}");
+        assert!(
+            t.stationary_factors.iter().all(|f| f.gyro.is_some()),
+            "a refresh factor without the gyro mean"
+        );
+        assert!(
+            (on as u64..=on as u64 + 1).contains(&st.keyframes_withheld),
+            "once per keyframe interval: {st:?}"
+        );
         assert!(st.parked);
         // 0.5 s tail + 0.5 s margin + a chunk at 200 Hz, and nothing evicted.
         assert!(on_ring <= 300, "the IMU ring held {on_ring} samples");
@@ -12124,9 +12166,10 @@ mod tests {
     /// Motion ends the withholding: wheels creeping 1 mm a frame (the camera does not see it), or
     /// the accelerometer shaking for a second, close the still run, the next frame inserts, and
     /// that keyframe gets an IMU edge over the tail only, starting after the still stretch, with
-    /// its bias link widened by the stretch.
+    /// its bias link widened by the stretch and the stretch recorded on the edge.
     ///
-    /// Mutation: dropping the bias-covariance widening turned this red.
+    /// Mutations (each turned this red): dropping the bias-covariance widening; recording no
+    /// `bias_walk_extra_s` (a culling merge or a BA repropagation would then drop the widening).
     #[test]
     fn test_motion_after_a_stop_inserts_with_a_tail_edge() {
         let shaking = |k: u64| Vec3F64::new(0.5 * (k as f64 * 1.3).sin(), 0.0, 0.0);
@@ -12178,6 +12221,12 @@ mod tests {
                 e.t0 - kf_t
             );
             let elided = e.t0 - kf_t;
+            // Recorded on the edge, so a culling merge or a BA repropagation widens it again.
+            assert!(
+                (e.bias_walk_extra_s - elided).abs() < 1e-6,
+                "{} vs {elided}",
+                e.bias_walk_extra_s
+            );
             let calib = t.inertial.as_ref().unwrap().cfg.calib;
             let p = &e.preintegrated;
             assert!(
@@ -12189,9 +12238,109 @@ mod tests {
         }
     }
 
+    /// A stall of the wheel stream (the head/body link goes stale, 0.6 s with no reading, past
+    /// the 0.5 s `max_gap`) while parked is not motion: the time-bound keyframe stays withheld
+    /// through it, and once the readings resume the gap is bridged (the IMU vouched for it), so
+    /// the run neither closes nor leaves a tail edge behind.
+    ///
+    /// Mutations (each turned this red): withholding only while the run covers the frame (the
+    /// old gate inserted during the stall); closing the run on any wheel gap (`runs_closed_wheels`
+    /// 1).
+    #[test]
+    fn test_a_stale_wheel_link_while_parked_is_not_motion() {
+        let mut t = stationary_tracker(|_| {});
+        let (s0, k0) = park_still_until_initialized(&mut t);
+        let frame = view_frame(&t, &Pose3d::IDENTITY, None);
+        let mut seq = s0;
+        for _ in 0..60 {
+            replay_still(&mut t, seq, &frame, (0.0, 0.0), &no_extra);
+            seq += 1;
+        }
+        assert_eq!(t.map.keyframes().len(), k0);
+        // 12 frames (0.8 s) with the IMU but no wheel reading.
+        for _ in 0..12 {
+            let stamp = stamp_of(seq);
+            let samples = parked_imu(&t, Some(stamp_of(seq - 1)), stamp, &no_extra);
+            t.push_raw_imu(samples, 0, false).unwrap();
+            let status = t
+                .process_frame(frame.clone(), CuTime::from_nanos(stamp))
+                .expect("a valid frame");
+            assert!(matches!(status, TrackStatus::Tracked(_)), "{status:?}");
+            seq += 1;
+        }
+        assert_eq!(
+            t.map.keyframes().len(),
+            k0,
+            "a keyframe was inserted during the stall"
+        );
+        for _ in 0..30 {
+            replay_still(&mut t, seq, &frame, (0.0, 0.0), &no_extra);
+            seq += 1;
+        }
+        let st = t.stationary_stats().unwrap();
+        assert_eq!(
+            (st.runs_closed_wheels, st.runs_closed_imu),
+            (0, 0),
+            "{st:?}"
+        );
+        assert_eq!(st.tail_edges, 0, "{st:?}");
+        assert!(st.parked, "{st:?}");
+        assert_eq!(t.map.keyframes().len(), k0);
+    }
+
+    /// The camera creeps 0.3 deg between quality keyframes (each pair within the 0.5 deg floor,
+    /// the IMU never seeing it): the first keyframe is linked as still, but no keyframe more than
+    /// 0.5 deg from the start of the stationary chain is, so culling can never compose a
+    /// zero-motion factor across the creep.
+    ///
+    /// Mutation: checking the camera against the previous keyframe only turned this red (one
+    /// chain from the start of the stop to the 0.6 deg keyframe).
+    #[test]
+    fn test_a_creeping_camera_breaks_the_stationary_chain() {
+        let mut t = stationary_tracker(|_| {});
+        let (s0, _) = park_still_until_initialized(&mut t);
+        let mut seq = s0;
+        let at = |t: &mut Tracker, seq: &mut u32, deg: f64, frames: usize, quality: bool| {
+            let frame = view_frame(t, &yaw_view(deg), None);
+            for k in 0..frames {
+                t.force_quality_keyframe = quality && k + 1 == frames;
+                replay_still(t, *seq, &frame, (0.0, 0.0), &no_extra);
+                *seq += 1;
+            }
+        };
+        at(&mut t, &mut seq, 0.0, 30, false);
+        for deg in [0.1, 0.2] {
+            at(&mut t, &mut seq, deg, 1, false);
+        }
+        at(&mut t, &mut seq, 0.3, 30, true);
+        let first = t.state.last_keyframe_idx.unwrap();
+        assert!(
+            t.stationary_factors.iter().any(|f| f.to_idx == first),
+            "the first creep is still"
+        );
+        for deg in [0.4, 0.5] {
+            at(&mut t, &mut seq, deg, 1, false);
+        }
+        at(&mut t, &mut seq, 0.6, 30, true);
+        let moved = t.state.last_keyframe_idx.unwrap();
+        assert_ne!(moved, first);
+        // Wherever the chain broke (a pan frame may ask for its own keyframe on the way), no
+        // stationary chain reaches from the start of the stop to the 0.6 deg keyframe.
+        assert_ne!(
+            t.stationary_chain_root(moved),
+            t.stationary_chain_root(first),
+            "the creep ended up under one stationary chain: {:?}",
+            t.stationary_factors
+                .iter()
+                .map(|f| (f.from_idx, f.to_idx))
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// THE behaviour (2026-10-12: a robot parked from boot dropped its map every ~20 min at the
     /// 11 s merge cap). An hour parked at 1 Hz with the IMU 300 ms ahead and a tracking-quality
-    /// keyframe every 30 s (~120, three times `max_keyframes`): culling merges the stationary
+    /// keyframe every 30 s (~120, three times `max_keyframes`; the last one 45 s before the
+    /// drive, so a refresh keyframe comes 15 s before it): culling merges the stationary
     /// edges without a span limit, so the map is never dropped and stays under the cap, both
     /// rings stay bounded, the pose and gravity stay put and the gyro bias stays the parked one.
     /// Then a 1 m drive tracks every frame, the first keyframe gets one tail edge, and the static
@@ -12203,7 +12352,10 @@ mod tests {
     fn test_an_hour_parked_keeps_its_map_and_then_drives() {
         const SEC: u64 = 1_000_000_000;
         const LEAD_NS: u64 = 300_000_000;
-        const CAP: usize = 40;
+        // The drive's 11 keyframes must fit on top of the parked map (culling is refused while
+        // the refinements the drive re-arms are pending, so it drops at the cap), which with the
+        // refresh keyframe 15 s before the drive holds one keyframe more than at 40.
+        const CAP: usize = 42;
         let mut t = stationary_tracker(|c| {
             c.max_keyframes = Some(CAP);
             c.keyframe_culling = Some(KeyframeCullingConfig {
@@ -12242,8 +12394,9 @@ mod tests {
             imu_to = stamp + LEAD_NS;
             t.push_raw_imu(samples, 0, false).unwrap();
             push_wheels(&mut t, &mut wheel_to, stamp, &|_| 0.0);
-            // A passer-by every 30 s, the last 30 s before the drive left alone.
-            if i % 30 == 0 && i <= hour - 30 {
+            // A passer-by every 30 s, the last 45 s before the drive left alone: the refresh
+            // keyframe comes 15 s before it.
+            if i % 30 == 15 && i <= hour - 30 {
                 t.force_quality_keyframe = true;
             }
             let status = t
@@ -12366,9 +12519,14 @@ mod tests {
             .find(|e| e.t0 > ts_sec(kf_before, epoch) + 1.0)
             .expect("a tail edge in the map");
         assert!(
-            tail.t0 >= ts_sec(kf_before, epoch) + 29.0,
+            tail.t0 >= ts_sec(kf_before, epoch) + 14.0,
             "{}",
             tail.t0 - ts_sec(kf_before, epoch)
+        );
+        assert!(
+            tail.bias_walk_extra_s >= 14.0,
+            "the elided time is not recorded: {}",
+            tail.bias_walk_extra_s
         );
         assert!(imu_edges(&t) > edges0);
         assert!(

@@ -260,6 +260,14 @@ pub struct StationaryCheck {
     pub factors: u32,
     /// The robot is parked now: the still run from the last keyframe covers this frame.
     pub parked: bool,
+    /// Still runs closed by the IMU (two failing chunks in a row, or a hole), lifetime. Rising
+    /// while the robot stays parked means false closures (footsteps, a door, the head servo).
+    pub runs_closed_imu: u64,
+    /// Still runs closed by the wheels (path or net motion past the parked floors, or a
+    /// discontinuity), lifetime. Rising while parked means encoder jitter past the floors.
+    pub runs_closed_wheels: u64,
+    /// Keyframes culled at a boundary between a stationary factor and an IMU edge, lifetime.
+    pub boundaries_removed: u64,
 }
 
 /// What the tracker knew about one processed frame. The time of validity is the frame's capture
@@ -414,9 +422,9 @@ mod tests {
         // layout change (a field added anywhere, appended at the end included, removed, retyped
         // or reordered) makes every log already written undecodable as the new type.
         // `test_diagnostics_golden_bytes` pins the whole layout; this only checks the two sigmas
-        // come right before the stationary record (six zero varints when off), NaN included.
-        let n = bytes.len() - 6;
-        assert_eq!(&bytes[n..], &[0u8; 6]);
+        // come right before the stationary record (nine zero varints when off), NaN included.
+        let n = bytes.len() - 9;
+        assert_eq!(&bytes[n..], &[0u8; 9]);
         assert_eq!(back.stationary, StationaryCheck::default());
         assert_eq!(&bytes[n - 8..n - 4], &0.125f32.to_le_bytes());
         assert_eq!(&bytes[n - 4..n], &f32::NAN.to_le_bytes());
@@ -482,6 +490,9 @@ mod tests {
                 keyframes_withheld: 24,
                 factors: 25,
                 parked: true,
+                runs_closed_imu: 26,
+                runs_closed_wheels: 27,
+                boundaries_removed: 28,
             },
         }
     }
@@ -495,7 +506,7 @@ mod tests {
             "010203030701000405060708090a0b0c0000c03f010300002040000060400000",
             "90400000b0400000d0400000f0400d0401000008410000184100002841000038",
             "4100004841000058410000684100007841000084410e0f1000008c4111011213",
-            "140000944100009c41151617181901",
+            "140000944100009c411516171819011a1b1c",
         );
         let bytes = bincode::encode_to_vec(every_field_distinct(), standard()).expect("encode");
         let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();

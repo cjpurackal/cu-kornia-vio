@@ -267,25 +267,37 @@ on the robot). `stationary_edges` removes both limits once the inertial path is 
 ),
 ```
 
-- From each keyframe the tracker verifies stillness as samples arrive: every 0.25 s chunk of IMU
-  samples passes the static initialization's spread and mean-rate checks, and the wheels'
-  cumulative path stays under 5 mm / 0.01 rad. Motion, an IMU hole or a wheel gap ends it.
-- While it holds and the camera stays within 1 cm / 0.5 deg of the last keyframe, a keyframe the
-  policy wants only on its time bound (`max_frames_between`, `max_interval_s`) is withheld with no
-  interval. Tracking-quality triggers (the tracked ratio dropping, parallax, an empty reference)
-  still insert, so a changed scene is still mapped.
+- From each keyframe the tracker verifies stillness as samples arrive: IMU chunks of at least
+  0.25 s are checked against the static initialization's spread and mean-rate checks, and two
+  failing chunks in a row end it (one is a knock or footsteps, left out of the gyro mean); the
+  wheel path stays under 5 mm / 0.01 rad per 5 s window (the old interval gate's floors) and the
+  net displacement since the keyframe under the same. An IMU hole or a wheel discontinuity ends
+  it; a gap in the wheel readings (the head/body link going stale) is bridged once the IMU has
+  verified that stretch.
+- While it is open (verified, or the sensors no more than a 2 s stall behind) and the camera
+  stays within 1 cm / 0.5 deg of the last keyframe and of the first keyframe of the stationary
+  chain, a keyframe the policy wants only on its time bound (`max_frames_between`,
+  `max_interval_s`) is withheld for up to 30 s. Tracking-quality triggers (the tracked ratio
+  dropping, parallax, an empty reference) still insert, so a changed scene is still mapped; the
+  30 s refresh keyframe feeds the stop's gyro mean to VI-BA, so at most 30 s of it is lost when
+  the stop ends in motion.
 - Such a keyframe is joined to the last one by a kornia-slam `StationaryFactor` (zero relative
   pose, zero velocity, bias continuity, the stop's mean gyro rate keeping the gyro bias observed)
   instead of an IMU edge. Culling composes stationary factors across a removed keyframe with no
-  span limit; a keyframe with an IMU edge on one side and a stationary one on the other is kept.
+  span limit; a keyframe with an IMU edge on one side and a stationary one on the other is culled
+  after the chain is composed, its IMU edge moved onto the still neighbour, so a stop never pins
+  keyframes.
 - The first keyframe after a stop that ended in motion gets an IMU edge over the tail only, from
-  0.5 s before the motion was seen, its bias link widened for the elided time.
+  0.5 s before the motion was seen, its bias link widened for the elided time. The edge records
+  that time, so a culling merge or a BA repropagation keeps the widening.
 - While no keyframe comes, the IMU and wheel rings are pruned every frame to 0.5 s before that
   anchor plus a margin, and the per-frame fusion predicts from it.
 
 Before the inertial path is initialized and while a refinement is pending, the parked interval
 gate and IMU edges apply as before (the still window and the refinements are built from IMU
-edges). `vio_diag`'s `stationary` record counts edges, merges, tail edges and withheld keyframes.
+edges). `vio_diag`'s `stationary` record counts edges, merges, culled boundary keyframes, tail
+edges, withheld keyframes and still runs closed by the IMU and by the wheels (rising while parked
+means false closures).
 
 ## Per-frame fusion
 

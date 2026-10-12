@@ -528,6 +528,27 @@ impl WheelState {
         t1_ns: u64,
         hold_ns: u64,
     ) -> Result<WheelDelta, WheelWindowError> {
+        self.delta_within(t0_ns, t1_ns, hold_ns, self.cfg.max_gap_ns())
+    }
+
+    /// [`Self::delta`] with no limit on the time between readings: a stretch with no reading is
+    /// taken as the straight line between the readings around it. Only for a caller that has
+    /// another sensor vouching for that stretch; a discontinuity is still refused.
+    pub fn delta_across_gaps(
+        &self,
+        t0_ns: u64,
+        t1_ns: u64,
+    ) -> Result<WheelDelta, WheelWindowError> {
+        self.delta_within(t0_ns, t1_ns, 0, u64::MAX)
+    }
+
+    fn delta_within(
+        &self,
+        t0_ns: u64,
+        t1_ns: u64,
+        hold_ns: u64,
+        max_gap: u64,
+    ) -> Result<WheelDelta, WheelWindowError> {
         if t1_ns <= t0_ns {
             return Err(WheelWindowError::NonPositiveInterval);
         }
@@ -547,7 +568,6 @@ impl WheelState {
             }
         }
         let b = b.min(self.ring.len() - 1);
-        let max_gap = self.cfg.max_gap_ns();
         for i in a..b {
             let (s0, s1) = (&self.ring[i], &self.ring[i + 1]);
             if s1.stamp_ns - s0.stamp_ns > max_gap {
