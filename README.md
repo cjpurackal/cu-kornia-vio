@@ -89,7 +89,8 @@ cnx: [
   frame. Unknown config keys are refused at startup rather than ignored. The recognised keys are
   `on_tracking_loss` (`keep_map`, the default, or `reset_map` for a long-running graph),
   `max_keyframes`, `orb_keypoints`, `search_radius_px`, `max_covisible_keyframes`,
-  `pnp_lm_iterations`, `inertial`, `landmark_buffers`, `wheel_odom` and `per_frame_fusion`;
+  `pnp_lm_iterations`, `inertial`, `landmark_buffers`, `wheel_odom`, `per_frame_fusion`,
+  `keyframe_policy` (insertion thresholds, parallax, a time bound) and `keyframe_culling`;
   `cu_kornia_vio::config::CONFIG_KEYS` lists them. Its `Freezable` is a no-op (the kornia-slam
   map has no serialised form), so a resim of a `background: true` graph reproduces it only from
   the start of a log; see Known limitations.
@@ -307,10 +308,13 @@ does not compile against this crate.
 - **IMU replay is approximate.** Samples cross into the background worker through the bus queue,
   not a logged input of the tracker, so which samples a given solve saw depends on when the worker
   ran. The `ImuFeed` edge is logged, but a replay is not bit-identical on the inertial path.
-- **The map is unbounded unless told otherwise.** kornia-slam never culls keyframes, and with
+- **The map is unbounded unless told otherwise.** Nothing culls keyframes by default, and with
   neither `max_keyframes` nor `on_tracking_loss: "reset_map"` set the map grows until per-frame
   cost stalls the tracker. Set `max_keyframes` on any long-running graph; the map is then dropped
-  and rebuilt when it reaches the bound.
+  and rebuilt when it reaches the bound. With `"keyframe_culling": (enabled: true)` the tracker
+  first removes redundant keyframes there (ORB-SLAM's rule, IMU and wheel edges merged) and drops
+  the map only if that cannot make room. Culling waits for a settled inertial path, and while
+  driving few keyframes are redundant: the room comes mostly from stops.
 
 ## License
 

@@ -4,11 +4,14 @@
 //! module.
 
 use cu29::prelude::{ComponentConfig, CuResult};
-use cu29::units::si::f64::Frequency;
+use cu29::units::si::f64::{Frequency, Time};
 use cu29::units::si::frequency::hertz;
+use cu29::units::si::time::second;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3F64, Vec3F64};
 use kornia_sensors::imu::ImuCalib;
+use kornia_slam::mapping::culling::KeyframeCullingConfig;
+use kornia_slam::tracking::KeyframePolicy;
 
 use crate::error::VioError;
 use crate::fusion::FusionConfig;
@@ -511,6 +514,251 @@ pub(crate) fn optional_fusion(config: Option<&ComponentConfig>) -> CuResult<Opti
     }
 }
 
+/// The `keyframe_policy` block of a `vio` component config: when a keyframe is inserted.
+///
+/// ```ron
+/// "keyframe_policy": (
+///   // Each optional; absent keeps kornia-slam's `KeyframePolicy::default()` (3, 8, 0.6).
+///   min_frames_between: 3,   // frames before another keyframe is considered
+///   max_frames_between: 8,   // a keyframe is forced at this gap
+///   ref_ratio: 0.6,          // insert when tracked < ratio * the reference keyframe's points
+///   min_parallax_px: 10.0,   // insert at this median rotation-compensated parallax (VINS-Mono)
+///   // ORB-SLAM3 / VINS-Mono insertion instead of a frame count: no `max_frames_between`, a
+///   // keyframe is earned by parallax or a weak reference. Needs `min_parallax_px`, and with the
+///   // `inertial` block on, `max_interval_s` too: an IMU edge must stay short enough to fit the
+///   // ring and for BA to converge on it.
+///   motion_only: false,
+///   max_interval_s: 1.0,     // a keyframe is forced this long after the last one
+/// ),
+/// ```
+///
+/// Absent, the policy is the default one, as it always was. The parked gate
+/// (`wheel_odom.parked_keyframe_interval_s`) still withholds what this asks for on a parked robot.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct KeyframePolicyRon {
+    #[serde(default)]
+    pub min_frames_between: Option<u32>,
+    #[serde(default)]
+    pub max_frames_between: Option<u32>,
+    #[serde(default)]
+    pub ref_ratio: Option<f64>,
+    #[serde(default)]
+    pub min_parallax_px: Option<f64>,
+    #[serde(default)]
+    pub motion_only: bool,
+    #[serde(default)]
+    pub max_interval_s: Option<f64>,
+}
+
+/// What [`KeyframePolicyRon`] configures: the policy, and the time bound beside it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct KeyframeInsertion {
+    pub policy: KeyframePolicy,
+    pub max_interval: Option<Time>,
+}
+
+impl KeyframePolicyRon {
+    /// The validated policy over kornia-slam's default.
+    pub fn to_config(&self) -> CuResult<KeyframeInsertion> {
+        let mut policy = KeyframePolicy::default();
+        if let Some(n) = self.min_frames_between {
+            policy.min_frames_between = n as usize;
+        }
+        match (self.motion_only, self.max_frames_between) {
+            (true, Some(_)) => {
+                return Err("`keyframe_policy.motion_only` has no frame bound; drop \
+                            `max_frames_between`"
+                    .into());
+            }
+            (true, None) => policy.max_frames_between = usize::MAX,
+            (false, Some(0)) => {
+                return Err("`keyframe_policy.max_frames_between` must be greater than 0".into());
+            }
+            (false, Some(n)) => policy.max_frames_between = n as usize,
+            (false, None) => {}
+        }
+        if policy.max_frames_between < policy.min_frames_between {
+            return Err(format!(
+                "`keyframe_policy.max_frames_between` ({}) is below `min_frames_between` ({})",
+                policy.max_frames_between, policy.min_frames_between
+            )
+            .into());
+        }
+        if let Some(r) = self.ref_ratio {
+            if !(r.is_finite() && r > 0.0 && r <= 1.0) {
+                return Err(
+                    format!("`keyframe_policy.ref_ratio` must be in (0, 1], got {r}").into(),
+                );
+            }
+            policy.ref_ratio = r;
+        }
+        if let Some(px) = self.min_parallax_px {
+            if !(px.is_finite() && px > 0.0) {
+                return Err(format!(
+                    "`keyframe_policy.min_parallax_px` must be finite and greater than 0, got {px}"
+                )
+                .into());
+            }
+            policy.min_parallax_px = Some(px);
+        }
+        // Without parallax nothing but a weak reference would ever earn a keyframe: a robot
+        // driving down a corridor would extend one keyframe until tracking failed.
+        if self.motion_only && policy.min_parallax_px.is_none() {
+            return Err("`keyframe_policy.motion_only` needs `min_parallax_px`".into());
+        }
+        let max_interval = match self.max_interval_s {
+            Some(s) if !(s.is_finite() && s > 0.0) => {
+                return Err(format!(
+                    "`keyframe_policy.max_interval_s` must be finite and greater than 0, got {s}"
+                )
+                .into());
+            }
+            other => other.map(Time::new::<second>),
+        };
+        Ok(KeyframeInsertion {
+            policy,
+            max_interval,
+        })
+    }
+}
+
+/// Reads and validates the optional `keyframe_policy` block; absent is the default policy.
+pub(crate) fn keyframe_insertion(config: Option<&ComponentConfig>) -> CuResult<KeyframeInsertion> {
+    config
+        .map(|c| c.get_value::<KeyframePolicyRon>(KEYFRAME_POLICY))
+        .transpose()?
+        .flatten()
+        .unwrap_or_default()
+        .to_config()
+}
+
+/// The `keyframe_culling` block of a `vio` component config: ORB-SLAM's redundant-keyframe
+/// culling (`kornia_slam::mapping::culling::cull_redundant_keyframes`), run when the map reaches
+/// `max_keyframes`, so the map is dropped only when culling cannot make room.
+///
+/// ```ron
+/// "keyframe_culling": (
+///   enabled: true,
+///   // Each optional; absent keeps `KeyframeCullingConfig::default()`.
+///   redundant_ratio: 0.9,        // fraction of a keyframe's landmarks seen elsewhere
+///   min_other_observers: 3,      // other keyframes that must see such a landmark
+///   scale_level_tolerance: 1,    // pyramid levels coarser that still count (0: the paper's)
+///   protect_newest: 3,           // newest keyframes never culled (at least 1)
+///   min_keyframes: 21,           // no culling at or below this many; below `max_keyframes`
+///   max_merged_imu_span_s: 3.0,  // longest IMU edge a removal may merge into
+///   max_removals: 1000,          // most keyframes one pass removes
+/// ),
+/// ```
+///
+/// Absent, or `enabled: false` (the default), the map bound drops the map as it always did.
+/// Enabled, it needs `max_keyframes`: that is what it acts at.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct KeyframeCullingRon {
+    /// Off unless set.
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub redundant_ratio: Option<f64>,
+    #[serde(default)]
+    pub min_other_observers: Option<u32>,
+    #[serde(default)]
+    pub scale_level_tolerance: Option<u8>,
+    #[serde(default)]
+    pub protect_newest: Option<u32>,
+    #[serde(default)]
+    pub min_keyframes: Option<u32>,
+    #[serde(default)]
+    pub max_merged_imu_span_s: Option<f64>,
+    #[serde(default)]
+    pub max_removals: Option<u32>,
+}
+
+impl KeyframeCullingRon {
+    /// The culling config, or `None` when disabled. Validated either way, so a disabled block
+    /// with a bad value fails at startup rather than on the day it is enabled.
+    pub fn to_config(&self) -> CuResult<Option<KeyframeCullingConfig>> {
+        let mut cfg = KeyframeCullingConfig::default();
+        if let Some(r) = self.redundant_ratio {
+            if !(r.is_finite() && r > 0.0 && r <= 1.0) {
+                return Err(format!(
+                    "`keyframe_culling.redundant_ratio` must be in (0, 1], got {r}"
+                )
+                .into());
+            }
+            cfg.redundant_ratio = r;
+        }
+        for (field, value, slot) in [
+            (
+                "min_other_observers",
+                self.min_other_observers,
+                &mut cfg.min_other_observers,
+            ),
+            (
+                "protect_newest",
+                self.protect_newest,
+                &mut cfg.protect_newest,
+            ),
+            ("min_keyframes", self.min_keyframes, &mut cfg.min_keyframes),
+            ("max_removals", self.max_removals, &mut cfg.max_removals),
+        ] {
+            match value {
+                Some(0) => {
+                    return Err(format!("`keyframe_culling.{field}` must be greater than 0").into());
+                }
+                Some(n) => *slot = n as usize,
+                None => {}
+            }
+        }
+        if let Some(t) = self.scale_level_tolerance {
+            cfg.scale_level_tolerance = t;
+        }
+        if let Some(s) = self.max_merged_imu_span_s {
+            if !(s.is_finite() && s > 0.0) {
+                return Err(format!(
+                    "`keyframe_culling.max_merged_imu_span_s` must be finite and greater than 0, \
+                     got {s}"
+                )
+                .into());
+            }
+            cfg.max_merged_imu_span_sec = s;
+        }
+        Ok(self.enabled.then_some(cfg))
+    }
+}
+
+/// Reads and validates the optional `keyframe_culling` block against `max_keyframes`, the bound
+/// it acts at.
+pub(crate) fn keyframe_culling(
+    config: Option<&ComponentConfig>,
+    max_keyframes: Option<usize>,
+) -> CuResult<Option<KeyframeCullingConfig>> {
+    let Some(ron) = config
+        .map(|c| c.get_value::<KeyframeCullingRon>(KEYFRAME_CULLING))
+        .transpose()?
+        .flatten()
+    else {
+        return Ok(None);
+    };
+    let Some(cfg) = ron.to_config()? else {
+        return Ok(None);
+    };
+    match max_keyframes {
+        None => Err(format!(
+            "`keyframe_culling` runs when the map reaches `{MAX_KEYFRAMES}`, which is not set"
+        )
+        .into()),
+        Some(cap) if cfg.min_keyframes >= cap => Err(format!(
+            "`keyframe_culling.min_keyframes` ({}) must be below `{MAX_KEYFRAMES}` ({cap}), or \
+             culling can never make room",
+            cfg.min_keyframes
+        )
+        .into()),
+        Some(_) => Ok(Some(cfg)),
+    }
+}
+
 /// Reads an optional finite, strictly-positive float key.
 pub(crate) fn optional_positive_f64(
     config: Option<&ComponentConfig>,
@@ -557,6 +805,8 @@ config_keys! {
     LANDMARK_BUFFERS => "landmark_buffers",
     WHEEL_ODOM => "wheel_odom",
     PER_FRAME_FUSION => "per_frame_fusion",
+    KEYFRAME_POLICY => "keyframe_policy",
+    KEYFRAME_CULLING => "keyframe_culling",
 }
 
 /// Refuses a config key `task` does not read.
@@ -1039,6 +1289,149 @@ mod tests {
         assert_eq!((c.extrinsic_sigma_m, c.extrinsic_sigma_rad), (0.05, 0.02));
         assert!(fusion_ron("(enabled: true, extrinsic_sigma_m: -0.01)").is_err());
         assert!(fusion_ron("(enabled: true, extrinsic_sigma_rad: 0.0)").is_err());
+    }
+
+    /// A `vio` node's config carrying `entries` (RON map entries), read the way a graph reads it.
+    fn node_config(entries: &str) -> ComponentConfig {
+        let text = format!(
+            r#"( tasks: [ ( id: "vio", type: "t::T", config: {{ {entries} }} ) ], cnx: [] )"#
+        );
+        let cfg = cu29::config::read_configuration_str(text, None).expect("a graph");
+        let graph = cfg.get_graph(None).expect("the graph");
+        let id = graph.get_node_id_by_name("vio").expect("the node");
+        graph
+            .get_node(id)
+            .expect("the node")
+            .get_instance_config()
+            .cloned()
+            .expect("a config")
+    }
+
+    fn insertion(block: &str) -> CuResult<KeyframeInsertion> {
+        keyframe_insertion(Some(&node_config(&format!(
+            r#""keyframe_policy": {block}"#
+        ))))
+    }
+
+    /// Absent is kornia-slam's default policy and no time bound; each field replaces its own
+    /// value; `motion_only` lifts the frame bound and needs parallax; nonsense is refused.
+    ///
+    /// Mutation: ignoring `motion_only` (keeping the frame bound) turned this red.
+    #[test]
+    fn test_the_keyframe_policy_block() {
+        assert!(CONFIG_KEYS.contains(&"keyframe_policy"));
+        let default = KeyframePolicy::default();
+        let absent = keyframe_insertion(None).unwrap();
+        assert_eq!(
+            (
+                absent.policy.min_frames_between,
+                absent.policy.max_frames_between,
+                absent.policy.ref_ratio,
+                absent.policy.min_parallax_px
+            ),
+            (
+                default.min_frames_between,
+                default.max_frames_between,
+                default.ref_ratio,
+                None
+            )
+        );
+        assert!(absent.max_interval.is_none());
+
+        let tuned = insertion(
+            "(min_frames_between: 2, max_frames_between: 12, ref_ratio: 0.5, \
+             min_parallax_px: 10.0, max_interval_s: 0.8)",
+        )
+        .unwrap();
+        assert_eq!(tuned.policy.min_frames_between, 2);
+        assert_eq!(tuned.policy.max_frames_between, 12);
+        assert_eq!(tuned.policy.ref_ratio, 0.5);
+        assert_eq!(tuned.policy.min_parallax_px, Some(10.0));
+        assert_eq!(tuned.max_interval.map(|t| t.get::<second>()), Some(0.8));
+
+        let motion = insertion("(motion_only: true, min_parallax_px: 10.0)").unwrap();
+        assert_eq!(motion.policy.max_frames_between, usize::MAX);
+
+        for bad in [
+            "(motion_only: true)",
+            "(motion_only: true, min_parallax_px: 10.0, max_frames_between: 8)",
+            "(max_frames_between: 0)",
+            "(min_frames_between: 9)",
+            "(ref_ratio: 0.0)",
+            "(ref_ratio: 1.5)",
+            "(min_parallax_px: -1.0)",
+            "(max_interval_s: 0.0)",
+            "(min_parallax: 10.0)",
+        ] {
+            assert!(insertion(bad).is_err(), "{bad} accepted");
+        }
+    }
+
+    fn culling(
+        entries: &str,
+        max_keyframes: Option<usize>,
+    ) -> CuResult<Option<KeyframeCullingConfig>> {
+        keyframe_culling(
+            Some(&node_config(&format!(r#""keyframe_culling": {entries}"#))),
+            max_keyframes,
+        )
+    }
+
+    /// Off unless enabled; enabled takes kornia-slam's defaults and each field replaces its own;
+    /// it needs a `max_keyframes` above its `min_keyframes`; a bad value is refused even while
+    /// disabled.
+    ///
+    /// Mutation: ignoring `enabled` (always `Some`) turned this red.
+    #[test]
+    fn test_the_keyframe_culling_block() {
+        assert!(CONFIG_KEYS.contains(&"keyframe_culling"));
+        assert!(keyframe_culling(None, Some(120)).unwrap().is_none());
+        assert!(culling("(min_keyframes: 30)", Some(120)).unwrap().is_none());
+        let on = culling("(enabled: true)", Some(120))
+            .unwrap()
+            .expect("enabled");
+        let default = KeyframeCullingConfig::default();
+        assert_eq!(on.min_keyframes, default.min_keyframes);
+        assert_eq!(on.redundant_ratio, default.redundant_ratio);
+        assert_eq!(on.max_removals, default.max_removals);
+
+        let tuned = culling(
+            "(enabled: true, redundant_ratio: 0.8, min_other_observers: 2, \
+             scale_level_tolerance: 0, protect_newest: 5, min_keyframes: 40, \
+             max_merged_imu_span_s: 2.0, max_removals: 7)",
+            Some(120),
+        )
+        .unwrap()
+        .expect("enabled");
+        assert_eq!(tuned.redundant_ratio, 0.8);
+        assert_eq!(tuned.min_other_observers, 2);
+        assert_eq!(tuned.scale_level_tolerance, 0);
+        assert_eq!(tuned.protect_newest, 5);
+        assert_eq!(tuned.min_keyframes, 40);
+        assert_eq!(tuned.max_merged_imu_span_sec, 2.0);
+        assert_eq!(tuned.max_removals, 7);
+
+        assert!(
+            culling("(enabled: true)", None).is_err(),
+            "no bound to act at"
+        );
+        assert!(
+            culling("(enabled: true, min_keyframes: 120)", Some(120)).is_err(),
+            "can never make room"
+        );
+        assert!(
+            culling("(enabled: false)", None).unwrap().is_none(),
+            "disabled needs no bound"
+        );
+        for bad in [
+            "(enabled: false, redundant_ratio: 0.0)",
+            "(enabled: false, protect_newest: 0)",
+            "(enabled: false, min_other_observers: 0)",
+            "(enabled: false, max_merged_imu_span_s: -1.0)",
+            "(enabled: true, redundant: 0.9)",
+        ] {
+            assert!(culling(bad, Some(120)).is_err(), "{bad} accepted");
+        }
     }
 
     fn cfg(keys: &[&str]) -> ComponentConfig {

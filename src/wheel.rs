@@ -791,6 +791,17 @@ impl WheelState {
         &self.factors
     }
 
+    /// The factors, for keyframe culling to compose the pair through a removed keyframe.
+    pub fn factors_mut(&mut self) -> &mut Vec<WheelOdomFactor> {
+        &mut self.factors
+    }
+
+    /// Keyframes a queued interval still names: culling must keep them, or the factor
+    /// integrated later would name a keyframe the map no longer holds.
+    pub fn pending_keyframes(&self) -> impl Iterator<Item = usize> + '_ {
+        self.pending.iter().flat_map(|e| [e.from_idx, e.to_idx])
+    }
+
     /// Drops readings and mounts no pending interval, keyframe or frame can still ask for.
     ///
     /// `keep_from` are the stamps a future lookup may start at (the last keyframe's, the last

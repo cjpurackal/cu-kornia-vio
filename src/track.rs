@@ -91,7 +91,9 @@ use kornia_slam::initialization::{
     AlignedTrackingState, ImuInitResult, ImuInitializer, ImuWindowStats, StationaryInitError,
 };
 use kornia_slam::mapping::bundle_adjustment::{local_window, run_local_ba, run_local_inertial_ba};
-use kornia_slam::mapping::culling::cull_landmarks;
+use kornia_slam::mapping::culling::{
+    KeyframeCullingConfig, cull_landmarks, cull_redundant_keyframes,
+};
 use kornia_slam::mapping::growth::accepted_pair_claims;
 use kornia_slam::mapping::map::{
     ImuFactor, Keyframe, LandmarkSeed, Map, MapInsertion, ORB_N_LEVELS, ORB_SCALE_FACTOR,
@@ -105,8 +107,8 @@ use kornia_slam::tracking::pose_estimation::map_projection::{
 };
 use kornia_slam::tracking::pose_estimation::pnp::{self, PnpConfig};
 use kornia_slam::tracking::{
-    KeyframePolicy, LocalMapSelectionConfig, MapProjectionEstimator, TrackingLossRecoveryPolicy,
-    select_local_map_points,
+    KeyframeEvidence, KeyframePolicy, LocalMapSelectionConfig, MapProjectionEstimator,
+    TrackingLossRecoveryPolicy, median_parallax_px, select_local_map_points,
 };
 
 use crate::consistency::{ConsistencyStats, IntervalMotion, MotionVerdict};
@@ -232,8 +234,19 @@ pub struct TrackerConfig {
     /// coordinate mapping, the scale-invariance gates and the epipolar sigma all
     /// read those constants independently, and a mismatch is silent.
     pub orb: OrbDetector,
-    /// Keyframe insertion heuristics.
+    /// Keyframe insertion heuristics. With `min_parallax_px` set the tracker measures the
+    /// rotation-compensated parallax against the last keyframe each time it asks.
     pub keyframe_policy: KeyframePolicy,
+    /// Force a keyframe once this long has passed since the last one, whatever the policy says.
+    /// `None` — what [`TrackerConfig::new`] sets — leaves insertion to the policy alone. The bound
+    /// a `keyframe_policy` without `max_frames_between` needs with the inertial path on: an IMU
+    /// edge is built from the ring between two keyframes, and BA did not converge on 10 s ones.
+    /// The parked gate still withholds what this forces on a parked robot.
+    pub keyframe_max_interval: Option<Time>,
+    /// Redundant-keyframe culling at [`Self::max_keyframes`]. `None` — what
+    /// [`TrackerConfig::new`] sets — drops the map at the bound, as it always did. `Some` culls
+    /// first and drops only if culling cannot make room; see [`Tracker::cull_for_room`].
+    pub keyframe_culling: Option<KeyframeCullingConfig>,
     /// Map-projection tracker thresholds (projection search, PnP).
     pub map_projection: MapProjectionConfig,
     /// Supplies the descriptor matcher + triangulation thresholds used by the
@@ -263,9 +276,9 @@ pub struct TrackerConfig {
     pub reset_map_on_loss: bool,
     /// Drop the map once it holds this many keyframes. `None` is unbounded.
     ///
-    /// kornia-slam never removes a keyframe — `cull_landmarks` only retires map points, and
-    /// `keyframes`/`map_points` are `Vec`s that only push — so insertion cost rises without
-    /// limit. Measured on a Jetson Orin with an OAK-D at 640x400: 62 ms at 25 keyframes, 260 ms
+    /// Nothing removes a keyframe unless [`Self::keyframe_culling`] is on — `cull_landmarks`
+    /// only retires map points, and `map_points` is a `Vec` that only pushes — so insertion cost
+    /// rises without limit. Measured on a Jetson Orin with an OAK-D at 640x400: 62 ms at 25 keyframes, 260 ms
     /// at 137, 427 ms at 156, then a silent stall (one thread at 99.9 %, 757 MB RSS, zero poses
     /// after 2.5 h).
     /// `reset_map_on_loss` bounds this ONLY when tracking fails; tracking cleanly in good light
@@ -309,6 +322,8 @@ impl TrackerConfig {
                 ..OrbDetector::default()
             },
             keyframe_policy: KeyframePolicy::default(),
+            keyframe_max_interval: None,
+            keyframe_culling: None,
             // Upstream's `MapProjectionConfig::default()`, unmodified.
             //
             // Lowering `pnp.outlier_rounds` from 4 to 2 does not show a reproducible saving: one
@@ -404,8 +419,9 @@ pub struct TrackerStats {
     /// Non-culled map points. Culling is logical, so this can shrink while
     /// `Map::num_map_points()` only grows.
     pub map_points: usize,
-    /// Keyframes in the map. Never culled, so this only grows — including
-    /// across tracking losses, which do *not* clear the map on the stereo path.
+    /// Keyframes in the map. Grows with every insertion, including across tracking losses,
+    /// which do *not* clear the map on the stereo path; only a map drop or keyframe culling
+    /// ([`TrackerConfig::keyframe_culling`]) brings it down.
     pub keyframes: usize,
     /// Status of the most recent frame; `None` before the first frame.
     pub status: Option<TrackingStatus>,
@@ -864,10 +880,10 @@ pub struct Tracker {
     /// a dead-reckoned coast, not a measurement). Consumers that map tracker poses into
     /// another frame must re-derive their transform when this changes.
     world_generation: u64,
-    /// Live (not culled) map points, and the `(keyframe count, world generation)` they were
-    /// counted at; see the refresh in `process_frame`.
+    /// Live (not culled) map points, and the `(keyframe count, world generation, keyframes
+    /// culled)` they were counted at; see the refresh in `process_frame`.
     live_map_points: usize,
-    live_map_points_key: (usize, u64),
+    live_map_points_key: (usize, u64, u64),
     /// `None` unless [`TrackerConfig::wheel_odom`] was supplied.
     wheel: Option<WheelState>,
     /// Whether the current frame's prior came from the wheels. Reset at the top of every frame.
@@ -912,6 +928,9 @@ pub struct Tracker {
     frame_report: FrameReport,
     /// Maps dropped (size bound, sustained loss, refused biases), lifetime.
     map_drops: u64,
+    /// Keyframes removed by [`TrackerConfig::keyframe_culling`], lifetime. A cull is not a drop:
+    /// the world, its generation and every other keyframe stay as they were.
+    culled_keyframes: u64,
     /// Maps discarded by ANY reset (requested, loss, size bound, refused biases), lifetime: each
     /// one means the next bootstrap starts a new map. Not `world_generation`, which also moves on
     /// an inertial alignment and a kept-map re-bootstrap, neither of which starts a map.
@@ -1241,7 +1260,7 @@ impl Tracker {
             losses_suppressed: 0,
             world_generation: 0,
             live_map_points: 0,
-            live_map_points_key: (0, 0),
+            live_map_points_key: (0, 0, 0),
             wheel,
             frame_on_wheels: false,
             world_anchored: false,
@@ -1256,6 +1275,7 @@ impl Tracker {
             bias_refusals_in_a_row: 0,
             frame_report: FrameReport::default(),
             map_drops: 0,
+            culled_keyframes: 0,
             map_generation: 0,
             anchored_since_reset: false,
             last_motion: MotionCheck::default(),
@@ -1476,8 +1496,13 @@ impl Tracker {
         // The live-point count a consumer publishes per frame is cached instead. Every point this
         // tracker creates or culls does so inside a keyframe insertion (bootstrap included), and
         // every map drop bumps the world generation, so the scan runs only when one of those two
-        // moved: once per keyframe, not once per frame.
-        let key = (self.map.keyframes().len(), self.world_generation);
+        // moved: once per keyframe, not once per frame. Culling retires landmarks too, and an
+        // insertion that culled one keyframe leaves the count where it was, so it keys as well.
+        let key = (
+            self.map.keyframes().len(),
+            self.world_generation,
+            self.culled_keyframes,
+        );
         if key != self.live_map_points_key {
             self.live_map_points = self.map.num_active_map_points();
             self.live_map_points_key = key;
@@ -1652,13 +1677,99 @@ impl Tracker {
     ///
     /// Split out from the insertion path so the predicate is reachable from a test: every
     /// conjunct here is a way to silently disable the bound or to fire it every frame.
+    ///
+    /// With [`TrackerConfig::keyframe_culling`] on, redundant keyframes are culled first and the
+    /// map is dropped only if that did not bring it back under the bound.
     fn arm_map_bound(&mut self, inserted: bool) {
         if let Some(cap) = self.config.max_keyframes
             && inserted
             && self.map.keyframes().len() >= cap
         {
-            self.pending_map_reset = true;
+            self.cull_for_room();
+            if self.map.keyframes().len() >= cap {
+                self.pending_map_reset = true;
+            }
         }
+    }
+
+    /// Removes redundant keyframes ([`TrackerConfig::keyframe_culling`]); returns how many.
+    ///
+    /// Not a reset: the world, its generation (`reset_epoch`), the pose, the coast origin and
+    /// every other keyframe stay as they were, and IMU and wheel edges through a removed keyframe
+    /// are merged into one, so no chain is cut. Kept, besides the newest the config protects:
+    /// every keyframe a queued wheel interval names, the tracking reference, the last keyframe
+    /// and a keyframe the fusion is suspended on, all of them looked up by id later.
+    ///
+    /// Nothing is culled while the inertial path is on but not yet settled: before the
+    /// initialization (its window is the keyframes' IMU edges, and a merged edge is one the
+    /// still window and the motion solve were never tuned on), under a stationary hold (it
+    /// names the keyframe the robot must move away from) and until both refinements ran (they
+    /// solve over the window from `start_kf_idx`). The map bound drops the map then, as before.
+    fn cull_for_room(&mut self) -> usize {
+        let Some(cfg) = self.config.keyframe_culling.as_ref() else {
+            return 0;
+        };
+        if let Some(inert) = self.inertial.as_ref()
+            && (!self.state.imu_initialized
+                || inert.static_hold.is_some()
+                || !inert.stats.first_refinement_done
+                || !inert.stats.second_refinement_done)
+        {
+            return 0;
+        }
+        let keep: HashSet<usize> = self
+            .wheel
+            .as_ref()
+            .into_iter()
+            .flat_map(|w| w.pending_keyframes())
+            .chain(self.state.current_keyframe_idx)
+            .chain(self.state.last_keyframe_idx)
+            .chain(self.fusion_suspended_on)
+            .collect();
+        let keyframes = self.map.keyframes();
+        let oldest_kept = keyframes
+            .iter()
+            .position(|kf| keep.contains(&kf.frame.idx))
+            .unwrap_or(keyframes.len());
+        let before = keyframes.len();
+        let cfg = KeyframeCullingConfig {
+            protect_newest: cfg.protect_newest.max(before - oldest_kept),
+            ..cfg.clone()
+        };
+        let report = cull_redundant_keyframes(
+            &mut self.map,
+            &cfg,
+            self.wheel.as_mut().map(|w| w.factors_mut()),
+        );
+        if report.removed.is_empty() {
+            debug!(
+                "keyframe culling: nothing redundant to remove keyframes={} kept_for_edges={}",
+                before, report.kept_for_edges
+            );
+            return 0;
+        }
+        let removed: HashSet<usize> = report.removed.iter().copied().collect();
+        self.kf_tracked_poses
+            .retain(|(idx, _, _)| !removed.contains(idx));
+        self.kf_cov.retain(|idx, _| !removed.contains(idx));
+        self.culled_keyframes += removed.len() as u64;
+        info!(
+            "keyframe culling: removed={} keyframes={} -> {} imu_edges_merged={}              wheel_edges_merged={} kept_for_edges={} landmarks_retired={} culled_total={}",
+            removed.len(),
+            before,
+            self.map.keyframes().len(),
+            report.imu_edges_merged,
+            report.wheel_edges_merged,
+            report.kept_for_edges,
+            report.landmarks_retired,
+            self.culled_keyframes
+        );
+        removed.len()
+    }
+
+    /// Keyframes removed by [`TrackerConfig::keyframe_culling`], lifetime. See the field.
+    pub fn culled_keyframes(&self) -> u64 {
+        self.culled_keyframes
     }
 
     /// Drop the map if the last insertion tripped [`TrackerConfig::max_keyframes`].
@@ -3219,6 +3330,57 @@ impl Tracker {
         true
     }
 
+    /// Whether the keyframe policy asks for a keyframe on this frame, or
+    /// [`TrackerConfig::keyframe_max_interval`] forces one.
+    ///
+    /// The parallax is measured only when the policy reads it (`min_parallax_px`): it walks every
+    /// match. Against the last keyframe, at the pose this frame was tracked at.
+    fn keyframe_wanted(
+        &self,
+        frame: &Frame,
+        stamp_ns: u64,
+        tracked_inliers: usize,
+        n_ref_map_points: usize,
+        matches: &[(usize, usize)],
+    ) -> bool {
+        let policy = &self.config.keyframe_policy;
+        let median_parallax_px = policy
+            .min_parallax_px
+            .zip(self.state.last_keyframe_idx)
+            .and_then(|(_, last)| {
+                median_parallax_px(
+                    &self.map,
+                    last,
+                    frame,
+                    &self.state.pose_world_to_cam,
+                    matches,
+                    &self.camera,
+                )
+            });
+        let evidence = KeyframeEvidence {
+            curr_idx: frame.idx,
+            last_keyframe_idx: self.state.last_keyframe_idx,
+            tracked_inliers,
+            n_ref_map_points,
+            median_parallax_px,
+        };
+        if policy.should_insert_with(&evidence) {
+            return true;
+        }
+        // The time bound, still inside `min_frames_between`: a burst of frames after a stall
+        // must not insert one keyframe each.
+        let (Some(interval), Some(kf_ns), Some(kf_idx)) = (
+            self.config.keyframe_max_interval,
+            self.last_keyframe_stamp_ns,
+            self.state.last_keyframe_idx,
+        ) else {
+            return false;
+        };
+        let interval_ns = (interval.get::<second>() * 1e9) as u64;
+        stamp_ns.saturating_sub(kf_ns) >= interval_ns
+            && frame.idx.saturating_sub(kf_idx) >= policy.min_frames_between
+    }
+
     /// Canonical order: insert -> associate -> densify close stereo -> grow(xN)
     /// -> IMU edge -> fuse -> local BA -> pose sync-back -> cull.
     fn try_insert_keyframe(
@@ -3243,12 +3405,7 @@ impl Tracker {
             .map(|kf| kf.num_associated_points())
             .unwrap_or(0);
 
-        if !self.config.keyframe_policy.should_insert(
-            frame.idx,
-            self.state.last_keyframe_idx,
-            tracked_inliers,
-            n_ref_map_points,
-        ) {
+        if !self.keyframe_wanted(frame, stamp_ns, tracked_inliers, n_ref_map_points, matches) {
             return false;
         }
         if self.parked_keyframe_suppressed(stamp_ns, tracked_inliers, n_ref_map_points) {
@@ -10006,5 +10163,360 @@ mod tests {
             "fusion p50 {p50} us is over 10 % of the frame p50 {} us",
             frames[1]
         );
+    }
+
+    // ── Keyframe policy and culling ──────────────────────────────────────────
+
+    /// The scene at position `pos` (`pos * SCENE_STEP_M` along +x), stamped at frame slot `slot`:
+    /// a parked camera is the same `pos` at successive slots.
+    fn feed_at(tracker: &mut Tracker, pos: u32, slot: u32) -> TrackStatus {
+        let (left, right, _) = scene_pair(pos);
+        let stamp = CuTime::from_nanos(EPOCH_NS + u64::from(slot) * FRAME_NS);
+        tracker
+            .process_stereo(&left, &right, stamp)
+            .expect("a valid pair")
+    }
+
+    /// The long run: parked at 0, a drive of `LEG` scene steps, parked again, a second drive.
+    const PARK: u32 = 80;
+    const LEG: u32 = 40;
+    const LONG_RUN: u32 = 2 * (PARK + LEG);
+
+    /// Where the long run's camera is at frame slot `slot`, in scene steps.
+    fn long_run_pos(slot: u32) -> u32 {
+        let (cycle, t) = (slot / (PARK + LEG), slot % (PARK + LEG));
+        cycle * LEG + t.saturating_sub(PARK)
+    }
+
+    /// Culling at a 14-keyframe bound, above 4, otherwise kornia-slam's (ORB-SLAM's) defaults.
+    const CULL_TEST_CAP: usize = 14;
+
+    fn cull_test_config() -> KeyframeCullingConfig {
+        KeyframeCullingConfig {
+            min_keyframes: 4,
+            ..KeyframeCullingConfig::default()
+        }
+    }
+
+    /// What one long run did.
+    struct LongRun {
+        drops: u64,
+        culled: u64,
+        world_generations: u64,
+        untracked: usize,
+        most_keyframes: usize,
+        worst_m: f64,
+        tracker: Tracker,
+    }
+
+    /// Parked 80 frames (the policy forces a keyframe every 8: ten), a 40-frame drive, parked
+    /// again, a second drive. The drives' keyframes are not redundant (ORB-SLAM's 90 % is a parked
+    /// or slow robot's), so the room comes from the stops.
+    fn long_parked_then_moving_run(culling: bool, wheels: bool) -> LongRun {
+        let mut tracker = scene_tracker_with(|c| {
+            c.max_keyframes = Some(CULL_TEST_CAP);
+            c.keyframe_culling = culling.then(cull_test_config);
+            if wheels {
+                c.wheel_odom = Some(scene_wheel_config());
+            }
+        });
+        if wheels {
+            let n = tracker
+                .push_wheel((0..=LONG_RUN).map(|slot| WheelSample {
+                    stamp_ns: EPOCH_NS + u64::from(slot) * FRAME_NS,
+                    x: 0.0,
+                    y: -SCENE_STEP_M * f64::from(long_run_pos(slot)),
+                    theta: 0.0,
+                }))
+                .expect("the wheel path is on");
+            assert_eq!(n, LONG_RUN as usize + 1);
+        }
+        let generation = tracker.world_generation();
+        let (mut untracked, mut most_keyframes, mut worst_m) = (0, 0, 0.0f64);
+        for slot in 0..LONG_RUN {
+            let pos = long_run_pos(slot);
+            match feed_at(&mut tracker, pos, slot) {
+                TrackStatus::Tracked(pose) => worst_m = worst_m.max(centre_error(&pose, pos)),
+                _ => untracked += 1,
+            }
+            // The cached live-point count a consumer publishes, after culls as after anything.
+            assert_eq!(
+                tracker.live_map_points(),
+                tracker.map().num_active_map_points(),
+                "slot {slot}: a stale live-point count"
+            );
+            most_keyframes = most_keyframes.max(tracker.map().keyframes().len());
+        }
+        LongRun {
+            drops: tracker.map_drops(),
+            culled: tracker.culled_keyframes(),
+            // Generations past the bootstrap's: each one a reset.
+            world_generations: tracker.world_generation() - generation,
+            untracked,
+            most_keyframes,
+            worst_m,
+            tracker,
+        }
+    }
+
+    /// A long parked-then-moving run dropped the map at `max_keyframes` (the control), and with
+    /// culling on stays in ONE map: no drop, no new world generation (`reset_epoch` does not move,
+    /// so no consumer wipes its trail), every frame tracked, the map under the bound, and the pose
+    /// as accurate as the scene allows. With wheels, the factor chain stays whole: every factor
+    /// names keyframes the map holds, and no keyframe has two factors on a side.
+    ///
+    /// Mutation: `arm_map_bound` not calling `cull_for_room` turned this red (a drop per side).
+    #[test]
+    fn culling_keeps_a_long_parked_then_moving_run_in_one_map() {
+        let control = long_parked_then_moving_run(false, false);
+        assert!(
+            control.drops >= 1,
+            "the control never reached the bound; the test lost its point"
+        );
+        assert_eq!(control.culled, 0);
+        assert!(control.world_generations >= 1, "a drop is a new generation");
+        for wheels in [false, true] {
+            let run = long_parked_then_moving_run(true, wheels);
+            assert_eq!(run.drops, 0, "wheels={wheels}: the map was dropped");
+            assert!(run.culled > 0, "wheels={wheels}: nothing culled");
+            assert_eq!(
+                run.world_generations, 0,
+                "wheels={wheels}: culling moved the world generation"
+            );
+            assert_eq!(run.untracked, 0, "wheels={wheels}: frames lost");
+            assert!(
+                run.most_keyframes <= CULL_TEST_CAP,
+                "wheels={wheels}: {} keyframes past the bound",
+                run.most_keyframes
+            );
+            assert!(
+                run.worst_m < 0.01,
+                "wheels={wheels}: worst camera-centre error {} m",
+                run.worst_m
+            );
+            let kfs: HashSet<usize> = run
+                .tracker
+                .map()
+                .keyframes()
+                .iter()
+                .map(|kf| kf.frame.idx)
+                .collect();
+            assert!(kfs.contains(&0), "the first keyframe is the gauge anchor");
+            if wheels {
+                let factors = run.tracker.wheel.as_ref().unwrap().factors();
+                assert!(!factors.is_empty(), "no wheel factor to check");
+                for f in factors {
+                    assert!(
+                        kfs.contains(&f.from_idx) && kfs.contains(&f.to_idx),
+                        "factor {} -> {} names a removed keyframe",
+                        f.from_idx,
+                        f.to_idx
+                    );
+                    assert!(
+                        factors.iter().filter(|g| g.from_idx == f.from_idx).count() == 1
+                            && factors.iter().filter(|g| g.to_idx == f.to_idx).count() == 1,
+                        "two factors on one side of a keyframe"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A parked map with enough redundant keyframes to cull, no bound.
+    fn parked_map(inertial: Option<InertialConfig>, frames: u32) -> Tracker {
+        let mut tracker = scene_tracker(inertial);
+        tracker.config.keyframe_culling = Some(cull_test_config());
+        for slot in 0..frames {
+            assert!(matches!(
+                feed_at(&mut tracker, 0, slot),
+                TrackStatus::Tracked(_)
+            ));
+        }
+        assert!(tracker.map().keyframes().len() > 8);
+        tracker
+    }
+
+    /// With the inertial path on, nothing is culled until it is settled: initialized, out of a
+    /// stationary hold, and past both refinements. Then the same map culls.
+    ///
+    /// Mutation: dropping the `static_hold` conjunct turned this red; so did dropping
+    /// `imu_initialized`, and dropping the refinement conjuncts.
+    #[test]
+    fn culling_waits_for_a_settled_inertial_path() {
+        let mut tracker = parked_map(Some(inertial_config()), 100);
+        let generation = tracker.world_generation();
+        let set_refined = |t: &mut Tracker, done: bool| {
+            let inert = t.inertial.as_mut().unwrap();
+            inert.stats.first_refinement_done = done;
+            inert.stats.second_refinement_done = done;
+        };
+        // Each condition alone, the others met.
+        set_refined(&mut tracker, true);
+        assert_eq!(tracker.cull_for_room(), 0, "not initialized");
+        tracker.state.imu_initialized = true;
+        set_refined(&mut tracker, false);
+        assert_eq!(tracker.cull_for_room(), 0, "refinements pending");
+        set_refined(&mut tracker, true);
+        tracker.inertial.as_mut().unwrap().static_hold = Some(0);
+        assert_eq!(tracker.cull_for_room(), 0, "under a stationary hold");
+        tracker.inertial.as_mut().unwrap().static_hold = None;
+        let before = tracker.map().keyframes().len();
+        let culled = tracker.cull_for_room();
+        assert!(culled > 0, "a settled path culls");
+        assert_eq!(tracker.map().keyframes().len(), before - culled);
+        assert_eq!(tracker.culled_keyframes(), culled as u64);
+        assert_eq!(tracker.world_generation(), generation);
+    }
+
+    /// Keyframes looked up by id later are never culled: here the tracking reference, pointed at
+    /// an old redundant keyframe (a relocalization does that). It stays, and so does everything
+    /// newer, which is how it is protected.
+    ///
+    /// Mutation: leaving `current_keyframe_idx` out of the kept set turned this red.
+    #[test]
+    fn culling_keeps_the_tracking_reference() {
+        let mut control = parked_map(None, 100);
+        let reference = control.map().keyframes()[2].frame.idx;
+        control.cull_for_room();
+        assert!(
+            control.map().get_keyframe(reference).is_none(),
+            "the control did not cull keyframe {reference}; the test lost its point"
+        );
+
+        let mut tracker = parked_map(None, 100);
+        tracker.state.current_keyframe_idx = Some(reference);
+        let newer: Vec<usize> = tracker
+            .map()
+            .keyframes()
+            .iter()
+            .map(|kf| kf.frame.idx)
+            .filter(|&idx| idx >= reference)
+            .collect();
+        tracker.cull_for_room();
+        for idx in newer {
+            assert!(
+                tracker.map().get_keyframe(idx).is_some(),
+                "keyframe {idx} culled"
+            );
+        }
+    }
+
+    /// An insertion that culls one keyframe leaves the keyframe count where it was, and the
+    /// live-point count a consumer publishes must still be recounted: the insertion added points.
+    ///
+    /// Mutation: leaving `culled_keyframes` out of the cache key turned this red.
+    #[test]
+    fn an_insertion_that_culls_one_keyframe_recounts_the_live_points() {
+        let mut tracker = parked_map(None, 100);
+        let (before, culled) = (tracker.map().keyframes().len(), tracker.culled_keyframes());
+        tracker.config.max_keyframes = Some(before + 1);
+        tracker.config.keyframe_culling = Some(KeyframeCullingConfig {
+            max_removals: 1,
+            ..cull_test_config()
+        });
+        let mut slot = 100;
+        while tracker.culled_keyframes() == culled {
+            assert!(slot < 120, "no insertion culled");
+            // Driving: the new keyframe grows points; the parked ones are the redundant ones.
+            assert!(matches!(
+                feed_at(&mut tracker, slot - 100, slot),
+                TrackStatus::Tracked(_)
+            ));
+            slot += 1;
+        }
+        assert_eq!(tracker.map().keyframes().len(), before);
+        assert_eq!(
+            tracker.live_map_points(),
+            tracker.map().num_active_map_points()
+        );
+    }
+
+    /// Culling off (the default) is the map bound as it always was: armed at the cap.
+    #[test]
+    fn without_culling_the_bound_drops_as_before() {
+        let mut tracker = parked_map(None, 100);
+        tracker.config.keyframe_culling = None;
+        tracker.config.max_keyframes = Some(tracker.map().keyframes().len());
+        assert_eq!(tracker.cull_for_room(), 0);
+        tracker.arm_map_bound(true);
+        assert!(tracker.pending_map_reset);
+    }
+
+    /// Keyframes over `frames` frames at `pos(slot)`.
+    fn keyframes_over(
+        tracker: &mut Tracker,
+        frames: std::ops::Range<u32>,
+        pos: impl Fn(u32) -> u32,
+    ) {
+        for slot in frames {
+            assert!(
+                matches!(feed_at(tracker, pos(slot), slot), TrackStatus::Tracked(_)),
+                "slot {slot}"
+            );
+        }
+    }
+
+    /// The motion-only policy: parked, no keyframe after the bootstrap (the frame-count policy
+    /// forces one every 8); driving, parallax earns them, more than the weak-reference rule alone
+    /// (the same policy at an unreachable parallax) does.
+    ///
+    /// Mutation: never measuring the parallax (`None`) turned this red.
+    #[test]
+    fn a_motion_only_policy_inserts_on_parallax_and_not_while_parked() {
+        let motion_only = |px: f64| {
+            move |c: &mut TrackerConfig| {
+                c.keyframe_policy.max_frames_between = usize::MAX;
+                c.keyframe_policy.min_parallax_px = Some(px);
+            }
+        };
+        let mut default = scene_tracker_with(|_| {});
+        keyframes_over(&mut default, 0..60, |_| 0);
+        assert!(default.map().keyframes().len() >= 7, "the control");
+
+        let mut tracker = scene_tracker_with(motion_only(8.0));
+        let mut ratio_only = scene_tracker_with(motion_only(1e9));
+        for t in [&mut tracker, &mut ratio_only] {
+            keyframes_over(t, 0..60, |_| 0);
+            assert_eq!(t.map().keyframes().len(), 1, "parked inserted");
+            keyframes_over(t, 60..90, |slot| slot - 60);
+        }
+        let (on_parallax, on_ratio) = (
+            tracker.map().keyframes().len() - 1,
+            ratio_only.map().keyframes().len() - 1,
+        );
+        assert!(
+            on_parallax >= 4 && on_parallax > on_ratio + 1,
+            "driving 30 frames inserted {on_parallax} on parallax, {on_ratio} on the ratio alone"
+        );
+    }
+
+    /// Parallax on top of the frame-count policy inserts more often while driving.
+    #[test]
+    fn parallax_adds_keyframes_to_the_frame_count_policy() {
+        let mut plain = scene_tracker_with(|_| {});
+        let mut parallax = scene_tracker_with(|c| c.keyframe_policy.min_parallax_px = Some(5.0));
+        keyframes_over(&mut plain, 0..40, |slot| slot);
+        keyframes_over(&mut parallax, 0..40, |slot| slot);
+        let (a, b) = (
+            plain.map().keyframes().len(),
+            parallax.map().keyframes().len(),
+        );
+        assert!(b > a, "parallax {b} keyframes, frame count {a}");
+    }
+
+    /// `keyframe_max_interval` forces a keyframe a motion-only policy would not insert while
+    /// parked, at the interval.
+    ///
+    /// Mutation: ignoring the interval turned this red (one keyframe).
+    #[test]
+    fn the_time_bound_forces_keyframes_on_a_motion_only_policy() {
+        let mut tracker = scene_tracker_with(|c| {
+            c.keyframe_policy.max_frames_between = usize::MAX;
+            c.keyframe_policy.min_parallax_px = Some(8.0);
+            c.keyframe_max_interval = Some(Time::new::<second>(1.0));
+        });
+        // 60 frames of 66.7 ms: 4 s, a keyframe every 15 frames after the bootstrap.
+        keyframes_over(&mut tracker, 0..60, |_| 0);
+        assert_eq!(tracker.map().keyframes().len(), 4);
     }
 }

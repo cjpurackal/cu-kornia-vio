@@ -219,6 +219,13 @@ pub struct StereoVio {
     /// pose PnP's.
     #[reflect(ignore)]
     per_frame_fusion: Option<crate::fusion::FusionConfig>,
+    /// The `keyframe_policy` block, read and validated in `new`; absent is kornia-slam's default.
+    #[reflect(ignore)]
+    keyframe_insertion: crate::config::KeyframeInsertion,
+    /// The `keyframe_culling` block, read and validated in `new` against `max_keyframes`; `None`
+    /// drops the map at the bound, as before.
+    #[reflect(ignore)]
+    keyframe_culling: Option<kornia_slam::mapping::culling::KeyframeCullingConfig>,
     /// The bus's wheel queue, when `wheel_odom` is enabled. Bound and armed only then.
     #[reflect(ignore)]
     wheel: Option<Arc<WheelQueue>>,
@@ -360,6 +367,19 @@ impl CuTask for StereoVio {
             )
             .into());
         }
+        let max_keyframes =
+            crate::config::optional_positive_usize(config, crate::config::MAX_KEYFRAMES)?;
+        let keyframe_insertion = crate::config::keyframe_insertion(config)?;
+        // An inertial path on a motion-only policy with no time bound builds an IMU edge across
+        // the whole stop: past the ring, and past what BA converges on.
+        if inertial.is_some()
+            && keyframe_insertion.policy.max_frames_between == usize::MAX
+            && keyframe_insertion.max_interval.is_none()
+        {
+            return Err("`keyframe_policy.motion_only` with the `inertial` block needs                         `keyframe_policy.max_interval_s`"
+                .into());
+        }
+        let keyframe_culling = crate::config::keyframe_culling(config, max_keyframes)?;
         if inertial.is_some() {
             // Declares the consumer. Until this runs the producer's push is a single atomic
             // load and no lock: the right state for every graph without this block.
@@ -370,10 +390,7 @@ impl CuTask for StereoVio {
             calib: RectifiedStereo::default(),
             eye_size: (0, 0),
             on_tracking_loss: crate::config::on_tracking_loss(config)?,
-            max_keyframes: crate::config::optional_positive_usize(
-                config,
-                crate::config::MAX_KEYFRAMES,
-            )?,
+            max_keyframes,
             orb_keypoints: crate::config::optional_positive_usize(
                 config,
                 crate::config::ORB_KEYPOINTS,
@@ -393,6 +410,8 @@ impl CuTask for StereoVio {
             inertial,
             wheel_odom,
             per_frame_fusion: crate::config::optional_fusion(config)?,
+            keyframe_insertion,
+            keyframe_culling,
             wheel,
             coasted: 0,
             not_localized: 0,
@@ -479,6 +498,9 @@ impl CuTask for StereoVio {
                 config.reset_map_on_loss =
                     matches!(self.on_tracking_loss, OnTrackingLoss::ResetMap);
                 config.max_keyframes = self.max_keyframes;
+                config.keyframe_policy = self.keyframe_insertion.policy.clone();
+                config.keyframe_max_interval = self.keyframe_insertion.max_interval;
+                config.keyframe_culling = self.keyframe_culling.clone();
                 if let Some(n) = self.orb_keypoints {
                     config.orb.n_keypoints = n;
                 }
@@ -730,6 +752,13 @@ impl CuTask for StereoVio {
             "vio: {} landmark snapshots, {} keyframes without one (pool exhausted)",
             self.landmark_snapshots, self.landmark_pool_exhausted
         );
+        if let Some(t) = self.tracker.as_ref() {
+            info!(
+                "vio map: {} maps dropped, {} keyframes culled",
+                t.map_drops(),
+                t.culled_keyframes()
+            );
+        }
         // One structured line per population, each figure its own field, in milliseconds. NaN
         // marks an empty population, which is not the same thing as a zero-cost one.
         let t = &self.timing;
@@ -1134,6 +1163,85 @@ mod tests {
                 tap: None,
             },
         )
+    }
+
+    /// A `vio` task built from a RON config carrying `entries` (RON map entries).
+    fn vio_with_entries(entries: &str) -> CuResult<StereoVio> {
+        let text = format!(
+            r#"( tasks: [ ( id: "vio", type: "t::T", config: {{ {entries} }} ) ], cnx: [] )"#
+        );
+        let cfg = cu29::config::read_configuration_str(text, None)?;
+        let graph = cfg.get_graph(None)?;
+        let node = graph
+            .get_node(graph.get_node_id_by_name("vio").expect("node"))
+            .expect("node");
+        StereoVio::new(
+            node.get_instance_config(),
+            vio_resources::Resources {
+                imu: Arc::new(ImuQueue::new()),
+                epoch: Arc::new(ResetEpoch::new()),
+                wheel: None,
+                tap: None,
+            },
+        )
+    }
+
+    /// Parked frames through the task: `keyframe_policy` reaches the tracker (a keyframe every
+    /// 4 frames, not 8) and so does `keyframe_culling` (the 6-keyframe bound culls, never drops).
+    ///
+    /// Mutation: not copying `keyframe_culling` into the tracker config turned this red.
+    #[test]
+    fn test_the_keyframe_keys_reach_the_tracker() {
+        let mut task = vio_with_entries(
+            r#""max_keyframes": 6, "keyframe_policy": (max_frames_between: 4),
+               "keyframe_culling": (enabled: true, min_keyframes: 3)"#,
+        )
+        .expect("a valid config");
+        let ctx = CuContext::new_with_clock();
+        let tov = |slot: u64| Tov::Time(CuTime::from_nanos(1_000_000 + slot * 66_000_000));
+        for slot in 0..13 {
+            let mut out = CuMsg::<VioPose>::default();
+            task.process(&ctx, &trackable_frame(0, tov(slot)), &mut out)
+                .expect("frame");
+        }
+        let tracker = task.tracker.as_ref().expect("built");
+        assert_eq!(
+            tracker.culled_keyframes() + tracker.map().keyframes().len() as u64,
+            4,
+            "keyframes at slots 0, 4, 8 and 12"
+        );
+        for slot in 13..80 {
+            let mut out = CuMsg::<VioPose>::default();
+            task.process(&ctx, &trackable_frame(0, tov(slot)), &mut out)
+                .expect("frame");
+        }
+        let tracker = task.tracker.as_ref().expect("built");
+        assert_eq!(tracker.map_drops(), 0);
+        assert!(tracker.culled_keyframes() > 0);
+    }
+
+    /// The cross-key checks run at construction: culling needs the bound it acts at, and an
+    /// inertial motion-only policy needs a time bound.
+    #[test]
+    fn test_the_keyframe_keys_are_checked_against_each_other_at_startup() {
+        assert!(vio_with_entries(r#""keyframe_culling": (enabled: true)"#).is_err());
+        assert!(
+            vio_with_entries(r#""max_keyframes": 20, "keyframe_culling": (enabled: true)"#)
+                .is_err(),
+            "min_keyframes 21 is not below 20"
+        );
+        vio_with_entries(r#""max_keyframes": 120, "keyframe_culling": (enabled: true)"#)
+            .expect("valid");
+        let inertial = r#""inertial": (
+                 t_bc_rotation: [-1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0],
+                 t_bc_translation: [0.0, 0.0, 0.0],
+                 gyro_noise: 0.00012, accel_noise: 0.0019,
+                 gyro_bias_noise: 0.000002, accel_bias_noise: 0.00004, rate_hz: 200.0)"#;
+        let motion = r#""keyframe_policy": (motion_only: true, min_parallax_px: 10.0"#;
+        vio_with_entries(&format!("{motion})")).expect("visual-only needs no time bound");
+        assert!(vio_with_entries(&format!("{inertial}, {motion})")).is_err());
+        vio_with_entries(&format!("{inertial}, {motion}, max_interval_s: 1.0)"))
+            .expect("bounded in time");
     }
 
     #[test]
