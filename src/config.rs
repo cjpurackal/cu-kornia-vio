@@ -16,6 +16,7 @@ use kornia_slam::tracking::KeyframePolicy;
 use crate::error::VioError;
 use crate::fusion::FusionConfig;
 use crate::imu::InertialConfig;
+use crate::parked::StationaryEdgeConfig;
 use crate::stationary::StaticInitConfig;
 use crate::wheel::{WheelOdomConfig, mat3_from_rows};
 
@@ -521,6 +522,87 @@ pub(crate) fn optional_fusion(config: Option<&ComponentConfig>) -> CuResult<Opti
     }
 }
 
+/// The `stationary_edges` block of a `vio` component config: parked keyframes
+/// ([`crate::parked`]).
+///
+/// ```ron
+/// "stationary_edges": (
+///   enabled: true,              // default false
+///   // Each optional; the defaults are kornia-slam's `StationaryFactor` ones.
+///   translation_sigma_m: 0.002, // zero relative camera translation
+///   rotation_sigma_rad: 0.002,  // zero relative camera rotation
+///   velocity_sigma_m_s: 0.01,   // zero velocity at each end
+///   huber_chi2: 21.03,          // on the 12-row pose and velocity chi-square
+///   min_span_s: 1.0,            // still time under which a keyframe keeps its IMU edge
+/// ),
+/// ```
+///
+/// Absent, or `enabled: false` (the default), nothing changes. Enabled, once the inertial path
+/// is initialized and no refinement is pending, a parked robot withholds the keyframes its policy
+/// asks for on the time bound (no interval: `wheel_odom.parked_keyframe_interval_s` applies only
+/// before that), still inserts on tracking-quality triggers, and links keyframes of one stop by
+/// a stationary factor that culling merges without a span limit. It needs `wheel_odom` enabled
+/// and `inertial` with `enable_inertial_ba`: refused at startup otherwise. Validated even when
+/// disabled.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StationaryEdgesRon {
+    /// Off unless set.
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub translation_sigma_m: Option<f64>,
+    #[serde(default)]
+    pub rotation_sigma_rad: Option<f64>,
+    #[serde(default)]
+    pub velocity_sigma_m_s: Option<f64>,
+    #[serde(default)]
+    pub huber_chi2: Option<f64>,
+    #[serde(default)]
+    pub min_span_s: Option<f64>,
+}
+
+impl StationaryEdgesRon {
+    /// The tracker's config, or `None` when disabled. Validated either way.
+    pub fn to_config(&self) -> Result<Option<StationaryEdgeConfig>, VioError> {
+        let mut cfg = StationaryEdgeConfig::new();
+        if let Some(v) = self.translation_sigma_m {
+            cfg.translation_sigma_m = v;
+        }
+        if let Some(v) = self.rotation_sigma_rad {
+            cfg.rotation_sigma_rad = v;
+        }
+        if let Some(v) = self.velocity_sigma_m_s {
+            cfg.velocity_sigma_m_s = v;
+        }
+        if let Some(v) = self.huber_chi2 {
+            cfg.huber_chi2 = Some(v);
+        }
+        if let Some(v) = self.min_span_s {
+            // `validate` refuses a NaN or an infinity carried through here.
+            cfg.min_span = Time::new::<second>(v);
+        }
+        cfg.validate()?;
+        Ok(self.enabled.then_some(cfg))
+    }
+}
+
+/// Reads and validates the optional `stationary_edges` block; malformed is a hard error.
+pub(crate) fn optional_stationary_edges(
+    config: Option<&ComponentConfig>,
+) -> CuResult<Option<StationaryEdgeConfig>> {
+    let ron = config
+        .map(|c| c.get_value::<StationaryEdgesRon>(STATIONARY_EDGES))
+        .transpose()?
+        .flatten();
+    match ron {
+        Some(r) => r
+            .to_config()
+            .map_err(|e| format!("`{STATIONARY_EDGES}`: {e}").into()),
+        None => Ok(None),
+    }
+}
+
 /// The `keyframe_policy` block of a `vio` component config: when a keyframe is inserted.
 ///
 /// ```ron
@@ -827,6 +909,7 @@ config_keys! {
     PER_FRAME_FUSION => "per_frame_fusion",
     KEYFRAME_POLICY => "keyframe_policy",
     KEYFRAME_CULLING => "keyframe_culling",
+    STATIONARY_EDGES => "stationary_edges",
 }
 
 /// Refuses a config key `task` does not read.
@@ -1463,6 +1546,48 @@ mod tests {
             "(enabled: true, redundant: 0.9)",
         ] {
             assert!(culling(bad, Some(120)).is_err(), "{bad} accepted");
+        }
+    }
+
+    fn stationary(entries: &str) -> CuResult<Option<StationaryEdgeConfig>> {
+        optional_stationary_edges(Some(&node_config(&format!(
+            r#""stationary_edges": {entries}"#
+        ))))
+    }
+
+    /// Off unless enabled; enabled takes kornia-slam's defaults and each field replaces its own;
+    /// a bad value is refused even while disabled, and so is an unknown field.
+    ///
+    /// Mutation: ignoring `enabled` (always `Some`) turned this red.
+    #[test]
+    fn test_the_stationary_edges_block() {
+        assert!(CONFIG_KEYS.contains(&"stationary_edges"));
+        deny_unknown_keys(Some(&cfg(&["stationary_edges"])), "task", CONFIG_KEYS).unwrap();
+        assert!(optional_stationary_edges(None).unwrap().is_none());
+        assert!(stationary("(min_span_s: 2.0)").unwrap().is_none());
+        assert_eq!(
+            stationary("(enabled: true)").unwrap(),
+            Some(StationaryEdgeConfig::new())
+        );
+        let tuned = stationary(
+            "(enabled: true, translation_sigma_m: 0.003, rotation_sigma_rad: 0.004, \
+             velocity_sigma_m_s: 0.02, huber_chi2: 12.0, min_span_s: 2.0)",
+        )
+        .unwrap()
+        .expect("enabled");
+        assert_eq!(tuned.translation_sigma_m, 0.003);
+        assert_eq!(tuned.rotation_sigma_rad, 0.004);
+        assert_eq!(tuned.velocity_sigma_m_s, 0.02);
+        assert_eq!(tuned.huber_chi2, Some(12.0));
+        assert_eq!(tuned.min_span.get::<second>(), 2.0);
+        for bad in [
+            "(enabled: false, translation_sigma_m: 0.0)",
+            "(enabled: false, min_span_s: 0.2)",
+            "(enabled: true, huber_chi2: -1.0)",
+            "(enabled: true, velocity_sigma_m_s: -0.01)",
+            "(enabled: true, sigma: 1.0)",
+        ] {
+            assert!(stationary(bad).is_err(), "{bad} accepted");
         }
     }
 

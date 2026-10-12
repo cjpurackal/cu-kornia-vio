@@ -17,6 +17,9 @@
 //!   path refuses to run without. Likewise free of copper runtime and graph types.
 //! * [`stationary`]: the stillness detector that lets a parked robot initialize the inertial
 //!   path from a still window instead of waiting to drive.
+//! * [`parked`]: what a parked robot inserts once initialized: no keyframes on the time bound,
+//!   stationary edges instead of IMU edges between parked keyframes, and bounded IMU and wheel
+//!   rings while no keyframe comes. Off unless the `stationary_edges` block enables it.
 //! * [`bus`], [`feed`], [`imu_channel`], [`reset`]: what reaches a BACKGROUNDED tracker without
 //!   a second input edge. A [`VioBus`] resource bundle holds an [`ImuQueue`] that the inline
 //!   [`ImuFeed`] sink fills from the graph's IMU edge, and a [`ResetEpoch`] any bound task can
@@ -47,6 +50,7 @@ pub mod feed;
 pub mod fusion;
 pub mod imu;
 pub mod imu_channel;
+pub mod parked;
 pub mod pose;
 pub mod reset;
 pub mod stationary;
@@ -67,6 +71,7 @@ pub use feed::ImuFeed;
 pub use fusion::{FusionConfig, FusionStats};
 pub use imu::{BiasLimit, ImuGates, ImuWindowError, InertialConfig, InertialStats};
 pub use imu_channel::ImuQueue;
+pub use parked::{StationaryEdgeConfig, StationaryStats};
 pub use reset::ResetEpoch;
 pub use stationary::{NotStill, StaticInitConfig};
 pub use tap::{MAX_TAP_FEATURES, VioTap, VioTapSource};

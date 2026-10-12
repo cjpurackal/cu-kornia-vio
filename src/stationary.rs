@@ -173,6 +173,16 @@ pub(crate) fn check_imu(
     if span_s < want_s {
         return Err(NotStill::TooShort { span_s, want_s });
     }
+    check_imu_stats(stats, cfg)
+}
+
+/// The per-statistic part of [`check_imu`], without the span: accelerometer and gyroscope
+/// spread and the mean rate. The parked keyframe run ([`crate::parked`]) applies it chunk by
+/// chunk, where the span is whatever arrived since the last frame.
+pub(crate) fn check_imu_stats(
+    stats: &ImuWindowStats,
+    cfg: &StaticInitConfig,
+) -> Result<(), NotStill> {
     if !within(stats.accel_rms_dev, cfg.accel_rms_max) {
         return Err(NotStill::AccelSpread {
             rms: stats.accel_rms_dev,

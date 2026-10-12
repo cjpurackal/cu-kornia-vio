@@ -232,6 +232,10 @@ pub struct StereoVio {
     /// drops the map at the bound, as before.
     #[reflect(ignore)]
     keyframe_culling: Option<kornia_slam::mapping::culling::KeyframeCullingConfig>,
+    /// The `stationary_edges` block, read and validated in `new` against `wheel_odom` and
+    /// `inertial`; `None` leaves parked keyframes as they were.
+    #[reflect(ignore)]
+    stationary_edges: Option<crate::parked::StationaryEdgeConfig>,
     /// The bus's wheel queue, when `wheel_odom` is enabled. Bound and armed only then.
     #[reflect(ignore)]
     wheel: Option<Arc<WheelQueue>>,
@@ -444,6 +448,23 @@ impl CuTask for StereoVio {
             )
             .into());
         }
+        // Parked keyframes act through the wheels (which vouch the base stood still) and the
+        // visual-inertial BA (the only solve that reads a stationary factor): refused without
+        // either rather than silently inert.
+        let stationary_edges = crate::config::optional_stationary_edges(config)?;
+        if stationary_edges.is_some() {
+            let key = crate::config::STATIONARY_EDGES;
+            if !wheel_enabled {
+                return Err(format!("`{key}` needs `wheel_odom` enabled").into());
+            }
+            match &inertial {
+                None => return Err(format!("`{key}` needs the `inertial` block").into()),
+                Some(i) if !i.enable_inertial_ba => {
+                    return Err(format!("`{key}` needs `inertial.enable_inertial_ba: true`").into());
+                }
+                Some(_) => {}
+            }
+        }
         if inertial.is_some() {
             // Declares the consumer. Until this runs the producer's push is a single atomic
             // load and no lock: the right state for every graph without this block.
@@ -476,6 +497,7 @@ impl CuTask for StereoVio {
             per_frame_fusion: crate::config::optional_fusion(config)?,
             keyframe_insertion,
             keyframe_culling,
+            stationary_edges,
             wheel,
             coasted: 0,
             not_localized: 0,
@@ -600,6 +622,7 @@ impl CuTask for StereoVio {
                     _ => None,
                 };
                 config.per_frame_fusion = self.per_frame_fusion;
+                config.stationary_edges = self.stationary_edges;
                 none.insert(Tracker::new(camera, config))
             }
         };
@@ -821,6 +844,19 @@ impl CuTask for StereoVio {
                 "vio map: {} maps dropped, {} keyframes culled",
                 t.map_drops(),
                 t.culled_keyframes()
+            );
+        }
+        if let Some(s) = self.tracker.as_ref().and_then(|t| t.stationary_stats()) {
+            info!(
+                "vio parked: {} stationary edges ({} merged by culling, {} held), {} tail edges, \
+                 {} time-bound keyframes withheld; still runs closed by the IMU {} / the wheels {}",
+                s.edges_added,
+                s.edges_merged,
+                s.factors,
+                s.tail_edges,
+                s.keyframes_withheld,
+                s.runs_closed_imu,
+                s.runs_closed_wheels
             );
         }
         // One structured line per population, each figure its own field, in milliseconds. NaN
@@ -1331,6 +1367,69 @@ mod tests {
         );
         vio_with_entries(&format!("{inertial}, {motion}, max_interval_s: 1.0)"))
             .expect("bounded in time");
+    }
+
+    /// `stationary_edges` is refused at startup without the wheels, without the `inertial`
+    /// block, or with `enable_inertial_ba` off, naming what is missing; with all three it is
+    /// accepted and reaches the tracker.
+    ///
+    /// Mutation: dropping the `enable_inertial_ba` check turned this red.
+    #[test]
+    fn test_stationary_edges_are_checked_at_startup_and_reach_the_tracker() {
+        let inertial = |ba: bool| {
+            format!(
+                r#""inertial": (
+                 t_bc_rotation: [-1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0],
+                 t_bc_translation: [0.0, 0.0, 0.0],
+                 gyro_noise: 0.00012, accel_noise: 0.0019,
+                 gyro_bias_noise: 0.000002, accel_bias_noise: 0.00004, rate_hz: 200.0,
+                 enable_inertial_ba: {ba})"#
+            )
+        };
+        let wheels = format!(r#""wheel_odom": {WHEEL_BLOCK}"#);
+        let on = r#""stationary_edges": (enabled: true)"#;
+        let with_wheel =
+            |entries: &str| vio_with_entries_and_wheel(entries, Some(Arc::new(WheelQueue::new())));
+        let first_line =
+            |e: cu29::CuError| e.to_string().lines().next().unwrap_or_default().to_string();
+        let no_wheels = first_line(
+            vio_with_entries(&format!("{}, {on}", inertial(true)))
+                .err()
+                .expect("no wheels"),
+        );
+        assert!(
+            no_wheels.contains("needs `wheel_odom` enabled"),
+            "{no_wheels}"
+        );
+        let no_inertial = first_line(
+            with_wheel(&format!("{wheels}, {on}"))
+                .err()
+                .expect("no inertial"),
+        );
+        assert!(
+            no_inertial.contains("needs the `inertial` block"),
+            "{no_inertial}"
+        );
+        let dry = first_line(
+            with_wheel(&format!("{}, {wheels}, {on}", inertial(false)))
+                .err()
+                .expect("a dry run"),
+        );
+        assert!(dry.contains("enable_inertial_ba"), "{dry}");
+        assert!(
+            with_wheel(&format!(
+                r#"{}, {wheels}, "stationary_edges": (enabled: true, min_span_s: 0.1)"#,
+                inertial(true)
+            ))
+            .is_err(),
+            "a span under the tail"
+        );
+        let task = with_wheel(&format!("{}, {wheels}, {on}", inertial(true))).expect("valid");
+        assert_eq!(
+            task.stationary_edges,
+            Some(crate::parked::StationaryEdgeConfig::new())
+        );
+        vio_with_entries(r#""stationary_edges": (enabled: false)"#).expect("off needs nothing");
     }
 
     /// With the inertial path on, culling is refused when the keyframe spacing while parked puts

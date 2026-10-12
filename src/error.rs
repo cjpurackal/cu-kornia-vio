@@ -198,6 +198,26 @@ pub enum VioError {
         value: f64,
     },
 
+    /// A `stationary_edges` parameter is not a usable positive number, or `min_span_s` is
+    /// shorter than the IMU tail every stationary anchor keeps
+    /// ([`crate::parked::STATIONARY_TAIL_MIN_S`]).
+    #[error("stationary_edges parameter `{field}` is out of range, got {value}")]
+    StationaryParamInvalid {
+        /// Which parameter.
+        field: &'static str,
+        /// The offending value.
+        value: f64,
+    },
+
+    /// Stationary edges are configured without what they act through: the wheels (which vouch
+    /// that the base stood still), the inertial path, and its visual-inertial BA (the only solve
+    /// that reads them).
+    #[error("stationary_edges need {what}")]
+    StationaryEdgesNeed {
+        /// What is missing.
+        what: &'static str,
+    },
+
     /// ORB detection or a pyramid resize failed inside kornia-imgproc.
     #[error("image operation failed: {0}")]
     Image(#[from] ImageError),

@@ -4,7 +4,7 @@
 //! record ([`frame_diagnostics`]) is everything else read off the tracker, all of it cached or
 //! O(1) per frame.
 
-use cu_stereo_payloads::{FusionCheck, TrackingState, VioDiagnostics};
+use cu_stereo_payloads::{FusionCheck, StationaryCheck, TrackingState, VioDiagnostics};
 
 use crate::covariance::{horizontal_sigmas, ros_from_left};
 use crate::track::{FrameReport, SystemMode, TrackStatus, Tracker};
@@ -117,7 +117,22 @@ pub fn frame_diagnostics(
         fusion: fusion_check(tracker),
         pose_sigma_xy_m,
         pose_sigma_yaw_rad,
+        stationary: stationary_check(tracker),
     }
+}
+
+/// The parked-keyframe counters; all zero with `stationary_edges` off.
+fn stationary_check(tracker: &Tracker) -> StationaryCheck {
+    tracker
+        .stationary_stats()
+        .map_or_else(StationaryCheck::default, |s| StationaryCheck {
+            edges: s.edges_added,
+            edges_merged: s.edges_merged,
+            tail_edges: s.tail_edges,
+            keyframes_withheld: s.keyframes_withheld,
+            factors: u32::try_from(s.factors).unwrap_or(u32::MAX),
+            parked: s.parked,
+        })
 }
 
 /// The published pose's horizontal position sigma and heading sigma ([`horizontal_sigmas`]),

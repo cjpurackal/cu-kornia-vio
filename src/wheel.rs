@@ -695,6 +695,17 @@ impl WheelState {
         }
     }
 
+    /// Stamp of the newest reading.
+    pub fn newest_stamp_ns(&self) -> Option<u64> {
+        self.ring.back().map(|s| s.stamp_ns)
+    }
+
+    /// Readings held.
+    #[cfg(test)]
+    pub fn buffered(&self) -> usize {
+        self.ring.len()
+    }
+
     /// Whether the base stood still over `[t0_ns, t1_ns]`: the PATH, not the net delta, under the
     /// stationary initialization's wheel floors, so a there-and-back is motion. `false` when the
     /// readings do not cover the interval: nothing then vouches for the base.

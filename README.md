@@ -92,7 +92,8 @@ cnx: [
   `on_tracking_loss` (`keep_map`, the default, or `reset_map` for a long-running graph),
   `max_keyframes`, `orb_keypoints`, `search_radius_px`, `max_covisible_keyframes`,
   `pnp_lm_iterations`, `inertial`, `landmark_buffers`, `wheel_odom`, `per_frame_fusion`,
-  `keyframe_policy` (insertion thresholds, parallax, a time bound) and `keyframe_culling`;
+  `keyframe_policy` (insertion thresholds, parallax, a time bound), `keyframe_culling` and
+  `stationary_edges`;
   `cu_kornia_vio::config::CONFIG_KEYS` lists them. Its `Freezable` is a no-op (the kornia-slam
   map has no serialised form), so a resim of a `background: true` graph reproduces it only from
   the start of a log; see Known limitations.
@@ -249,6 +250,43 @@ With it on:
 `MountFeed` is only needed when the mount moves (a tilting head); the config's `cam_in_base_*`
 is used until the first `CameraMount` arrives.
 
+### Parked keyframes
+
+`wheel_odom.parked_keyframe_interval_s` withholds keyframes while the wheels and the camera are
+still, but forces one per interval, joined to the last by an IMU edge. Culling merges IMU edges
+only up to `keyframe_culling.max_merged_imu_span_s`, so a robot parked for long enough runs out of
+mergeable keyframes and the map is dropped at `max_keyframes` anyway (every ~20 min at 5 s / 11 s
+on the robot). `stationary_edges` removes both limits once the inertial path is settled:
+
+```ron
+"stationary_edges": (
+    enabled: true,              // default false; needs wheel_odom and inertial with
+                                // enable_inertial_ba, refused at startup otherwise
+    // optional: translation_sigma_m (0.002), rotation_sigma_rad (0.002),
+    // velocity_sigma_m_s (0.01), huber_chi2 (21.03), min_span_s (1.0)
+),
+```
+
+- From each keyframe the tracker verifies stillness as samples arrive: every 0.25 s chunk of IMU
+  samples passes the static initialization's spread and mean-rate checks, and the wheels'
+  cumulative path stays under 5 mm / 0.01 rad. Motion, an IMU hole or a wheel gap ends it.
+- While it holds and the camera stays within 1 cm / 0.5 deg of the last keyframe, a keyframe the
+  policy wants only on its time bound (`max_frames_between`, `max_interval_s`) is withheld with no
+  interval. Tracking-quality triggers (the tracked ratio dropping, parallax, an empty reference)
+  still insert, so a changed scene is still mapped.
+- Such a keyframe is joined to the last one by a kornia-slam `StationaryFactor` (zero relative
+  pose, zero velocity, bias continuity, the stop's mean gyro rate keeping the gyro bias observed)
+  instead of an IMU edge. Culling composes stationary factors across a removed keyframe with no
+  span limit; a keyframe with an IMU edge on one side and a stationary one on the other is kept.
+- The first keyframe after a stop that ended in motion gets an IMU edge over the tail only, from
+  0.5 s before the motion was seen, its bias link widened for the elided time.
+- While no keyframe comes, the IMU and wheel rings are pruned every frame to 0.5 s before that
+  anchor plus a margin, and the per-frame fusion predicts from it.
+
+Before the inertial path is initialized and while a refinement is pending, the parked interval
+gate and IMU edges apply as before (the still window and the refinements are built from IMU
+edges). `vio_diag`'s `stationary` record counts edges, merges, tail edges and withheld keyframes.
+
 ## Per-frame fusion
 
 Off by default. Without it the IMU and the wheels only seed each frame's PnP and meet vision in
@@ -336,7 +374,8 @@ does not compile against this crate.
   driving few keyframes are redundant: the room comes mostly from stops. With the inertial path
   on, that needs `max_merged_imu_span_s` of at least twice the parked keyframe spacing
   (`parked_keyframe_interval_s` plus 0.25 s for the frame that lands past it), which startup
-  checks. Culling bounds keyframes, not landmark
+  checks; `stationary_edges` lifts that limit for a settled inertial path (see
+  [Parked keyframes](#parked-keyframes)). Culling bounds keyframes, not landmark
   slots (kornia-slam never compacts those), so the map is still dropped once it holds
   `max_keyframes * orb_keypoints` of them.
 

@@ -430,6 +430,11 @@ impl ImuBuffer {
         self.forget_marks_before(stamp_ns);
     }
 
+    /// Stamp of the newest buffered sample.
+    pub fn newest_stamp_ns(&self) -> Option<u64> {
+        self.samples.back().map(|s| s.stamp_ns)
+    }
+
     /// Counters, plus the current occupancy.
     pub fn stats(&self) -> ImuBufferStats {
         ImuBufferStats {

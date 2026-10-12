@@ -241,6 +241,27 @@ pub struct FusionCheck {
     pub imu_dropped: u64,
 }
 
+/// The parked-keyframe path's counters (cu-kornia-vio's `stationary_edges`): keyframes of one
+/// stop linked by stationary factors instead of IMU edges, and time-bound keyframes withheld
+/// while parked. All zero when it is off.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect,
+)]
+pub struct StationaryCheck {
+    /// Keyframes linked to the previous one by a stationary factor, lifetime.
+    pub edges: u64,
+    /// Stationary factors composed across a culled keyframe, lifetime.
+    pub edges_merged: u64,
+    /// Keyframes after a still stretch linked by an IMU edge over its tail only, lifetime.
+    pub tail_edges: u64,
+    /// Time-bound keyframes withheld while parked, once per keyframe interval, lifetime.
+    pub keyframes_withheld: u64,
+    /// Stationary factors held now.
+    pub factors: u32,
+    /// The robot is parked now: the still run from the last keyframe covers this frame.
+    pub parked: bool,
+}
+
 /// What the tracker knew about one processed frame. The time of validity is the frame's capture
 /// stamp, on the carrying `CuMsg`'s `tov`.
 #[derive(
@@ -301,6 +322,9 @@ pub struct VioDiagnostics {
     pub pose_sigma_xy_m: f32,
     /// The published pose's heading sigma (rotation about the up axis), radians. NaN likewise.
     pub pose_sigma_yaw_rad: f32,
+    /// The parked-keyframe path's counters. Appended last: logs recorded before it existed do
+    /// not decode as this type.
+    pub stationary: StationaryCheck,
 }
 
 /// [`FeaturePoint::class`] bit: the keypoint has a stereo depth.
@@ -390,10 +414,12 @@ mod tests {
         // layout change (a field added anywhere, appended at the end included, removed, retyped
         // or reordered) makes every log already written undecodable as the new type.
         // `test_diagnostics_golden_bytes` pins the whole layout; this only checks the two sigmas
-        // close the encoding, NaN included.
-        let n = bytes.len();
+        // come right before the stationary record (six zero varints when off), NaN included.
+        let n = bytes.len() - 6;
+        assert_eq!(&bytes[n..], &[0u8; 6]);
+        assert_eq!(back.stationary, StationaryCheck::default());
         assert_eq!(&bytes[n - 8..n - 4], &0.125f32.to_le_bytes());
-        assert_eq!(&bytes[n - 4..], &f32::NAN.to_le_bytes());
+        assert_eq!(&bytes[n - 4..n], &f32::NAN.to_le_bytes());
     }
 
     /// Every field set to a value no other field of its type holds, so the golden bytes below
@@ -449,6 +475,14 @@ mod tests {
             },
             pose_sigma_xy_m: 18.5,
             pose_sigma_yaw_rad: 19.5,
+            stationary: StationaryCheck {
+                edges: 21,
+                edges_merged: 22,
+                tail_edges: 23,
+                keyframes_withheld: 24,
+                factors: 25,
+                parked: true,
+            },
         }
     }
 
@@ -461,7 +495,7 @@ mod tests {
             "010203030701000405060708090a0b0c0000c03f010300002040000060400000",
             "90400000b0400000d0400000f0400d0401000008410000184100002841000038",
             "4100004841000058410000684100007841000084410e0f1000008c4111011213",
-            "140000944100009c41",
+            "140000944100009c41151617181901",
         );
         let bytes = bincode::encode_to_vec(every_field_distinct(), standard()).expect("encode");
         let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();

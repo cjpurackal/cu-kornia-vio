@@ -90,7 +90,9 @@ use kornia_slam::inertial::{
     AlignedTrackingState, ImuInitResult, ImuInitializer, ImuWindowStats, StationaryInitError,
 };
 use kornia_slam::initialization::two_view::TwoViewInitConfig;
-use kornia_slam::mapping::bundle_adjustment::{local_window, run_local_ba, run_local_inertial_ba};
+use kornia_slam::mapping::bundle_adjustment::{
+    local_window_with_neighbors, run_local_ba, run_local_inertial_ba,
+};
 use kornia_slam::mapping::culling::{
     KeyframeCullingConfig, cull_landmarks, cull_redundant_keyframes,
 };
@@ -99,6 +101,7 @@ use kornia_slam::mapping::map::{
     ImuFactor, Keyframe, LandmarkSeed, Map, MapInsertion, ORB_N_LEVELS, ORB_SCALE_FACTOR,
     ObservationKey,
 };
+use kornia_slam::mapping::stationary::StationaryFactor;
 use kornia_slam::mapping::wheel_odom::WheelOdomFactor;
 use kornia_slam::stereo::{StereoMatchConfig, compute_stereo_matches, unproject_stereo};
 use kornia_slam::tracking::local_map::landmarks_in_frustum;
@@ -123,6 +126,10 @@ use crate::fusion::{
 use crate::imu::{
     ImuBuffer, ImuWindowError, InertialConfig, InertialStats, RawImuSample, WindowExcitation,
     preintegration_is_finite, ts_sec, window_excitation,
+};
+use crate::parked::{
+    EdgeAnchor, MAX_STATIONARY_FACTORS, PRUNE_MARGIN_NS, StationaryEdgeConfig, StationaryRun,
+    StationaryStats, edge_anchor,
 };
 use crate::stationary::{NotStill, StaticInitConfig, check_camera, check_imu, check_wheels};
 use crate::wheel::{WheelOdomConfig, WheelSample, WheelState, WheelStats, WheelWindowError};
@@ -304,9 +311,38 @@ pub struct TrackerConfig {
     /// publishes PnP's pose, the IMU and the wheels seeding it only. It fuses whatever of
     /// [`Self::inertial`] and [`Self::wheel_odom`] is on, and with neither it changes nothing.
     pub per_frame_fusion: Option<FusionConfig>,
+    /// Parked keyframes ([`crate::parked`]): no keyframes on the time bound while parked, and
+    /// stationary factors instead of IMU edges between keyframes of one stop. `None` — what
+    /// [`TrackerConfig::new`] sets — leaves every path as it was. Needs [`Self::wheel_odom`] and
+    /// [`Self::inertial`] with `enable_inertial_ba`; see
+    /// [`TrackerConfig::validate_stationary_edges`].
+    pub stationary_edges: Option<StationaryEdgeConfig>,
 }
 
 impl TrackerConfig {
+    /// Checks [`Self::stationary_edges`] against what it acts through: the wheels vouch that
+    /// the base stood still, and only the visual-inertial BA reads the factors. `Ok` when off.
+    pub fn validate_stationary_edges(&self) -> Result<(), VioError> {
+        let Some(cfg) = &self.stationary_edges else {
+            return Ok(());
+        };
+        cfg.validate()?;
+        if self.wheel_odom.is_none() {
+            return Err(VioError::StationaryEdgesNeed {
+                what: "wheel odometry (`wheel_odom`)",
+            });
+        }
+        match &self.inertial {
+            None => Err(VioError::StationaryEdgesNeed {
+                what: "the inertial path (`inertial`)",
+            }),
+            Some(i) if !i.enable_inertial_ba => Err(VioError::StationaryEdgesNeed {
+                what: "`inertial.enable_inertial_ba`",
+            }),
+            Some(_) => Ok(()),
+        }
+    }
+
     /// Builds a config for a rectified pair with the given metric baseline.
     pub fn new(baseline: Length) -> Self {
         // Upstream's `TwoViewInitConfig::default` carries the runtime's
@@ -355,6 +391,7 @@ impl TrackerConfig {
             inertial: None,
             wheel_odom: None,
             per_frame_fusion: None,
+            stationary_edges: None,
         }
     }
 }
@@ -1090,6 +1127,29 @@ pub struct Tracker {
     /// [`COAST_UNMEASURED_WARN_GAP_NS`] after it, so a wheel stream that gaps every second does
     /// not log every second.
     coast_unmeasured_warned_ns: Option<u64>,
+    /// The still stretch since the last keyframe ([`crate::parked`]); `None` unless
+    /// [`TrackerConfig::stationary_edges`] is on, restarted at every keyframe, cleared by a reset.
+    stationary_run: Option<StationaryRun>,
+    /// Stationary factors between keyframes, keyed by `Frame::idx` as `run_local_inertial_ba`
+    /// takes them. Composed by culling, cleared with the map.
+    stationary_factors: Vec<StationaryFactor>,
+    /// Parked-keyframe counters.
+    stationary: StationaryStats,
+    /// Test-only: the next keyframe ask is a tracking-quality one (what a passer-by occluding
+    /// the view produces), so a simulation can insert parked keyframes at will.
+    #[cfg(test)]
+    force_quality_keyframe: bool,
+}
+
+/// What asks for a keyframe, if anything: see [`Tracker::keyframe_wanted`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyframeWant {
+    No,
+    /// A tracking-quality trigger: the first keyframe, an empty reference, the tracked ratio
+    /// dropping, or parallax. Never withheld by the parked gate in stationary mode.
+    Quality,
+    /// Only a time bound: the policy's frame-count bound or `keyframe_max_interval`.
+    Bound,
 }
 
 /// How long a coast's covariance is integrated from one origin before it re-bases on its own
@@ -1399,6 +1459,14 @@ impl Tracker {
             );
         }
 
+        let mut config = config;
+        if let Err(e) = config.validate_stationary_edges() {
+            error!(
+                "cu-kornia-vio stationary_edges refused, running without them: {}",
+                e.to_string()
+            );
+            config.stationary_edges = None;
+        }
         let wheel = config.wheel_odom.clone().map(WheelState::new);
         if let Some(w) = &wheel {
             warning!(
@@ -1474,6 +1542,11 @@ impl Tracker {
             coast_unmeasured: 0,
             coast_unmeasured_run: 0,
             coast_unmeasured_warned_ns: None,
+            stationary_run: None,
+            stationary_factors: Vec::new(),
+            stationary: StationaryStats::default(),
+            #[cfg(test)]
+            force_quality_keyframe: false,
         }
     }
 
@@ -1500,6 +1573,29 @@ impl Tracker {
         right: &Image<u8, 1>,
         stamp: CuTime,
     ) -> Result<TrackStatus, VioError> {
+        let t0 = std::time::Instant::now();
+        let (frame, [orb_ms, pyr_ms, stereo_ms]) = self.stereo_frame(left, right)?;
+        let result = self.process_frame(frame, stamp);
+        // Per-stage split at debug level: the frontend (ORB + pyramids + stereo) is fixed
+        // cost per frame, while `track_ms` (colour sampling + Frame build + process_frame,
+        // dominated by process_frame) scales with the map — which one saturates a live loop
+        // decides whether the fix is a feature budget or a map bound. The four fields sum
+        // to the whole call.
+        let track_ms = t0.elapsed().as_secs_f64() * 1e3 - orb_ms - pyr_ms - stereo_ms;
+        debug!(
+            "process_stereo stage split: orb_ms={} pyr_ms={} stereo_ms={} track_ms={}",
+            orb_ms, pyr_ms, stereo_ms, track_ms
+        );
+        result
+    }
+
+    /// The stereo frontend of [`Self::process_stereo`]: ORB on both eyes, the pyramids and the
+    /// stereo matches, as the [`Frame`] `process_frame` takes, with the three stages' cost in ms.
+    fn stereo_frame(
+        &self,
+        left: &Image<u8, 1>,
+        right: &Image<u8, 1>,
+    ) -> Result<(Frame, [f64; 3]), VioError> {
         validate_camera(&self.camera, self.config.baseline.get::<meter>())?;
         if left.width() != right.width() || left.height() != right.height() {
             return Err(VioError::StereoSizeMismatch {
@@ -1509,7 +1605,6 @@ impl Tracker {
                 right_h: right.height(),
             });
         }
-
         let t0 = std::time::Instant::now();
         let features = self.config.orb.detect_and_extract_u8(left)?;
         let right_features = self.config.orb.detect_and_extract_u8(right)?;
@@ -1552,19 +1647,7 @@ impl Tracker {
             depth: stereo.depth,
             keypoints_undist: Vec::new(), // filled by `ensure_undistorted`
         };
-
-        let result = self.process_frame(frame, stamp);
-        // Per-stage split at debug level: the frontend (ORB + pyramids + stereo) is fixed
-        // cost per frame, while `track_ms` (colour sampling + Frame build + process_frame,
-        // dominated by process_frame) scales with the map — which one saturates a live loop
-        // decides whether the fix is a feature budget or a map bound. The four fields sum
-        // to the whole call.
-        let track_ms = t0.elapsed().as_secs_f64() * 1e3 - orb_ms - pyr_ms - stereo_ms;
-        debug!(
-            "process_stereo stage split: orb_ms={} pyr_ms={} stereo_ms={} track_ms={}",
-            orb_ms, pyr_ms, stereo_ms, track_ms
-        );
-        result
+        Ok((frame, [orb_ms, pyr_ms, stereo_ms]))
     }
 
     /// Feeds a frame whose features and per-keypoint stereo depths were built
@@ -1623,6 +1706,9 @@ impl Tracker {
                     },
                 }),
         );
+
+        // After the task drained the IMU and wheel queues, before anything reads the rings.
+        self.advance_stationary_run(stamp_ns);
 
         // No `ImuInit` arm: see [`SystemMode`] for why this tracker never parks there.
         let frame_idx = frame.idx;
@@ -1712,9 +1798,12 @@ impl Tracker {
             .coast_origin
             .map(|o| o.stamp_ns)
             .filter(|&t| stamp_ns.saturating_sub(t) <= 2 * COAST_REBASE_NS);
+        // Where the next keyframe's wheel interval can start: the last keyframe, or once a
+        // parked anchor moved past it, that anchor less a margin.
+        let edge_keep_from = self.edge_keep_from_ns();
         if let Some(w) = self.wheel.as_mut() {
             w.prune([
-                self.last_keyframe_stamp_ns,
+                edge_keep_from,
                 self.last_frame_stamp_ns,
                 still_window_start,
                 carry_velocity_start,
@@ -1910,6 +1999,156 @@ impl Tracker {
             .is_some_and(|i| !self.state.imu_initialized && !i.dry_run_accepted)
     }
 
+    /// Whether an initialized inertial path still waits for a refinement that solves over its
+    /// window's IMU edges: no stationary hold, the schedule not run out, a stage not run.
+    fn refinement_pending(&self) -> bool {
+        self.inertial.as_ref().is_some_and(|inert| {
+            self.state.imu_initialized
+                && inert.static_hold.is_none()
+                && !inert.refinements_lapsed
+                && !(inert.stats.first_refinement_done && inert.stats.second_refinement_done)
+        })
+    }
+
+    /// Whether parked keyframes are linked by stationary factors and withheld without an
+    /// interval ([`crate::parked`]): configured, the inertial path initialized and applied, and
+    /// no refinement pending (a stationary hold counts as settled, as for culling). Otherwise the
+    /// keyframes keep their IMU edges, which the still window and the refinements are built from.
+    fn stationary_active(&self) -> bool {
+        self.config.stationary_edges.is_some()
+            && self.wheel.is_some()
+            && self
+                .inertial
+                .as_ref()
+                .is_some_and(|i| i.cfg.enable_inertial_ba)
+            && self.state.imu_initialized
+            && !self.refinement_pending()
+    }
+
+    /// Whether the current pose is within the parked floors of keyframe `kf_idx`
+    /// ([`PARKED_CAMERA_TRANSLATION_M`], [`PARKED_CAMERA_ROTATION_RAD`]). A NaN pose is not.
+    fn camera_near_keyframe(&self, kf_idx: usize) -> bool {
+        let Some(kf) = self.map.get_keyframe(kf_idx) else {
+            return false;
+        };
+        let (p0, p1) = (kf.frame.pose_world_to_cam, self.state.pose_world_to_cam);
+        let moved = (p1.inverse().translation - p0.inverse().translation).length();
+        let turned = crate::consistency::angle_between(&p0.rotation, &p1.rotation);
+        moved <= PARKED_CAMERA_TRANSLATION_M && turned <= PARKED_CAMERA_ROTATION_RAD
+    }
+
+    /// The edge a keyframe at `stamp_ns` would get from keyframe `(kf_idx, kf_ns)`; see
+    /// [`crate::parked::edge_anchor`].
+    fn edge_anchor_from(
+        &self,
+        kf_idx: usize,
+        kf_ns: u64,
+        stamp_ns: u64,
+        camera_still: bool,
+    ) -> EdgeAnchor {
+        let (Some(cfg), Some(w)) = (self.config.stationary_edges.as_ref(), self.wheel.as_ref())
+        else {
+            return EdgeAnchor::Keyframe(kf_ns);
+        };
+        edge_anchor(
+            self.stationary_run.as_ref(),
+            kf_idx,
+            kf_ns,
+            stamp_ns,
+            self.stationary_active(),
+            camera_still,
+            cfg.min_span_ns(),
+            w.cfg.max_gap_ns(),
+        )
+    }
+
+    /// The parked anchor the last keyframe's next edge starts at, when the rings were pruned
+    /// past the keyframe; `None` while that edge still starts at the keyframe.
+    fn committed_anchor_ns(&self) -> Option<u64> {
+        let (kf_idx, kf_ns) = (self.state.last_keyframe_idx?, self.last_keyframe_stamp_ns?);
+        self.stationary_run
+            .as_ref()
+            .filter(|r| r.kf_idx == kf_idx && r.start_ns == kf_ns && r.committed_ns > kf_ns)
+            .map(|r| r.committed_ns)
+    }
+
+    /// The oldest wheel reading the next keyframe's interval can need.
+    fn edge_keep_from_ns(&self) -> Option<u64> {
+        let kf_ns = self.last_keyframe_stamp_ns?;
+        Some(
+            self.committed_anchor_ns()
+                .map_or(kf_ns, |a| a.saturating_sub(PRUNE_MARGIN_NS).max(kf_ns)),
+        )
+    }
+
+    /// Advances the still run with the samples and readings drained for this frame, and prunes
+    /// the IMU ring to the parked anchor once there is one: while no keyframe comes, the ring
+    /// holds the tail and a margin, not the whole stop. A no-op unless stationary edges are on.
+    fn advance_stationary_run(&mut self, stamp_ns: u64) {
+        self.stationary.parked = false;
+        if self.config.stationary_edges.is_none() {
+            return;
+        }
+        let (Some(run), Some(inert), Some(w), Some(epoch)) = (
+            self.stationary_run.as_mut(),
+            self.inertial.as_ref(),
+            self.wheel.as_ref(),
+            self.epoch_ns,
+        ) else {
+            return;
+        };
+        let still = inert.cfg.static_init.unwrap_or_else(|| {
+            StaticInitConfig::from_noise(&inert.cfg.calib, inert.cfg.gates.nominal_rate)
+        });
+        if run
+            .advance_imu(&inert.buffer, &inert.cfg.gates, &still, epoch)
+            .is_some()
+        {
+            self.stationary.runs_closed_imu += 1;
+        }
+        if run.advance_wheels(w).is_some() {
+            self.stationary.runs_closed_wheels += 1;
+        }
+        let covers = run.covers(stamp_ns, w.cfg.max_gap_ns());
+        let (Some(kf_idx), Some(kf_ns)) =
+            (self.state.last_keyframe_idx, self.last_keyframe_stamp_ns)
+        else {
+            return;
+        };
+        self.stationary.parked = covers && self.stationary_active();
+        let anchor = self.edge_anchor_from(kf_idx, kf_ns, stamp_ns, true);
+        if matches!(anchor, EdgeAnchor::Keyframe(_)) {
+            return;
+        }
+        let anchor_ns = anchor.start_ns();
+        if let Some(run) = self.stationary_run.as_mut() {
+            run.committed_ns = run.committed_ns.max(anchor_ns);
+        }
+        // Every later reader starts at or after this: the next anchor (monotone), the gyro prior
+        // (from the last frame), the run's cursors (at or past the anchor).
+        let keep_from = anchor_ns
+            .saturating_sub(PRUNE_MARGIN_NS)
+            .min(self.last_frame_stamp_ns.unwrap_or(u64::MAX));
+        if let Some(inert) = self.inertial.as_mut() {
+            inert.buffer.prune_before(keep_from);
+        }
+    }
+
+    /// Starts the still run at a keyframe just inserted (bootstrap included).
+    fn restart_stationary_run(&mut self, kf_idx: usize, stamp_ns: u64) {
+        if self.config.stationary_edges.is_some() {
+            self.stationary_run = Some(StationaryRun::new(kf_idx, stamp_ns));
+        }
+    }
+
+    /// Parked-keyframe counters; `None` unless [`TrackerConfig::stationary_edges`] is on.
+    pub fn stationary_stats(&self) -> Option<StationaryStats> {
+        self.config.stationary_edges.map(|_| StationaryStats {
+            factors: self.stationary_factors.len(),
+            ..self.stationary
+        })
+    }
+
     /// Removes redundant keyframes ([`TrackerConfig::keyframe_culling`]); returns how many.
     ///
     /// Not a reset: the world, its generation (`reset_epoch`), the pose, the coast origin and
@@ -1932,13 +2171,7 @@ impl Tracker {
         let Some(cfg) = self.config.keyframe_culling.as_ref() else {
             return 0;
         };
-        if let Some(inert) = self.inertial.as_ref()
-            && (self.inertial_unsettled()
-                || (self.state.imu_initialized
-                    && inert.static_hold.is_none()
-                    && !inert.refinements_lapsed
-                    && !(inert.stats.first_refinement_done && inert.stats.second_refinement_done)))
-        {
+        if self.inertial_unsettled() || self.refinement_pending() {
             debug!(
                 "keyframe culling: the inertial path is not settled, nothing culled keyframes={}",
                 self.map.keyframes().len()
@@ -1970,7 +2203,15 @@ impl Tracker {
             &mut self.map,
             &cfg,
             self.wheel.as_mut().map(|w| w.factors_mut()),
+            self.config
+                .stationary_edges
+                .is_some()
+                .then_some(&mut self.stationary_factors),
         );
+        self.stationary.edges_merged += report.stationary_edges_merged as u64;
+        debug_assert!(self.stationary_factors.iter().all(|f| {
+            self.map.get_keyframe(f.from_idx).is_some() && self.map.get_keyframe(f.to_idx).is_some()
+        }));
         if report.removed.is_empty() {
             debug!(
                 "keyframe culling: nothing redundant to remove keyframes={} kept_for_edges={}",
@@ -1985,12 +2226,14 @@ impl Tracker {
         self.culled_keyframes += removed.len() as u64;
         info!(
             "keyframe culling: removed={} keyframes={} -> {} imu_edges_merged={} \
-             wheel_edges_merged={} kept_for_edges={} landmarks_retired={} culled_total={}",
+             wheel_edges_merged={} stationary_edges_merged={} kept_for_edges={} \
+             landmarks_retired={} culled_total={}",
             removed.len(),
             before,
             self.map.keyframes().len(),
             report.imu_edges_merged,
             report.wheel_edges_merged,
+            report.stationary_edges_merged,
             report.kept_for_edges,
             report.landmarks_retired,
             self.culled_keyframes
@@ -2277,6 +2520,9 @@ impl Tracker {
         if let Some(w) = self.wheel.as_mut() {
             w.reset_map();
         }
+        // Same: keyed by keyframes of the dropped map; the next bootstrap starts a run.
+        self.stationary_factors.clear();
+        self.stationary_run = None;
         // Their keyframe indices name keyframes of the dropped map.
         self.kf_tracked_poses.clear();
         self.kf_cov.clear();
@@ -2434,6 +2680,7 @@ impl Tracker {
         self.anchored_since_reset = true;
         self.last_keyframe_timestamp_sec = Some(timestamp_sec);
         self.last_keyframe_stamp_ns = Some(stamp_ns);
+        self.restart_stationary_run(curr_idx, stamp_ns);
         self.arm_inertial_window(curr_idx, timestamp_sec, stamp_ns);
         self.adopt_carried_alignment(carried, timestamp_sec);
 
@@ -3054,6 +3301,9 @@ impl Tracker {
             return None;
         }
         let position_rows = imu_position_trusted(self.inertial_diag().0);
+        // Parked past a stationary anchor ([`crate::parked`]) the prediction starts there, at the
+        // keyframe's state: nothing moved before it, and the rings no longer reach the keyframe.
+        let kf_ns = self.committed_anchor_ns().unwrap_or(kf_ns);
         let kf = self.map.get_keyframe(kf_idx)?;
         let kf_pose = kf.frame.pose_world_to_cam;
         let (kf_bias, kf_velocity) = (kf.imu_bias, kf.velocity_world);
@@ -3576,12 +3826,26 @@ impl Tracker {
     /// window is built from keyframe IMU edges, and withholding them kept a robot parked 9 s
     /// uninitialized into its first drive (replay of a 2026-10-11 capture). So does a fusion
     /// suspended on the last keyframe, which waits for the next one.
+    ///
+    /// In stationary mode ([`Self::stationary_active`], [`crate::parked`]) the rule changes: only
+    /// a keyframe the policy wants on its TIME bound ([`KeyframeWant::Bound`]) is withheld, for
+    /// as long as the still run from the last keyframe covers the frame and the camera stays
+    /// within the floors, with no interval; a tracking-quality ask always inserts.
     fn parked_keyframe_suppressed(
         &mut self,
         stamp_ns: u64,
         tracked_inliers: usize,
         n_ref_map_points: usize,
+        want: KeyframeWant,
     ) -> bool {
+        if self.stationary_active() {
+            return self.stationary_keyframe_withheld(
+                stamp_ns,
+                tracked_inliers,
+                n_ref_map_points,
+                want,
+            );
+        }
         let Some(w) = self.wheel.as_ref() else {
             return false;
         };
@@ -3611,27 +3875,70 @@ impl Tracker {
         if !strong || !w.parked_between(kf_ns, stamp_ns) {
             return false;
         }
-        let Some(kf) = self.map.get_keyframe(kf_idx) else {
+        if !self.camera_near_keyframe(kf_idx) {
+            return false;
+        }
+        self.count_parked_skip(kf_idx);
+        true
+    }
+
+    /// Counts a withheld keyframe once per keyframe interval: past its frame budget the policy
+    /// asks again on every frame, and those frames are one keyframe.
+    fn count_parked_skip(&mut self, kf_idx: usize) {
+        if self.parked_skip_counted_for == Some(kf_idx) {
+            return;
+        }
+        self.parked_skip_counted_for = Some(kf_idx);
+        if let Some(w) = self.wheel.as_mut() {
+            w.stats.parked_keyframes_skipped += 1;
+        }
+        if self.stationary_active() {
+            self.stationary.keyframes_withheld += 1;
+        }
+    }
+
+    /// The stationary-mode gate: withholds a time-bound keyframe while the still run from the
+    /// last keyframe covers `stamp_ns`, tracking is strong and the camera has not moved. No
+    /// interval: the next keyframe of a robot that stays parked comes from a tracking-quality
+    /// trigger, or from the motion that ends the stop. A fusion suspended on the last keyframe
+    /// still gets its keyframe.
+    fn stationary_keyframe_withheld(
+        &mut self,
+        stamp_ns: u64,
+        tracked_inliers: usize,
+        n_ref_map_points: usize,
+        want: KeyframeWant,
+    ) -> bool {
+        if want != KeyframeWant::Bound {
+            return false;
+        }
+        let (Some(kf_ns), Some(kf_idx), Some(w)) = (
+            self.last_keyframe_stamp_ns,
+            self.state.last_keyframe_idx,
+            self.wheel.as_ref(),
+        ) else {
             return false;
         };
-        let (p0, p1) = (kf.frame.pose_world_to_cam, self.state.pose_world_to_cam);
-        let moved = (p1.inverse().translation - p0.inverse().translation).length();
-        let turned = crate::consistency::angle_between(&p0.rotation, &p1.rotation);
-        // A NaN pose is not parked.
-        if !(moved <= PARKED_CAMERA_TRANSLATION_M && turned <= PARKED_CAMERA_ROTATION_RAD) {
+        if self.fusion_suspended_on == Some(kf_idx) {
             return false;
         }
-        if self.parked_skip_counted_for != Some(kf_idx) {
-            self.parked_skip_counted_for = Some(kf_idx);
-            if let Some(w) = self.wheel.as_mut() {
-                w.stats.parked_keyframes_skipped += 1;
-            }
+        let covered = self.stationary_run.as_ref().is_some_and(|r| {
+            r.kf_idx == kf_idx && r.start_ns == kf_ns && r.covers(stamp_ns, w.cfg.max_gap_ns())
+        });
+        let strong = n_ref_map_points > 0
+            && tracked_inliers as f64
+                >= n_ref_map_points as f64 * self.config.keyframe_policy.ref_ratio;
+        if !(covered && strong && self.camera_near_keyframe(kf_idx)) {
+            return false;
         }
+        self.count_parked_skip(kf_idx);
         true
     }
 
     /// Whether the keyframe policy asks for a keyframe on this frame, or
-    /// [`TrackerConfig::keyframe_max_interval`] forces one.
+    /// [`TrackerConfig::keyframe_max_interval`] forces one, and which kind of ask it is:
+    /// [`KeyframeWant::Quality`] when the policy would ask without its frame-count bound,
+    /// [`KeyframeWant::Bound`] when only that bound or the time bound does.
     ///
     /// The parallax is measured only when the policy reads it (`min_parallax_px`): it walks every
     /// match. Against the last keyframe, at the pose this frame was tracked at.
@@ -3642,7 +3949,7 @@ impl Tracker {
         tracked_inliers: usize,
         n_ref_map_points: usize,
         matches: &[(usize, usize)],
-    ) -> bool {
+    ) -> KeyframeWant {
         let policy = &self.config.keyframe_policy;
         let median_parallax_px = policy
             .min_parallax_px
@@ -3664,8 +3971,23 @@ impl Tracker {
             n_ref_map_points,
             median_parallax_px,
         };
+        let quality = KeyframePolicy {
+            max_frames_between: usize::MAX,
+            ..*policy
+        };
+        #[cfg(test)]
+        let forced = self.force_quality_keyframe
+            && self
+                .state
+                .last_keyframe_idx
+                .is_some_and(|kf| frame.idx.saturating_sub(kf) >= policy.min_frames_between);
+        #[cfg(not(test))]
+        let forced = false;
+        if forced || quality.should_insert_with(&evidence) {
+            return KeyframeWant::Quality;
+        }
         if policy.should_insert_with(&evidence) {
-            return true;
+            return KeyframeWant::Bound;
         }
         // The time bound, still inside `min_frames_between`: a burst of frames after a stall
         // must not insert one keyframe each.
@@ -3674,11 +3996,16 @@ impl Tracker {
             self.last_keyframe_stamp_ns,
             self.state.last_keyframe_idx,
         ) else {
-            return false;
+            return KeyframeWant::No;
         };
         let interval_ns = (interval.get::<second>() * 1e9) as u64;
-        stamp_ns.saturating_sub(kf_ns) >= interval_ns
+        if stamp_ns.saturating_sub(kf_ns) >= interval_ns
             && frame.idx.saturating_sub(kf_idx) >= policy.min_frames_between
+        {
+            KeyframeWant::Bound
+        } else {
+            KeyframeWant::No
+        }
     }
 
     /// Canonical order: insert -> associate -> densify close stereo -> grow(xN)
@@ -3705,10 +4032,12 @@ impl Tracker {
             .map(|kf| kf.num_associated_points())
             .unwrap_or(0);
 
-        if !self.keyframe_wanted(frame, stamp_ns, tracked_inliers, n_ref_map_points, matches) {
+        let want =
+            self.keyframe_wanted(frame, stamp_ns, tracked_inliers, n_ref_map_points, matches);
+        if want == KeyframeWant::No {
             return false;
         }
-        if self.parked_keyframe_suppressed(stamp_ns, tracked_inliers, n_ref_map_points) {
+        if self.parked_keyframe_suppressed(stamp_ns, tracked_inliers, n_ref_map_points, want) {
             return false;
         }
 
@@ -3721,6 +4050,17 @@ impl Tracker {
         {
             return false;
         }
+
+        // What links this keyframe to the last one ([`crate::parked`]): today's IMU edge from the
+        // last keyframe, a stationary factor, or an IMU edge over the tail of a still stretch.
+        // Decided before the state below moves on, against the pose this frame was tracked at.
+        let anchor = prev_edge.map(|(prev_idx, prev_ns)| {
+            let still = self.camera_near_keyframe(prev_idx);
+            (
+                prev_idx,
+                self.edge_anchor_from(prev_idx, prev_ns, stamp_ns, still),
+            )
+        });
 
         let curr_kf = self.seeded_keyframe(Frame {
             idx: frame.idx,
@@ -3829,12 +4169,48 @@ impl Tracker {
         self.last_keyframe_stamp_ns = Some(stamp_ns);
         self.state.current_keyframe_idx = Some(frame.idx);
         self.state.last_keyframe_idx = Some(frame.idx);
+        #[cfg(test)]
+        if want == KeyframeWant::Quality {
+            self.force_quality_keyframe = false;
+        }
+        self.restart_stationary_run(frame.idx, stamp_ns);
 
         // Inertial edge + initialization ladder: after growth, before fuse, where it has always
         // been. Both endpoints of the edge are in the map, which `Map::apply_insertion` refuses
         // an IMU factor without and `ImuInitializer` silently skips a factor without. `None` —
         // the configuration this repo ships — means every line below behaves exactly as before.
-        let inertial_ba = self.on_keyframe_inertial(prev_edge, frame.idx, stamp_ns);
+        let imu_edge = match anchor {
+            Some((prev, EdgeAnchor::Keyframe(t0))) => Some((prev, t0, 0.0)),
+            Some((
+                prev,
+                EdgeAnchor::Tail {
+                    anchor_ns,
+                    elided_s,
+                },
+            )) => {
+                self.stationary.tail_edges += 1;
+                Some((prev, anchor_ns, elided_s))
+            }
+            Some((_, EdgeAnchor::Stationary { .. })) | None => None,
+        };
+        let inertial_ba = self.on_keyframe_inertial_edge(imu_edge, frame.idx, stamp_ns);
+        if let (Some((prev, EdgeAnchor::Stationary { span_s, gyro, .. })), Some(cfg), Some(inert)) =
+            (anchor, self.config.stationary_edges, self.inertial.as_ref())
+        {
+            self.stationary_factors.push(cfg.factor(
+                prev,
+                frame.idx,
+                span_s,
+                gyro,
+                inert.cfg.calib,
+            ));
+            self.stationary.edges_added += 1;
+            let excess = self
+                .stationary_factors
+                .len()
+                .saturating_sub(MAX_STATIONARY_FACTORS);
+            self.stationary_factors.drain(..excess);
+        }
 
         // Fuse before local BA, deliberately: BA then sees the extra
         // reprojection constraints.
@@ -3884,7 +4260,13 @@ impl Tracker {
             }
         }
         let new_wheel_factors = match self.wheel.as_mut() {
-            Some(w) => w.on_keyframe(prev_edge, frame.idx, stamp_ns),
+            // From the edge's anchor: the base did not move before it, and the readings are
+            // pruned to it while parked. The chain stays one in, one out for culling.
+            Some(w) => w.on_keyframe(
+                anchor.map(|(prev, a)| (prev, a.start_ns())),
+                frame.idx,
+                stamp_ns,
+            ),
             None => Vec::new(),
         };
         self.check_motion(&new_wheel_factors, timestamp_sec);
@@ -3912,7 +4294,17 @@ impl Tracker {
             // the active keyframes' IMU neighbours. Same solve as cloning the whole map (#143:
             // byte-identical trajectory, peak RSS 768 -> 504 MB), at a cost that no longer
             // grows with the map.
-            let snapshot = self.map.ba_snapshot(&local_window(&self.map));
+            // The stationary factors only act in the inertial solve; their keyframes are pulled
+            // into the window as IMU neighbours are.
+            let stationary: &[StationaryFactor] = if inertial_ba.is_some() {
+                &self.stationary_factors
+            } else {
+                &[]
+            };
+            let snapshot = self.map.ba_snapshot(&local_window_with_neighbors(
+                &self.map,
+                stationary.iter().map(|f| (f.from_idx, f.to_idx)),
+            ));
             let update = match inertial_ba {
                 // 15 DOF per keyframe (pose, velocity, bias) instead of 6. Mirrors
                 // kornia-slam's own local mapping, which branches on exactly this flag.
@@ -3922,6 +4314,7 @@ impl Tracker {
                     Some(imu_t_bc),
                     gravity_world,
                     &wheel_factors,
+                    stationary,
                 ),
                 // A map built without the inertial path holds no IMU factor, so the 15-DOF solve
                 // is the visual one plus the wheel edges; velocity and bias ride along under the
@@ -3935,6 +4328,7 @@ impl Tracker {
                         None,
                         Vec3F64::ZERO,
                         &wheel_factors,
+                        &[],
                     )
                 }
                 None => run_local_ba(snapshot, &self.camera),
@@ -4359,6 +4753,22 @@ impl Tracker {
 
     // ── Inertial ─────────────────────────────────────────────────────────────
 
+    /// The keyframe edge from the previous keyframe's own stamp: the test seam of
+    /// [`Self::on_keyframe_inertial_edge`].
+    #[cfg(test)]
+    fn on_keyframe_inertial(
+        &mut self,
+        prev_edge: Option<(usize, u64)>,
+        curr_kf_idx: usize,
+        stamp_ns: u64,
+    ) -> Option<(Pose3d, Vec3F64)> {
+        self.on_keyframe_inertial_edge(
+            prev_edge.map(|(idx, t0)| (idx, t0, 0.0)),
+            curr_kf_idx,
+            stamp_ns,
+        )
+    }
+
     /// Everything the inertial path does on a keyframe insertion, in the order kornia-slam's
     /// removed `SlamPipeline` did it: build the edge, prune, then run the initialization ladder.
     ///
@@ -4376,9 +4786,14 @@ impl Tracker {
     /// `&mut` the inertial bias and gravity at the same time, which it cannot have while a
     /// field of `self` is borrowed. The move is a handful of scalars plus the ring's `VecDeque`
     /// handle; nothing is copied.
-    fn on_keyframe_inertial(
+    ///
+    /// The edge is `(prev_kf_idx, t0_ns, elided_s)`: an IMU edge
+    /// from `t0_ns`, which is the previous keyframe's stamp, or a parked anchor after it with
+    /// `elided_s` of stillness before it ([`crate::parked`]). `None` adds no edge (the first
+    /// keyframe, or a pair a stationary factor links).
+    fn on_keyframe_inertial_edge(
         &mut self,
-        prev_edge: Option<(usize, u64)>,
+        imu_edge: Option<(usize, u64, f64)>,
         curr_kf_idx: usize,
         stamp_ns: u64,
     ) -> Option<(Pose3d, Vec3F64)> {
@@ -4387,7 +4802,7 @@ impl Tracker {
         // arithmetic sane if that ever stops being true.
         let epoch = self.epoch_ns.unwrap_or(stamp_ns);
 
-        if let Some((prev_kf_idx, prev_stamp_ns)) = prev_edge {
+        if let Some((prev_kf_idx, prev_stamp_ns, elided_s)) = imu_edge {
             self.add_imu_edge(
                 &mut inert,
                 prev_kf_idx,
@@ -4395,6 +4810,7 @@ impl Tracker {
                 curr_kf_idx,
                 stamp_ns,
                 epoch,
+                elided_s,
             );
         }
         // Unconditional — refusal included. `t0` for the next interval is exactly this stamp,
@@ -4418,6 +4834,7 @@ impl Tracker {
     /// `PreintegratedImu::from_measurements` would have returned a well-formed delta anyway:
     /// see the gates in [`crate::imu`]. That asymmetry — a missing factor is recoverable, a
     /// wrong one poisons a bias shared across the whole window — is why the gates are strict.
+    #[allow(clippy::too_many_arguments)]
     fn add_imu_edge(
         &mut self,
         inert: &mut InertialState,
@@ -4426,6 +4843,7 @@ impl Tracker {
         curr_kf_idx: usize,
         stamp_ns: u64,
         epoch: u64,
+        elided_s: f64,
     ) {
         // Converted once, straight out of the ring, into the one owned copy the `ImuFactor`
         // keeps. Seconds relative to the tracker's frame epoch — the SAME conversion
@@ -4462,7 +4880,18 @@ impl Tracker {
 
         let t0 = ts_sec(prev_stamp_ns, epoch);
         let t1 = ts_sec(stamp_ns, epoch);
-        let preint = PreintegratedImu::from_measurements(inert.bias, inert.cfg.calib, &raw, t0, t1);
+        let mut preint =
+            PreintegratedImu::from_measurements(inert.bias, inert.cfg.calib, &raw, t0, t1);
+        // A tail edge ([`crate::parked`]) starts after a still stretch of `elided_s`: the pose,
+        // velocity and motion terms are the whole interval's (nothing moved before the tail), but
+        // the bias wandered over all of it, so its link is widened by the elided time.
+        if elided_s > 0.0 {
+            let c = inert.cfg.calib;
+            for i in 0..3 {
+                preint.bias_covariance[i * 7] += c.gyro_bias_noise.powi(2) * elided_s;
+                preint.bias_covariance[(i + 3) * 7] += c.accel_bias_noise.powi(2) * elided_s;
+            }
+        }
 
         // Negated on purpose: a NaN `dt` must be refused too, which `dt <= 0.0` would let through.
         #[allow(clippy::neg_cmp_op_on_partial_ord)]
@@ -11447,5 +11876,504 @@ mod tests {
         // 60 frames of 66.7 ms: 4 s, a keyframe every 15 frames after the bootstrap.
         keyframes_over(&mut tracker, 0..60, |_| 0);
         assert_eq!(tracker.map().keyframes().len(), 4);
+    }
+
+    // ── Parked keyframes: stationary edges ([`crate::parked`]) ──────────────
+
+    /// The parked scene with the wheels, the static initialization and stationary edges on (the
+    /// parked interval at the robot's 5 s, for the stretch before stationary mode), then `f`.
+    fn stationary_tracker(f: impl FnOnce(&mut TrackerConfig)) -> Tracker {
+        scene_tracker_with(|c| {
+            c.inertial = Some(static_inertial_config());
+            let mut w = scene_wheel_config();
+            w.parked_keyframe_interval = Some(Time::new::<second>(5.0));
+            c.wheel_odom = Some(w);
+            c.stationary_edges = Some(StationaryEdgeConfig::new());
+            f(c);
+        })
+    }
+
+    /// The frame the frontend builds for `view`, for replay through `process_frame` without ORB
+    /// on every frame. With `keep` the pair is occluded beyond that fraction of the width (a
+    /// passer-by in front of the robot).
+    fn view_frame(t: &Tracker, view: &Pose3d, keep: Option<f64>) -> Frame {
+        let (mut left, mut right) = render_pair(view);
+        if let Some(keep) = keep {
+            let (w, h) = (left.width(), left.height());
+            let from = (w as f64 * keep) as usize;
+            let blank = |img: &Image<u8, 1>| {
+                let mut px = img.as_slice().to_vec();
+                for y in 0..h {
+                    px[y * w + from..(y + 1) * w].fill(0);
+                }
+                Image::new(img.size(), px).expect("sized")
+            };
+            left = blank(&left);
+            right = blank(&right);
+        }
+        t.stereo_frame(&left, &right).expect("a valid pair").0
+    }
+
+    /// One parked frame at `seq` (15 Hz) replaying `frame`: the parked IMU since the last frame
+    /// with `accel` on top, and a wheel reading `(x, theta)` at the stamp.
+    fn replay_still(
+        t: &mut Tracker,
+        seq: u32,
+        frame: &Frame,
+        wheel: (f64, f64),
+        accel: &dyn Fn(u64) -> Vec3F64,
+    ) -> TrackStatus {
+        let stamp = EPOCH_NS + u64::from(seq) * FRAME_NS;
+        let from = seq
+            .checked_sub(1)
+            .map(|p| EPOCH_NS + u64::from(p) * FRAME_NS);
+        let samples = parked_imu(t, from, stamp, accel);
+        t.push_raw_imu(samples, 0, false).unwrap();
+        t.push_wheel([WheelSample {
+            stamp_ns: stamp,
+            x: wheel.0,
+            y: 0.0,
+            theta: wheel.1,
+        }])
+        .unwrap();
+        t.process_frame(frame.clone(), CuTime::from_nanos(stamp))
+            .expect("a valid frame")
+    }
+
+    fn stamp_of(seq: u32) -> u64 {
+        EPOCH_NS + u64::from(seq) * FRAME_NS
+    }
+
+    fn imu_edges(t: &Tracker) -> usize {
+        t.map.imu_factors().len()
+    }
+
+    /// Startup: stationary edges need the wheels, the inertial path and its visual-inertial BA;
+    /// without any of them the config is refused naming it, and a tracker handed one anyway runs
+    /// without them (no stats). Off is valid with nothing else.
+    #[test]
+    fn test_stationary_edges_need_wheels_and_inertial_ba() {
+        let base = || {
+            let mut c = TrackerConfig::new(Length::new::<meter>(0.1));
+            c.stationary_edges = Some(StationaryEdgeConfig::new());
+            c
+        };
+        let mut c = base();
+        assert!(matches!(
+            c.validate_stationary_edges(),
+            Err(VioError::StationaryEdgesNeed { what }) if what.contains("wheel_odom")
+        ));
+        c.wheel_odom = Some(scene_wheel_config());
+        assert!(matches!(
+            c.validate_stationary_edges(),
+            Err(VioError::StationaryEdgesNeed { what }) if what.contains("`inertial`")
+        ));
+        let mut dry = static_inertial_config();
+        dry.enable_inertial_ba = false;
+        c.inertial = Some(dry);
+        assert!(matches!(
+            c.validate_stationary_edges(),
+            Err(VioError::StationaryEdgesNeed { what }) if what.contains("enable_inertial_ba")
+        ));
+        assert!(
+            Tracker::new(rectified_camera(), c)
+                .stationary_stats()
+                .is_none()
+        );
+
+        let mut ok = base();
+        ok.wheel_odom = Some(scene_wheel_config());
+        ok.inertial = Some(static_inertial_config());
+        ok.validate_stationary_edges().unwrap();
+        let mut bad = base();
+        bad.wheel_odom = Some(scene_wheel_config());
+        bad.inertial = Some(static_inertial_config());
+        bad.stationary_edges.as_mut().unwrap().translation_sigma_m = 0.0;
+        assert!(matches!(
+            bad.validate_stationary_edges(),
+            Err(VioError::StationaryParamInvalid { .. })
+        ));
+        assert!(
+            Tracker::new(rectified_camera(), ok)
+                .stationary_stats()
+                .is_some()
+        );
+        TrackerConfig::new(Length::new::<meter>(0.1))
+            .validate_stationary_edges()
+            .unwrap();
+    }
+
+    /// Fix 2: once initialized, a parked robot inserts NO keyframe on the time bound, however
+    /// long it stays (60 s here), where the interval gate alone inserts one every 5 s; the
+    /// withheld keyframe is counted once; the IMU ring holds the tail, not the minute.
+    ///
+    /// Mutations (each turned this red): dropping `stationary_active` from the gate (the
+    /// interval gate everywhere); dropping the per-frame prune to the anchor (the ring filled to
+    /// its 2048-sample capacity).
+    #[test]
+    fn test_a_parked_robot_withholds_time_bound_keyframes_without_an_interval() {
+        let frames = 900; // 60 s at 15 Hz after the initialization
+        let run = |stationary: bool| {
+            let mut t = stationary_tracker(|c| {
+                if !stationary {
+                    c.stationary_edges = None;
+                }
+            });
+            let (s0, k0) = park_still_until_initialized(&mut t);
+            let frame = view_frame(&t, &Pose3d::IDENTITY, None);
+            let mut most = 0;
+            for seq in s0..s0 + frames {
+                let status = replay_still(&mut t, seq, &frame, (0.0, 0.0), &no_extra);
+                assert!(
+                    matches!(status, TrackStatus::Tracked(_)),
+                    "{seq}: {status:?}"
+                );
+                let inert = t.inertial.as_ref().unwrap();
+                most = most.max(inert.buffer.stats().buffered);
+            }
+            (t.map.keyframes().len() - k0, most, t)
+        };
+        let (on, on_ring, t) = run(true);
+        let (off, _, _) = run(false);
+        assert!(off >= 10, "the interval gate's keyframes: {off}");
+        assert_eq!(on, 0, "time-bound keyframes inserted while parked: {on}");
+        let st = t.stationary_stats().unwrap();
+        assert_eq!(st.keyframes_withheld, 1, "once per keyframe interval");
+        assert!(st.parked);
+        // 0.5 s tail + 0.5 s margin + a chunk at 200 Hz, and nothing evicted.
+        assert!(on_ring <= 300, "the IMU ring held {on_ring} samples");
+        assert_eq!(t.inertial.as_ref().unwrap().buffer.stats().evicted, 0);
+        assert!(t.wheel.as_ref().unwrap().buffered() <= 40);
+    }
+
+    /// A tracking-quality ask while parked (a passer-by occludes most of the view) inserts at
+    /// once, and the keyframe is linked to the last one by a stationary factor over the whole
+    /// stop, with the stop's mean gyro rate, instead of an IMU edge; the wheel chain stays one
+    /// in, one out; the counters reach the diagnostics record.
+    ///
+    /// Mutation (core rule): withholding `Quality` asks too turned this red.
+    #[test]
+    fn test_a_parked_quality_keyframe_gets_a_stationary_edge() {
+        let mut t = stationary_tracker(|_| {});
+        let (s0, k0) = park_still_until_initialized(&mut t);
+        let full = view_frame(&t, &Pose3d::IDENTITY, None);
+        let occluded = view_frame(&t, &Pose3d::IDENTITY, Some(0.35));
+        let pose0 = t.state.pose_world_to_cam;
+        let last_kf = t.state.last_keyframe_idx.unwrap();
+        let last_ns = t.last_keyframe_stamp_ns.unwrap();
+        let mut seq = s0;
+        for _ in 0..150 {
+            replay_still(&mut t, seq, &full, (0.0, 0.0), &no_extra);
+            seq += 1;
+        }
+        let edges0 = imu_edges(&t);
+        assert_eq!(t.map.keyframes().len(), k0);
+        let status = replay_still(&mut t, seq, &occluded, (0.0, 0.0), &no_extra);
+        assert!(
+            matches!(&status, TrackStatus::Tracked(p) if p.keyframe),
+            "the occluded frame did not insert: {status:?}"
+        );
+        let new_kf = t.state.last_keyframe_idx.unwrap();
+        assert_ne!(new_kf, last_kf);
+        assert_eq!(
+            imu_edges(&t),
+            edges0,
+            "an IMU edge was added for a still pair"
+        );
+        assert_eq!(t.stationary_factors.len(), 1);
+        let f = t.stationary_factors[0];
+        assert_eq!((f.from_idx, f.to_idx), (last_kf, new_kf));
+        let span = (stamp_of(seq) - last_ns) as f64 * 1e-9;
+        assert!((f.span_s - span).abs() < 1e-9, "{} vs {span}", f.span_s);
+        let g = f.gyro.expect("the run measured the gyro");
+        let bg = Vec3F64::from_array(PARKED_GYRO_BIAS);
+        assert!((g.mean - bg).length() < 2e-4, "{:?}", g.mean);
+        assert!(g.covered_s > 9.0, "{}", g.covered_s);
+        let w = t.wheel.as_ref().unwrap();
+        assert!(
+            w.factors()
+                .iter()
+                .any(|f| f.from_idx == last_kf && f.to_idx == new_kf),
+            "the wheel chain was cut"
+        );
+        let diag =
+            crate::diag::frame_diagnostics(&t, &status, crate::diag::StreamCounters::default());
+        assert_eq!(diag.stationary.edges, 1);
+        assert_eq!(diag.stationary.factors, 1);
+        for _ in 0..30 {
+            seq += 1;
+            replay_still(&mut t, seq, &full, (0.0, 0.0), &no_extra);
+        }
+        // A tracking-quality ask with tracking still strong (parallax would be one; the ratio
+        // drop above never is) inserts too: only time-bound asks are withheld.
+        let before = t.map.keyframes().len();
+        t.force_quality_keyframe = true;
+        seq += 1;
+        replay_still(&mut t, seq, &full, (0.0, 0.0), &no_extra);
+        assert_eq!(
+            t.map.keyframes().len(),
+            before + 1,
+            "a quality ask was withheld"
+        );
+        assert_eq!(t.stationary_factors.len(), 2);
+        let moved = (t.state.pose_world_to_cam.inverse().translation - pose0.inverse().translation)
+            .length();
+        assert!(moved < 1e-3, "the parked pose moved {moved} m");
+    }
+
+    /// Motion ends the withholding: wheels creeping 1 mm a frame (the camera does not see it), or
+    /// the accelerometer shaking for a second, close the still run, the next frame inserts, and
+    /// that keyframe gets an IMU edge over the tail only, starting after the still stretch, with
+    /// its bias link widened by the stretch.
+    ///
+    /// Mutation: dropping the bias-covariance widening turned this red.
+    #[test]
+    fn test_motion_after_a_stop_inserts_with_a_tail_edge() {
+        let shaking = |k: u64| Vec3F64::new(0.5 * (k as f64 * 1.3).sin(), 0.0, 0.0);
+        for creep in [true, false] {
+            let mut t = stationary_tracker(|_| {});
+            let (s0, k0) = park_still_until_initialized(&mut t);
+            let frame = view_frame(&t, &Pose3d::IDENTITY, None);
+            let kf_ns = t.last_keyframe_stamp_ns.unwrap();
+            let mut seq = s0;
+            for _ in 0..150 {
+                replay_still(&mut t, seq, &frame, (0.0, 0.0), &no_extra);
+                seq += 1;
+            }
+            assert_eq!(t.map.keyframes().len(), k0);
+            let (edges0, start) = (imu_edges(&t), seq);
+            let shake_from = (stamp_of(start) - EPOCH_NS) / IMU_PERIOD_NS;
+            let shake = move |k: u64| {
+                if k >= shake_from && k < shake_from + 200 {
+                    shaking(k)
+                } else {
+                    Vec3F64::ZERO
+                }
+            };
+            while t.map.keyframes().len() == k0 {
+                assert!(seq < start + 30, "motion never inserted (creep {creep})");
+                let x = if creep {
+                    0.001 * f64::from(seq - start)
+                } else {
+                    0.0
+                };
+                let accel: &dyn Fn(u64) -> Vec3F64 = if creep { &no_extra } else { &shake };
+                replay_still(&mut t, seq, &frame, (x, 0.0), accel);
+                seq += 1;
+            }
+            let st = t.stationary_stats().unwrap();
+            assert_eq!(
+                (st.runs_closed_wheels, st.runs_closed_imu),
+                if creep { (1, 0) } else { (0, 1) }
+            );
+            assert_eq!(st.tail_edges, 1);
+            assert_eq!(st.edges_added, 0);
+            assert_eq!(imu_edges(&t), edges0 + 1, "the tail edge was refused");
+            let e = t.map.imu_factors().last().unwrap();
+            let epoch = t.epoch_ns.unwrap();
+            let kf_t = ts_sec(kf_ns, epoch);
+            assert!(
+                e.t0 > kf_t + 9.0,
+                "the edge starts at {} s after the keyframe",
+                e.t0 - kf_t
+            );
+            let elided = e.t0 - kf_t;
+            let calib = t.inertial.as_ref().unwrap().cfg.calib;
+            let p = &e.preintegrated;
+            assert!(
+                p.bias_covariance[0] >= calib.gyro_bias_noise.powi(2) * (elided + p.dt) * 0.99,
+                "gyro bias link {} for {} s",
+                p.bias_covariance[0],
+                elided + p.dt
+            );
+        }
+    }
+
+    /// THE behaviour (2026-10-12: a robot parked from boot dropped its map every ~20 min at the
+    /// 11 s merge cap). An hour parked at 1 Hz with the IMU 300 ms ahead and a tracking-quality
+    /// keyframe every 30 s (~120, three times `max_keyframes`): culling merges the stationary
+    /// edges without a span limit, so the map is never dropped and stays under the cap, both
+    /// rings stay bounded, the pose and gravity stay put and the gyro bias stays the parked one.
+    /// Then a 1 m drive tracks every frame, the first keyframe gets one tail edge, and the static
+    /// hold is released.
+    ///
+    /// Mutation (core rule): handing culling no stationary factors (`None`) turned this red: it
+    /// removed parked keyframes the stationary chain still named.
+    #[test]
+    fn test_an_hour_parked_keeps_its_map_and_then_drives() {
+        const SEC: u64 = 1_000_000_000;
+        const LEAD_NS: u64 = 300_000_000;
+        const CAP: usize = 40;
+        let mut t = stationary_tracker(|c| {
+            c.max_keyframes = Some(CAP);
+            c.keyframe_culling = Some(KeyframeCullingConfig {
+                max_merged_imu_span_sec: 11.0,
+                ..KeyframeCullingConfig::default()
+            });
+        });
+        let (s0, _) = park_still_until_initialized(&mut t);
+        let frame = view_frame(&t, &Pose3d::IDENTITY, None);
+        let pose0 = t.state.pose_world_to_cam;
+        let up0 = up_error_deg(&t);
+        let evicted0 = t.inertial.as_ref().unwrap().buffer.stats().evicted;
+        let refused0 = t.inertial.as_ref().unwrap().stats.refused_total();
+        let t0 = stamp_of(s0 - 1);
+        let mut imu_to = t0;
+        let mut wheel_to = t0;
+        // Wheel readings every 250 ms (inside `max_gap`) from the last one up to `until`.
+        fn push_wheels(t: &mut Tracker, wheel_to: &mut u64, until: u64, y: &dyn Fn(u64) -> f64) {
+            let mut next = *wheel_to + 250_000_000;
+            while next <= until {
+                t.push_wheel([WheelSample {
+                    stamp_ns: next,
+                    x: 0.0,
+                    y: y(next),
+                    theta: 0.0,
+                }])
+                .unwrap();
+                *wheel_to = next;
+                next += 250_000_000;
+            }
+        }
+        let hour = 3600;
+        for i in 1..=hour {
+            let stamp = t0 + i * SEC;
+            let samples = parked_imu(&t, Some(imu_to), stamp + LEAD_NS, no_extra);
+            imu_to = stamp + LEAD_NS;
+            t.push_raw_imu(samples, 0, false).unwrap();
+            push_wheels(&mut t, &mut wheel_to, stamp, &|_| 0.0);
+            // A passer-by every 30 s, the last 30 s before the drive left alone.
+            if i % 30 == 0 && i <= hour - 30 {
+                t.force_quality_keyframe = true;
+            }
+            let status = t
+                .process_frame(frame.clone(), CuTime::from_nanos(stamp))
+                .expect("a valid frame");
+            assert!(
+                matches!(status, TrackStatus::Tracked(_)),
+                "{i} s: {status:?}"
+            );
+            assert_eq!(t.map_drops(), 0, "the map was dropped at {i} s");
+            let kfs = t.map.keyframes().len();
+            assert!(kfs <= CAP, "{kfs} keyframes at {i} s");
+            assert!(t.stationary_factors.len() < kfs);
+            let ring = t.inertial.as_ref().unwrap().buffer.stats();
+            assert!(
+                ring.buffered <= 600,
+                "{} IMU samples held at {i} s",
+                ring.buffered
+            );
+            assert_eq!(ring.evicted, evicted0);
+            assert!(t.wheel.as_ref().unwrap().buffered() <= 20);
+        }
+        let st = t.stationary_stats().unwrap();
+        assert!(st.edges_added >= 100, "{st:?}");
+        assert!(st.edges_merged > 0, "{st:?}");
+        assert!(st.keyframes_withheld > 0, "{st:?}");
+        assert_eq!(st.tail_edges, 0, "{st:?}");
+        assert!(
+            t.culled_keyframes() >= 60,
+            "culled {}",
+            t.culled_keyframes()
+        );
+        assert_eq!(t.inertial.as_ref().unwrap().stats.refused_total(), refused0);
+        for f in &t.stationary_factors {
+            assert!(
+                t.map.get_keyframe(f.from_idx).is_some() && t.map.get_keyframe(f.to_idx).is_some()
+            );
+        }
+        let pose = t.state.pose_world_to_cam;
+        let moved = (pose.inverse().translation - pose0.inverse().translation).length();
+        let turned = crate::consistency::angle_between(&pose.rotation, &pose0.rotation);
+        assert!(moved < 1e-3, "the parked camera moved {moved} m");
+        assert!(
+            turned < 0.05f64.to_radians(),
+            "and turned {} deg",
+            turned.to_degrees()
+        );
+        assert!((up_error_deg(&t) - up0).abs() < 0.1, "gravity moved");
+        let inert = t.inertial.as_ref().unwrap();
+        assert_eq!(inert.applied_stage, Some(InitStage::Static));
+        assert!(inert.cfg.bias_limit.admits(&inert.bias));
+        let bg_err = (inert.bias.gyro - Vec3F64::from_array(PARKED_GYRO_BIAS)).length();
+        assert!(bg_err < 2e-4, "gyro bias off by {bg_err} rad/s");
+        assert!(inert.static_hold.is_some());
+
+        // 1 m along the camera's +x over 6 s at 15 Hz, from rest to rest, every sensor agreeing.
+        let (dist, dur) = (1.0, 6.0);
+        let tau = |ns: u64| ((ns.saturating_sub(t0 + hour * SEC)) as f64 * 1e-9).min(dur);
+        let x_at = move |s: f64| {
+            dist * (s / dur
+                - (2.0 * std::f64::consts::PI * s / dur).sin() / (2.0 * std::f64::consts::PI))
+        };
+        let a_at = move |s: f64| {
+            if s >= dur {
+                0.0
+            } else {
+                dist / dur
+                    * (2.0 * std::f64::consts::PI / dur)
+                    * (2.0 * std::f64::consts::PI * s / dur).sin()
+            }
+        };
+        let r_bc = t.inertial.as_ref().unwrap().cfg.imu_t_bc.rotation;
+        let accel =
+            move |k: u64| r_bc * Vec3F64::new(a_at(tau(EPOCH_NS + k * IMU_PERIOD_NS)), 0.0, 0.0);
+        let r_wc0 = pose0.inverse().rotation;
+        let c0 = pose0.inverse().translation;
+        let edges0 = imu_edges(&t);
+        let kf_before = t.last_keyframe_stamp_ns.unwrap();
+        let start = t0 + hour * SEC;
+        let mut worst = 0.0f64;
+        for j in 1..=90u64 {
+            let stamp = start + j * FRAME_NS;
+            let samples = parked_imu(&t, Some(imu_to), stamp + LEAD_NS, accel);
+            imu_to = stamp + LEAD_NS;
+            t.push_raw_imu(samples, 0, false).unwrap();
+            push_wheels(&mut t, &mut wheel_to, stamp, &|ns| -x_at(tau(ns)));
+            // The wheels at the frame itself too, at 15 Hz.
+            if wheel_to < stamp {
+                t.push_wheel([WheelSample {
+                    stamp_ns: stamp,
+                    x: 0.0,
+                    y: -x_at(tau(stamp)),
+                    theta: 0.0,
+                }])
+                .unwrap();
+                wheel_to = stamp;
+            }
+            let x = x_at(tau(stamp));
+            let (left, right) =
+                render_pair(&Pose3d::new(Mat3F64::IDENTITY, Vec3F64::new(x, 0.0, 0.0)));
+            let status = t
+                .process_stereo(&left, &right, CuTime::from_nanos(stamp))
+                .expect("a valid pair");
+            let TrackStatus::Tracked(p) = status else {
+                panic!("drive frame {j}: {status:?}");
+            };
+            let truth = c0 + r_wc0 * Vec3F64::new(x, 0.0, 0.0);
+            worst = worst.max((p.cam_in_world().translation - truth).length());
+        }
+        assert!(worst < 0.02, "worst drive centre error {worst} m");
+        assert_eq!(t.map_drops(), 0);
+        let st = t.stationary_stats().unwrap();
+        assert_eq!(st.tail_edges, 1, "{st:?}");
+        // The first drive keyframe's edge starts at the end of the stop, not at its keyframe.
+        let epoch = t.epoch_ns.unwrap();
+        let tail = t
+            .map
+            .imu_factors()
+            .iter()
+            .find(|e| e.t0 > ts_sec(kf_before, epoch) + 1.0)
+            .expect("a tail edge in the map");
+        assert!(
+            tail.t0 >= ts_sec(kf_before, epoch) + 29.0,
+            "{}",
+            tail.t0 - ts_sec(kf_before, epoch)
+        );
+        assert!(imu_edges(&t) > edges0);
+        assert!(
+            t.inertial.as_ref().unwrap().static_hold.is_none(),
+            "the drive did not release the static hold"
+        );
     }
 }
