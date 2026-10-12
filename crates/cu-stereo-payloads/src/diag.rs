@@ -76,6 +76,11 @@ pub enum FailureReason {
     /// Per-frame fusion: vision disagreed with the IMU and wheel prediction past the gate, and
     /// the frame published the prediction as a coast.
     VisionRejected,
+    /// The hard motion veto: vision's pose disagreed with the gyro or the wheels past hard bounds
+    /// since the last published pose (or was not yet re-accepted after such a veto), and the frame
+    /// published their dead reckoning as a coast. Appended last: logs recorded before it existed
+    /// decode unchanged.
+    VisionVetoed,
 }
 
 impl FailureReason {
@@ -92,6 +97,7 @@ impl FailureReason {
             Self::LowReferenceCorrespondences => "low_reference_correspondences",
             Self::DeadReckonedAnchor => "dead_reckoned_anchor",
             Self::VisionRejected => "vision_rejected",
+            Self::VisionVetoed => "vision_vetoed",
         }
     }
 }
@@ -270,6 +276,30 @@ pub struct StationaryCheck {
     pub boundaries_removed: u64,
 }
 
+/// The hard motion veto's counters (cu-kornia-vio's `motion_veto`): poses the gyro or the wheels
+/// contradicted past hard bounds, never published. All zero when it is off.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Encode, Decode, Serialize, Deserialize, Reflect,
+)]
+pub struct VetoCheck {
+    /// Poses vetoed (tracked, fused or relocalized), lifetime.
+    pub vetoes: u64,
+    /// Frames that published the wheel and gyro dead reckoning because vision was vetoed or not
+    /// yet re-accepted, lifetime.
+    pub dead_reckoned: u64,
+    /// Recoveries: vision accepted again after agreeing with the dead reckoning for the
+    /// configured run of frames, lifetime.
+    pub relocalizations: u64,
+    /// Recoveries that timed out into a map re-anchored at the dead-reckoned pose, lifetime.
+    pub rebootstraps: u64,
+    /// Local BA results refused for moving the newest keyframe past the bounds, lifetime.
+    pub ba_refused: u64,
+    /// This frame's pose was vetoed.
+    pub vetoed: bool,
+    /// The tracker is re-localizing after a veto.
+    pub recovering: bool,
+}
+
 /// What the tracker knew about one processed frame. The time of validity is the frame's capture
 /// stamp, on the carrying `CuMsg`'s `tov`.
 #[derive(
@@ -333,6 +363,9 @@ pub struct VioDiagnostics {
     /// The parked-keyframe path's counters. Appended last: logs recorded before it existed do
     /// not decode as this type.
     pub stationary: StationaryCheck,
+    /// The hard motion veto's counters. Appended last: logs recorded before it existed do not
+    /// decode as this type.
+    pub veto: VetoCheck,
 }
 
 /// [`FeaturePoint::class`] bit: the keypoint has a stereo depth.
@@ -422,10 +455,12 @@ mod tests {
         // layout change (a field added anywhere, appended at the end included, removed, retyped
         // or reordered) makes every log already written undecodable as the new type.
         // `test_diagnostics_golden_bytes` pins the whole layout; this only checks the two sigmas
-        // come right before the stationary record (nine zero varints when off), NaN included.
-        let n = bytes.len() - 9;
-        assert_eq!(&bytes[n..], &[0u8; 9]);
+        // come right before the stationary record (nine zero varints when off) and the veto record
+        // (seven), NaN included.
+        let n = bytes.len() - 16;
+        assert_eq!(&bytes[n..], &[0u8; 16]);
         assert_eq!(back.stationary, StationaryCheck::default());
+        assert_eq!(back.veto, VetoCheck::default());
         assert_eq!(&bytes[n - 8..n - 4], &0.125f32.to_le_bytes());
         assert_eq!(&bytes[n - 4..n], &f32::NAN.to_le_bytes());
     }
@@ -494,6 +529,15 @@ mod tests {
                 runs_closed_wheels: 27,
                 boundaries_removed: 28,
             },
+            veto: VetoCheck {
+                vetoes: 29,
+                dead_reckoned: 30,
+                relocalizations: 31,
+                rebootstraps: 32,
+                ba_refused: 33,
+                vetoed: true,
+                recovering: false,
+            },
         }
     }
 
@@ -506,7 +550,7 @@ mod tests {
             "010203030701000405060708090a0b0c0000c03f010300002040000060400000",
             "90400000b0400000d0400000f0400d0401000008410000184100002841000038",
             "4100004841000058410000684100007841000084410e0f1000008c4111011213",
-            "140000944100009c411516171819011a1b1c",
+            "140000944100009c411516171819011a1b1c1d1e1f20210100",
         );
         let bytes = bincode::encode_to_vec(every_field_distinct(), standard()).expect("encode");
         let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
