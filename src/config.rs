@@ -656,8 +656,9 @@ pub(crate) fn keyframe_insertion(config: Option<&ComponentConfig>) -> CuResult<K
 /// landmarks keep their slot, so the map is still dropped once it holds
 /// `max_keyframes * orb_keypoints` landmark slots. With the `inertial` block on, the keyframe
 /// spacing while parked (`wheel_odom.parked_keyframe_interval_s`, or a motion-only
-/// `keyframe_policy.max_interval_s`) must be at most half `max_merged_imu_span_s`: a parked
-/// keyframe sits between two such IMU edges, and a merge longer than the bound is kept.
+/// `keyframe_policy.max_interval_s`) plus 0.25 s must be at most half `max_merged_imu_span_s`:
+/// a parked keyframe sits between two such IMU edges, each up to a frame longer than the
+/// interval, and a merge longer than the bound is kept.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct KeyframeCullingRon {

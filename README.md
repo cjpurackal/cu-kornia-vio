@@ -316,7 +316,8 @@ does not compile against this crate.
   the map only if that cannot make room. Culling waits for a settled inertial path, and while
   driving few keyframes are redundant: the room comes mostly from stops. With the inertial path
   on, that needs `max_merged_imu_span_s` of at least twice the parked keyframe spacing
-  (`parked_keyframe_interval_s`), which startup checks. Culling bounds keyframes, not landmark
+  (`parked_keyframe_interval_s` plus 0.25 s for the frame that lands past it), which startup
+  checks. Culling bounds keyframes, not landmark
   slots (kornia-slam never compacts those), so the map is still dropped once it holds
   `max_keyframes * orb_keypoints` of them.
 

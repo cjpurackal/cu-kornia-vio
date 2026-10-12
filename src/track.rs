@@ -1003,6 +1003,10 @@ pub struct Tracker {
     /// wheels or vision measured. What [`COAST_UNMEASURED_WARN_EVERY`] counts, so every episode's
     /// first frame is logged however many came before it.
     coast_unmeasured_run: u64,
+    /// Frame stamp of the last unmeasured-coast warning: an episode's first frame logs only
+    /// [`COAST_UNMEASURED_WARN_GAP_NS`] after it, so a wheel stream that gaps every second does
+    /// not log every second.
+    coast_unmeasured_warned_ns: Option<u64>,
 }
 
 /// How long a coast's covariance is integrated from one origin before it re-bases on its own
@@ -1023,6 +1027,10 @@ const COAST_UNMEASURED_RAD_PER_S: f64 = 1.0;
 /// Unmeasured coast frames ([`Tracker::coast_unmeasured`]): the first of each episode is logged,
 /// then one in this many, ~1 min apart at the head's 15 Hz while it persists.
 const COAST_UNMEASURED_WARN_EVERY: u64 = 900;
+/// Least time between two episodes' first-frame warnings, the same ~1 min. An episode ends at
+/// any measured frame, and a flaky wheel link (a gap, then the 1 s re-base past it) ends one
+/// every second or two.
+const COAST_UNMEASURED_WARN_GAP_NS: u64 = 60_000_000_000;
 
 /// What a coast grows from ([`Tracker::coast_covariance`]). The wheels' measurement noise is
 /// independent from one interval to the next and accumulates chunk by chunk; the camera-to-base
@@ -1320,6 +1328,7 @@ impl Tracker {
             coast_origin: None,
             coast_unmeasured: 0,
             coast_unmeasured_run: 0,
+            coast_unmeasured_warned_ns: None,
         }
     }
 
@@ -1779,8 +1788,10 @@ impl Tracker {
             .into_iter()
             .flat_map(|w| w.pending_keyframes())
             .chain(self.state.current_keyframe_idx)
+            // Also the keyframe a suspended fusion waits on: the suspension is read only while it
+            // names the last keyframe, and is never cleared, so keeping it once a newer keyframe
+            // exists would pin it and everything newer for the life of the map.
             .chain(self.state.last_keyframe_idx)
-            .chain(self.fusion_suspended_on)
             .collect();
         let keyframes = self.map.keyframes();
         let oldest_kept = keyframes
@@ -3131,7 +3142,7 @@ impl Tracker {
     }
 
     /// Counts a coast frame's covariance as measured or not and says so when not, rate-limited
-    /// per episode; `true` when it logged. A measured one ends the episode.
+    /// per episode and between episodes; `true` when it logged. A measured one ends the episode.
     fn note_coast(&mut self, unmeasured: bool, frame_idx: usize, stamp_ns: u64) -> bool {
         if !unmeasured {
             self.coast_unmeasured_run = 0;
@@ -3141,8 +3152,13 @@ impl Tracker {
         self.coast_unmeasured_run += 1;
         let n = self.coast_unmeasured;
         let run = self.coast_unmeasured_run;
-        let logged = run == 1 || run.is_multiple_of(COAST_UNMEASURED_WARN_EVERY);
+        // A stamp before the last warning (a replay restarted) is a new timeline.
+        let gap_passed = self
+            .coast_unmeasured_warned_ns
+            .is_none_or(|t| stamp_ns < t || stamp_ns - t >= COAST_UNMEASURED_WARN_GAP_NS);
+        let logged = (run == 1 && gap_passed) || run.is_multiple_of(COAST_UNMEASURED_WARN_EVERY);
         if logged {
+            self.coast_unmeasured_warned_ns = Some(stamp_ns);
             let since_ms = self
                 .coast_origin
                 .map_or(0, |o| stamp_ns.saturating_sub(o.stamp_ns) / 1_000_000);
@@ -10475,6 +10491,24 @@ mod tests {
         }
     }
 
+    /// A fusion suspension is never cleared, only outlived: once a newer keyframe exists it names
+    /// an old keyframe nothing reads, and culling must not keep it (and so everything newer).
+    ///
+    /// Mutation: chaining `fusion_suspended_on` into the kept set turned this red.
+    #[test]
+    fn a_stale_fusion_suspension_does_not_stop_culling() {
+        let mut tracker = parked_map(None, 100);
+        let stale = tracker.map().keyframes()[2].frame.idx;
+        assert_ne!(tracker.state.last_keyframe_idx, Some(stale));
+        // What a rejection-run expiry or a relocalization at that keyframe left behind.
+        tracker.fusion_suspended_on = Some(stale);
+        assert!(tracker.cull_for_room() > 0);
+        assert!(
+            tracker.map().get_keyframe(stale).is_none(),
+            "keyframe {stale} kept by a suspension that ended"
+        );
+    }
+
     /// An insertion that culls one keyframe leaves the keyframe count where it was, and the
     /// live-point count a consumer publishes must still be recounted: the insertion added points.
     ///
@@ -10684,7 +10718,8 @@ mod tests {
     }
 
     /// The unmeasured-coast warning is rate-limited per episode: the first frame of every
-    /// episode logs, however many came before it, and a measured frame ends the episode.
+    /// episode logs, however many came before it, once a minute has passed since the last
+    /// warning, and a measured frame ends the episode.
     ///
     /// Mutation: keying the limit off the lifetime count turned this red (episode two silent).
     #[test]
@@ -10693,19 +10728,39 @@ mod tests {
         let logged: Vec<bool> = (0..3).map(|k| tracker.note_coast(true, k, 0)).collect();
         assert_eq!(logged, [true, false, false]);
         assert!(!tracker.note_coast(false, 3, 0));
+        let t = COAST_UNMEASURED_WARN_GAP_NS;
         assert!(
-            tracker.note_coast(true, 4, 0),
+            tracker.note_coast(true, 4, t),
             "a new episode logs its first frame"
         );
-        assert!(!tracker.note_coast(true, 5, 0));
+        assert!(!tracker.note_coast(true, 5, t));
         assert_eq!(tracker.coast_unmeasured(), 5, "the count stays lifetime");
         for k in 3..COAST_UNMEASURED_WARN_EVERY {
-            tracker.note_coast(true, k as usize + 4, 0);
+            tracker.note_coast(true, k as usize + 4, t);
         }
         assert!(
-            tracker.note_coast(true, 0, 0),
+            tracker.note_coast(true, 0, t),
             "then one in COAST_UNMEASURED_WARN_EVERY of the episode"
         );
+    }
+
+    /// A flaky wheel link ends an unmeasured episode every second or so (a gap, then the re-base
+    /// past it): one warning a minute, not one per gap.
+    ///
+    /// Mutation: dropping the between-episodes gap turned this red (a warning per second).
+    #[test]
+    fn unmeasured_coast_episodes_a_second_apart_log_once_a_minute() {
+        let mut tracker = scene_tracker(None);
+        let one_s = 1_000_000_000u64;
+        let logged = (0..180u64)
+            .filter(|&s| {
+                let stamp = s * one_s;
+                let warned = tracker.note_coast(true, 2 * s as usize, stamp);
+                tracker.note_coast(false, 2 * s as usize + 1, stamp + one_s / 2);
+                warned
+            })
+            .count();
+        assert_eq!(logged, 3, "180 one-second episodes over three minutes");
     }
 
     /// Keyframes over `frames` frames at `pos(slot)`.

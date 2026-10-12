@@ -50,6 +50,12 @@ pub const MAX_LANDMARK_BUFFERS: usize = 256;
 /// Pool id reported in copper's pool statistics.
 const LANDMARK_POOL_ID: &str = "cu_kornia_vio.landmarks";
 
+/// How much longer than its configured interval a parked keyframe spacing can run, seconds: the
+/// keyframe lands on the first processed frame past the interval, and a backgrounded solve
+/// processes frames 70-140 ms apart (15 fps, every frame or every other). Covers that and the
+/// IMU edge ending on a sample rather than on the frame stamp.
+const PARKED_SPACING_SLACK_S: f64 = 0.25;
+
 /// Fills a pooled snapshot from `points`, or returns `None` when every buffer is checked out.
 ///
 /// The buffer is cleared and refilled in place: the pool hands back the same `Vec` with its
@@ -387,6 +393,7 @@ impl CuTask for StereoVio {
         // parked; culling it merges them, and kornia-slam keeps a keyframe whose merge would be
         // longer than `max_merged_imu_span_sec`. Past half of it no parked keyframe is ever culled
         // (`kept_for_edges`), the stops give no room and the map drops at the bound as before.
+        // The spacing is the interval plus up to a frame, so exactly half is already too long.
         let parked_spacing = wheel_odom
             .as_ref()
             .and_then(|ron| ron.to_config().ok().flatten())
@@ -401,17 +408,18 @@ impl CuTask for StereoVio {
             .map(|(t, key)| (t.get::<cu29::units::si::time::second>(), key));
         if inertial.is_some()
             && let Some(cull) = keyframe_culling.as_ref()
-            && let Some((spacing_s, key)) = parked_spacing
-            && 2.0 * spacing_s > cull.max_merged_imu_span_sec
+            && let Some((interval_s, key)) = parked_spacing
+            && 2.0 * (interval_s + PARKED_SPACING_SLACK_S) > cull.max_merged_imu_span_sec
         {
             return Err(format!(
                 "`keyframe_culling` with the `inertial` block can never cull a parked keyframe: \
-                 `{key}` ({} s) puts an IMU edge that long on each side, and two of them exceed \
-                 `keyframe_culling.max_merged_imu_span_s` ({} s); raise it to at least {} s or \
-                 shorten `{key}`",
-                spacing_s,
+                 `{key}` ({} s) puts an IMU edge up to {} s longer than that on each side, and \
+                 two of them exceed `keyframe_culling.max_merged_imu_span_s` ({} s); raise it to \
+                 at least {} s or shorten `{key}`",
+                interval_s,
+                PARKED_SPACING_SLACK_S,
                 cull.max_merged_imu_span_sec,
-                2.0 * spacing_s
+                2.0 * (interval_s + PARKED_SPACING_SLACK_S)
             )
             .into());
         }
@@ -1301,7 +1309,8 @@ mod tests {
     /// more than `max_merged_imu_span_s` across a parked keyframe (an IMU edge as long as the
     /// spacing on each side): it could never cull one, and the stops are where the room is.
     ///
-    /// Mutation: dropping the startup check turned this red (the 5 s parked interval accepted).
+    /// Mutation: dropping the startup check turned this red (the 5 s parked interval accepted);
+    /// so did dropping `PARKED_SPACING_SLACK_S` from it (1.5 s against 3 s accepted).
     #[test]
     fn test_culling_is_refused_when_no_parked_keyframe_could_be_culled() {
         let inertial = r#""inertial": (
@@ -1330,11 +1339,21 @@ mod tests {
             "{refused}"
         );
         with_wheel(&format!(
-            "{inertial}, {}, {cull}, max_merged_imu_span_s: 10.0)",
+            "{inertial}, {}, {cull}, max_merged_imu_span_s: 11.0)",
             parked(5.0)
         ))
-        .expect("a merge as long as both edges");
-        with_wheel(&format!("{inertial}, {}, {cull})", parked(1.5))).expect("1.5 s each side");
+        .expect("a merge as long as both edges and a frame each");
+        // Exactly half: the real spacing is longer than the interval, so no parked keyframe
+        // would ever be culled.
+        let refused = with_wheel(&format!("{inertial}, {}, {cull})", parked(1.5)))
+            .err()
+            .expect("1.5 s each side is 3 s only before the frame past the interval")
+            .to_string();
+        assert!(
+            refused.contains("can never cull a parked keyframe"),
+            "{refused}"
+        );
+        with_wheel(&format!("{inertial}, {}, {cull})", parked(1.2))).expect("1.2 s each side");
         with_wheel(&format!("{}, {cull})", parked(5.0))).expect("no IMU edges to merge");
         with_wheel(&format!(
             r#"{inertial}, {}, "max_keyframes": 120, "keyframe_culling": (enabled: false)"#,
