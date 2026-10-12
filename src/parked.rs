@@ -327,15 +327,22 @@ impl StationaryRun {
     /// allows), and no further past the IMU's than that plus one [`RUN_CHUNK_NS`]: the IMU end
     /// moves a chunk at a time, so on clean data it trails the frame by up to a chunk (475 ms
     /// measured with 500 ms chunks, against a 500 ms `max_gap`), and IMU arriving a little after
-    /// the frame must not make a parked robot flicker out of `parked`.
+    /// the frame must not make a parked robot flicker out of `parked`. The chunk is not granted
+    /// while a failing chunk awaits the next one: the samples past the IMU end were checked and
+    /// showed a disturbance, so nothing past `max_gap` of it is vouched for.
     pub fn covers(&self, stamp_ns: u64, max_gap_ns: u64) -> bool {
+        let chunk_lag_ns = if self.suspect_end_ns.is_some() {
+            0
+        } else {
+            RUN_CHUNK_NS
+        };
         self.open
             && stamp_ns <= self.wheel_end_ns.saturating_add(max_gap_ns)
             && stamp_ns
                 <= self
                     .imu_end_ns
                     .saturating_add(max_gap_ns)
-                    .saturating_add(RUN_CHUNK_NS)
+                    .saturating_add(chunk_lag_ns)
     }
 
     /// Whether a time-bound keyframe at `stamp_ns` stays withheld: the run is open (nothing has
@@ -979,9 +986,11 @@ mod tests {
         assert_eq!(run.closed_by, Some(RunClose::Wheels));
     }
 
-    /// `covers` allows the IMU end a chunk more lag than the wheels': it moves a chunk at a time.
+    /// `covers` allows the IMU end a chunk more lag than the wheels': it moves a chunk at a time;
+    /// but not while a failing chunk is pending.
     ///
-    /// Mutation: dropping the chunk from the IMU side turned the trailing-IMU case red.
+    /// Mutations (each turned this red): dropping the chunk from the IMU side, the trailing-IMU
+    /// case; granting it while suspect, the suspect case.
     #[test]
     fn covers_allows_the_imu_one_chunk_of_lag() {
         let gap = 500 * MS;
@@ -989,6 +998,10 @@ mod tests {
         run.imu_end_ns = T0 + 9_000 * MS;
         assert!(run.covers(T0 + 10_000 * MS, gap));
         assert!(!run.covers(T0 + 10_001 * MS, gap));
+        run.suspect_end_ns = Some(T0 + 9_500 * MS);
+        assert!(!run.covers(T0 + 9_600 * MS, gap), "suspect: no chunk");
+        assert!(run.covers(T0 + 9_500 * MS, gap));
+        run.suspect_end_ns = None;
         run.imu_end_ns = T0 + 10_000 * MS;
         run.wheel_end_ns = T0 + 9_400 * MS;
         assert!(
