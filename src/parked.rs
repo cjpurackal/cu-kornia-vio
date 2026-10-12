@@ -31,9 +31,9 @@
 //!
 //! "Still" is the [`StationaryRun`]: from each keyframe on, the IMU samples are checked in 0.5 s
 //! chunks against the stationary initialization's per-sample checks (accelerometer and gyroscope
-//! spread, mean rate; the gyro spread ceiling raised to [`RUN_GYRO_RMS_MAX`] for the robot's own
-//! vibration), and two failing chunks in a row close the run (one is a disturbance: a door,
-//! footsteps); the wheel path stays under the parked floors per 5 s window, as the interval gate
+//! spread, mean rate; the spread ceilings raised to [`RUN_ACCEL_RMS_MAX`] and
+//! [`RUN_GYRO_RMS_MAX`] for the robot's own vibration), and two failing chunks in a row close the
+//! run (one is a disturbance: a door, footsteps); the wheel path stays under the parked floors per 5 s window, as the interval gate
 //! judged it, and the net displacement since the keyframe under the same floors. A hole in the
 //! IMU samples or a discontinuity in the wheel readings closes the run for good; a gap in the
 //! wheel readings (a stale head/body link) is bridged once the IMU has verified the stretch. The
@@ -66,31 +66,44 @@ pub(crate) const STATIONARY_TAIL_MIN_NS: u64 = 500_000_000;
 pub(crate) const PRUNE_MARGIN_NS: u64 = 500_000_000;
 
 /// The shortest IMU chunk the run checks at once, nanoseconds: 100 samples at 200 Hz. Two
-/// failing chunks in a row close the run, so a disturbance must last about a second to close it.
+/// failing chunks in a row close the run. A disturbance shorter than a chunk closes it only when
+/// it straddles a chunk boundary strongly enough to fail both sides; a strong knock of a few
+/// samples can, a weak one lasting under a chunk inside it cannot.
 ///
-/// It was 250 ms. Parked on the robot (2026-10-12, build 7b75117dd2da) that closed runs on the
-/// IMU 23 and 12 times per head run with the wheels at 0, each closure letting a burst of
-/// interval keyframes in. The cause is bursts of 38-39 Hz vibration, 2-4 s long, mostly on the
-/// gyro x axis (head pitch): peak 0.136 rad/s, net rotation under 0.2 deg. The worst chunk spread
-/// was 0.064 rad/s over 250 ms and 0.048 over 500 ms, against the static initialization's 0.0118
-/// (quiet parked chunks: 0.0053 at most, no sample gaps). A steady vibration fails that gate
-/// whatever the chunk length (replayed over 10 recorded minutes: 8 closures at 250 ms, 5 at
-/// 500 ms, 2 at 1 s), hence also [`RUN_GYRO_RMS_MAX`]. The longer chunk is the margin: against
-/// the run's gyro ceiling 1.09x at 250 ms becomes 1.46x, and the accelerometer spread (0.216 over
-/// 250 ms, over its 0.186 ceiling) drops to 0.162. The cost is later detection by the IMU: a
-/// 1.5 deg/s turn after 1.5 s instead of 0.9 s, a 0.5 m/s^2 x 0.2 s shove in 12 of 30 phases
-/// instead of 30. Creep and gentle pushes never showed on the IMU at any chunk length; the wheel
-/// floors and the camera floor catch them.
+/// It was 250 ms; the owner asked for 500 ms. Parked on the robot (2026-10-12, build
+/// 7b75117dd2da) the old check closed runs on the IMU 23 and 12 times per head run with the wheels
+/// at 0, each closure letting a burst of interval keyframes in. The cause is bursts of 38-39 Hz
+/// vibration, 2-4 s long, mostly on the gyro x axis (head pitch): peak 0.136 rad/s, net rotation
+/// under 0.2 deg. Its spread does not shrink with the chunk (a steady vibration's never does), so
+/// the chunk alone is not the fix (replayed over 10 recorded minutes at the static
+/// initialization's ceilings: 8 closures at 250 ms, 5 at 500 ms, 2 at 1 s), the raised ceilings
+/// [`RUN_GYRO_RMS_MAX`] and [`RUN_ACCEL_RMS_MAX`] are. With them the same replay closes nothing at
+/// 250 ms or at 500 ms; with the vibration scaled up 1.3x, 500 ms still closes nothing and 250 ms
+/// neither. What 500 ms buys is tolerance of short events (0.1-0.4 s ones were recorded too, too
+/// weak to close a run at either length): a disturbance a few hundred milliseconds long that lies
+/// inside a 500 ms chunk is a single failing chunk, where at 250 ms it always spans two. The cost
+/// is later detection by the IMU: a 1.5 deg/s turn after 1.5 s instead of 0.9 s, a 0.5 m/s^2 x
+/// 0.2 s shove in 1 of 30 phases instead of 30 (see [`RUN_ACCEL_RMS_MAX`]), a 2 deg head tilt
+/// over 1 s in 19 of 30 phases instead of 30. Creep and gentle pushes never showed on the IMU at
+/// any chunk length; the wheel floors and the camera's 1 cm / 0.5 deg floor catch them.
 pub(crate) const RUN_CHUNK_NS: u64 = 500_000_000;
 
 /// The run's gyroscope spread ceiling, rad/s, in place of the static initialization's when that
-/// is lower (0.0118 on the robot's BNO086): 1.46x the worst 500 ms spread measured in the
-/// vibration bursts above (0.048). The initialization keeps its own: it judges one window, once,
-/// and a vibration there only delays it. A rotation is still caught by the mean-rate gate (a
-/// steady turn has no spread) and by the wheels; on the recorded data this ceiling closed nothing
-/// while costing no motion detection against 500 ms chunks at the old ceiling, except a 2 deg
-/// head tilt over 1 s (19 of 30 phases instead of 30), which the camera's 0.5 deg floor sees.
+/// is lower (0.0118 on the robot's BNO086): 1.3x the worst 500 ms spread measured in the
+/// vibration bursts above at any chunk phase (0.053; 0.048 on 500 ms chunks laid end to end). The
+/// initialization keeps its own: it judges one window, once, and a vibration there only delays
+/// it. A rotation is still caught by the mean-rate gate (a steady turn has no spread) and by the
+/// wheels.
 pub(crate) const RUN_GYRO_RMS_MAX: f64 = 0.07;
+
+/// The run's accelerometer spread ceiling, m/s^2, in place of the static initialization's when
+/// that is lower (0.186 on the robot's BNO086): 1.34x the worst 500 ms spread measured in the
+/// vibration bursts at any chunk phase (0.179; 0.162 on chunks laid end to end), where 0.186 left
+/// 1.04x. Replayed with the recorded bursts scaled up, 0.186 closed a run at 1.15x on this gate
+/// alone, 0.24 nothing up to 1.3x. It costs the 0.5 m/s^2 x 0.2 s shove (12 of 30 phases to 1),
+/// a 1 cm displacement the wheel floors (5 mm) and the camera floor see; nothing else of the
+/// replayed motion set changed.
+pub(crate) const RUN_ACCEL_RMS_MAX: f64 = 0.24;
 
 /// Fewest samples in a checked chunk.
 const RUN_CHUNK_MIN_SAMPLES: usize = 10;
@@ -238,10 +251,11 @@ pub(crate) enum RunClose {
     WheelGap,
 }
 
-/// The chunk length and gyro spread ceiling [`StationaryRun::advance_imu`] checks with.
+/// The chunk length and spread ceilings [`StationaryRun::advance_imu`] checks with.
 #[derive(Debug, Clone, Copy)]
 struct RunImuCheck {
     chunk_ns: u64,
+    accel_rms_max: f64,
     gyro_rms_max: f64,
 }
 
@@ -352,10 +366,10 @@ impl StationaryRun {
 
     /// Checks the IMU samples that arrived since the verified end (or since a suspect chunk),
     /// once at least [`RUN_CHUNK_NS`] of them are buffered, against the static initialization's
-    /// checks with the gyro spread ceiling raised to [`RUN_GYRO_RMS_MAX`]. A chunk failing them
-    /// makes the run suspect without moving its end; the next chunk passing clears it (the
-    /// disturbance is left out of the gyro mean), failing too closes the run at the end before
-    /// the first. A hole closes it at once. Returns the reason when this call closed the run.
+    /// checks with the spread ceilings raised to [`RUN_ACCEL_RMS_MAX`] and [`RUN_GYRO_RMS_MAX`].
+    /// A chunk failing them makes the run suspect without moving its end; the next chunk passing
+    /// clears it (the disturbance is left out of the gyro mean), failing too closes the run at the
+    /// end before the first. A hole closes it at once. Returns the reason when this call closed the run.
     pub fn advance_imu(
         &mut self,
         buffer: &ImuBuffer,
@@ -365,12 +379,13 @@ impl StationaryRun {
     ) -> Option<RunClose> {
         let check = RunImuCheck {
             chunk_ns: RUN_CHUNK_NS,
+            accel_rms_max: RUN_ACCEL_RMS_MAX,
             gyro_rms_max: RUN_GYRO_RMS_MAX,
         };
         self.advance_imu_with(buffer, gates, cfg, epoch_ns, check)
     }
 
-    /// [`Self::advance_imu`] with the chunk length and gyro ceiling given (the tests replay the
+    /// [`Self::advance_imu`] with the chunk length and spread ceilings given (the tests replay the
     /// old ones).
     fn advance_imu_with(
         &mut self,
@@ -399,6 +414,7 @@ impl StationaryRun {
             return self.close(RunClose::ImuHole);
         };
         let cfg = StaticInitConfig {
+            accel_rms_max: cfg.accel_rms_max.max(check.accel_rms_max),
             gyro_rms_max: cfg.gyro_rms_max.max(check.gyro_rms_max),
             ..*cfg
         };
@@ -627,13 +643,15 @@ mod tests {
     }
 
     /// The shipped check, and the one before 2026-10-12 (250 ms chunks, the static
-    /// initialization's gyro spread ceiling).
+    /// initialization's spread ceilings).
     const NEW: RunImuCheck = RunImuCheck {
         chunk_ns: RUN_CHUNK_NS,
+        accel_rms_max: RUN_ACCEL_RMS_MAX,
         gyro_rms_max: RUN_GYRO_RMS_MAX,
     };
     const OLD: RunImuCheck = RunImuCheck {
         chunk_ns: 250 * MS,
+        accel_rms_max: 0.0,
         gyro_rms_max: 0.0,
     };
 
@@ -744,16 +762,17 @@ mod tests {
     }
 
     /// The robot's own vibration while parked, as recorded on 2026-10-12: 38.5 Hz on the gyro
-    /// x axis (head pitch) at 0.068 rad/s and on the accelerometer at 0.15 m/s^2 per axis, which
-    /// puts a chunk's spreads at the worst measured over 500 ms (0.048 rad/s, 0.16 m/s^2), in
-    /// bursts of 2.4, 3.6 and 4 s.
-    fn vibration(on: impl Fn(u64) -> bool) -> impl Fn(u64) -> ([f64; 3], [f64; 3]) {
+    /// x axis (head pitch) at 0.075 rad/s and on the accelerometer at 0.18 m/s^2 on two axes,
+    /// which puts a chunk's spreads at the worst measured over 500 ms at any phase (0.053 rad/s,
+    /// 0.179 m/s^2), in bursts of 2.4, 3.6 and 4 s; `scale` times that.
+    fn vibration(scale: f64, on: impl Fn(u64) -> bool) -> impl Fn(u64) -> ([f64; 3], [f64; 3]) {
         move |k| {
             if !on(k) {
                 return ([0.0; 3], [0.0; 3]);
             }
             let s = (2.0 * std::f64::consts::PI * 38.5 * k as f64 * 0.005).sin();
-            ([0.0, 0.15 * s, 0.15 * s], [0.068 * s, 0.0, 0.0])
+            let s = scale * s;
+            ([0.0, 0.18 * s, 0.18 * s], [0.075 * s, 0.0, 0.0])
         }
     }
 
@@ -765,19 +784,19 @@ mod tests {
     }
 
     /// Ten minutes parked with a vibration burst every 30 s stay open on the shipped check. The
-    /// old check (250 ms chunks, the initialization's 0.0118 rad/s gyro ceiling) closes on the
-    /// first burst, as on the robot, and so do 500 ms chunks alone: a steady vibration's spread
-    /// does not shrink with the window, so the chunk is not the fix by itself.
+    /// old check (250 ms chunks, the initialization's ceilings) closes on the first burst, as on
+    /// the robot, and so do 500 ms chunks alone: a steady vibration's spread does not shrink with
+    /// the window, so the chunk is not the fix by itself. Nor does it pin the chunk: a steady
+    /// burst passes 250 ms chunks under the raised ceilings too, as it did in the replay of the
+    /// recorded ten minutes; [`a_short_disturbance_inside_a_chunk_is_not_motion`] pins it.
     ///
-    /// Mutation: `RUN_GYRO_RMS_MAX` at 0.04, under the burst, turned this red. A 250 ms chunk
-    /// with the new ceiling stays green here, as on the recorded ten minutes: against a steady
-    /// burst the longer chunk is margin (worst spread 0.064 over 250 ms against 0.048 over
-    /// 500 ms, on the robot), not the fix.
+    /// Mutations (each turned this red): `RUN_GYRO_RMS_MAX` at 0.04, under the burst; the run's
+    /// check keeping the static accelerometer ceiling (the stronger bursts).
     #[test]
     fn the_robots_own_vibration_does_not_close_the_run() {
-        let samples = imu(0, 600_005, vibration(bursty));
-        // The bursts are at the measured level: over the static gyro ceiling, under the run's
-        // with the margin claimed, and under the accelerometer's.
+        let samples = imu(0, 600_005, vibration(1.0, bursty));
+        // The bursts are at the measured level: over the static gyro ceiling, the accelerometer
+        // spread at the static one, and both under the run's with the margin claimed.
         let chunk: Vec<ImuMeasurement> = samples[2_000..2_100]
             .iter()
             .map(|s| s.to_measurement(T0))
@@ -785,17 +804,18 @@ mod tests {
         let stats = ImuWindowStats::from_samples(&chunk).expect("chunk");
         let cfg = still_cfg();
         assert!(
-            (0.045..0.055).contains(&stats.gyro_rms_dev),
+            (0.05..0.056).contains(&stats.gyro_rms_dev),
             "{}",
             stats.gyro_rms_dev
         );
         assert!(stats.gyro_rms_dev > 3.0 * cfg.gyro_rms_max);
         assert!(RUN_GYRO_RMS_MAX > 1.25 * stats.gyro_rms_dev);
         assert!(
-            stats.accel_rms_dev < cfg.accel_rms_max,
+            (0.9 * cfg.accel_rms_max..0.19).contains(&stats.accel_rms_dev),
             "{}",
             stats.accel_rms_dev
         );
+        assert!(RUN_ACCEL_RMS_MAX > 1.25 * stats.accel_rms_dev);
 
         let mut run = StationaryRun::new(1, T0);
         assert_eq!(run_imu_with(&mut run, samples.clone(), NEW), None);
@@ -804,12 +824,18 @@ mod tests {
         // The bursts are left out of the gyro mean or average out of it.
         let g = run.gyro().expect("chunks checked");
         assert!((g.mean.x - BIAS[0]).abs() < 5e-4, "{}", g.mean.x);
+        // Bursts 1.2x stronger than any recorded (the ones of the first run on 2026-10-12 were
+        // not), the accelerometer spread over the static ceiling: still open.
+        let mut run = StationaryRun::new(1, T0);
+        let stronger = imu(0, 600_005, vibration(1.2, bursty));
+        assert_eq!(run_imu_with(&mut run, stronger, NEW), None);
 
         for (check, name) in [
             (OLD, "250 ms, static ceiling"),
             (
                 RunImuCheck {
                     chunk_ns: RUN_CHUNK_NS,
+                    accel_rms_max: 0.0,
                     gyro_rms_max: 0.0,
                 },
                 "500 ms, static ceiling",
@@ -822,6 +848,52 @@ mod tests {
                 "{name}: {closed:?}"
             );
         }
+    }
+
+    /// The 500 ms chunk the owner asked for: a zero-mean disturbance 400 ms long (a knock, a burst
+    /// of footsteps, well over the raised gyro ceiling) is a single failing chunk whenever it
+    /// lies inside one, and closes the run only when it straddles a boundary enough to fail both
+    /// sides. At 250 ms it spans two chunks at every phase and closes the run every time.
+    ///
+    /// Mutation: `RUN_CHUNK_NS` back at 250 ms turned this red.
+    #[test]
+    fn a_short_disturbance_inside_a_chunk_is_not_motion() {
+        let knock = |onset: u64| {
+            move |k: u64| {
+                let on = (onset..onset + 80).contains(&k);
+                let s = (2.0 * std::f64::consts::PI * 38.5 * k as f64 * 0.005).sin();
+                ([0.0; 3], [if on { 0.3 * s } else { 0.0 }, 0.0, 0.0])
+            }
+        };
+        let short = RunImuCheck {
+            chunk_ns: 250 * MS,
+            ..NEW
+        };
+        let phases: Vec<u64> = (0..600).step_by(25).collect();
+        let closed = |check: RunImuCheck| {
+            phases
+                .iter()
+                .filter(|&&phase_ms| {
+                    let mut run = StationaryRun::new(1, T0);
+                    let onset = (5_000 + phase_ms) / 5;
+                    run_imu_with(&mut run, imu(0, 8_005, knock(onset)), check).is_some()
+                })
+                .count()
+        };
+        let (at_500, at_250) = (closed(NEW), closed(short));
+        assert_eq!(
+            at_250,
+            phases.len(),
+            "250 ms closed {at_250} of {}",
+            phases.len()
+        );
+        assert!(
+            at_500 * 3 <= phases.len() * 2,
+            "500 ms closed {at_500} of {}",
+            phases.len()
+        );
+        // Not a blind spot: a phase that straddles a boundary still closes it.
+        assert!(at_500 > 0, "500 ms closed none");
     }
 
     /// Real slow motion still closes the run within a bounded time, at every chunk phase and in
@@ -849,7 +921,7 @@ mod tests {
                 ([a, 0.0, 0.0], [0.0; 3])
             }
         };
-        let buzz = vibration(|k| (1_000..1_800).contains(&k));
+        let buzz = vibration(1.0, |k| (1_000..1_800).contains(&k));
         for phase_ms in (0..600).step_by(50) {
             let onset_ms = 5_000 + phase_ms;
             let onset = onset_ms / 5;
