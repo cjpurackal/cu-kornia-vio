@@ -268,8 +268,10 @@ on the robot). `stationary_edges` removes both limits once the inertial path is 
 ```
 
 - From each keyframe the tracker verifies stillness as samples arrive: IMU chunks of at least
-  0.25 s are checked against the static initialization's spread and mean-rate checks, and two
-  failing chunks in a row end it (one is a knock or footsteps, left out of the gyro mean); the
+  0.5 s are checked against the static initialization's spread and mean-rate checks, with the
+  gyro spread ceiling raised to 0.07 rad/s (the robot's own 38 Hz head vibration reaches 0.048
+  over 0.5 s while parked, against the initialization's 0.0118), and two failing chunks in a row
+  end it (one is a knock or footsteps, left out of the gyro mean); the
   wheel path stays under 5 mm / 0.01 rad per 5 s window (the old interval gate's floors) and the
   net displacement since the keyframe under the same. An IMU hole or a wheel discontinuity ends
   it; a gap in the wheel readings (the head/body link going stale) is bridged once the IMU has
