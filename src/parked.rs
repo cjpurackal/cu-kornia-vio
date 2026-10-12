@@ -54,7 +54,7 @@ use kornia_slam::mapping::stationary::{StationaryFactor, StationaryGyro};
 
 use crate::error::VioError;
 use crate::imu::{ImuBuffer, ImuGates};
-use crate::stationary::{StaticInitConfig, check_imu_stats};
+use crate::stationary::{NotStill, StaticInitConfig, check_imu_stats};
 use crate::wheel::{PARKED_PATH_M, PARKED_PATH_RAD, WheelState, WheelWindowError};
 
 /// IMU kept before a stationary anchor and the shortest tail edge, seconds: enough samples for
@@ -227,9 +227,10 @@ pub struct StationaryStats {
     pub tail_edges: u64,
     /// Time-bound keyframes withheld while parked, once per keyframe interval, lifetime.
     pub keyframes_withheld: u64,
-    /// Still runs closed by the IMU (two failing chunks in a row, or a hole in the samples),
-    /// lifetime.
+    /// Still runs closed by the IMU's stillness checks (two failing chunks in a row), lifetime.
     pub runs_closed_imu: u64,
+    /// Still runs closed by a hole in the IMU samples, lifetime.
+    pub runs_closed_imu_hole: u64,
     /// Still runs closed by the wheels (motion, or a discontinuity in the readings), lifetime.
     pub runs_closed_wheels: u64,
     /// Stationary factors held now.
@@ -277,6 +278,10 @@ pub(crate) struct StationaryRun {
     /// End of a chunk that failed the stillness checks, while the next one has not been judged:
     /// one failing chunk is a disturbance (a door, footsteps), two in a row close the run.
     suspect_end_ns: Option<u64>,
+    /// The check that chunk failed, and its value.
+    suspect_fail: Option<NotStill>,
+    /// The checks the two failing chunks that closed the run failed, oldest first.
+    pub imu_failures: Option<[NotStill; 2]>,
     /// Start of the current wheel window ([`RUN_WHEEL_WINDOW_NS`]) and the wheel path in it.
     window_start_ns: u64,
     path_m: f64,
@@ -302,6 +307,8 @@ impl StationaryRun {
             gyro_dt_sum: Vec3F64::ZERO,
             covered_s: 0.0,
             suspect_end_ns: None,
+            suspect_fail: None,
+            imu_failures: None,
             window_start_ns: start_ns,
             path_m: 0.0,
             path_rad: 0.0,
@@ -376,7 +383,8 @@ impl StationaryRun {
     /// checks with the spread ceilings raised to [`RUN_ACCEL_RMS_MAX`] and [`RUN_GYRO_RMS_MAX`].
     /// A chunk failing them makes the run suspect without moving its end; the next chunk passing
     /// clears it (the disturbance is left out of the gyro mean), failing too closes the run at the
-    /// end before the first. A hole closes it at once. Returns the reason when this call closed the run.
+    /// end before the first, recording the two failed checks in [`Self::imu_failures`]. A hole
+    /// closes it at once. Returns the reason when this call closed the run.
     pub fn advance_imu(
         &mut self,
         buffer: &ImuBuffer,
@@ -425,17 +433,20 @@ impl StationaryRun {
             gyro_rms_max: cfg.gyro_rms_max.max(check.gyro_rms_max),
             ..*cfg
         };
-        if check_imu_stats(&stats, &cfg).is_err() {
-            if self.suspect_end_ns.is_some() {
+        if let Err(fail) = check_imu_stats(&stats, &cfg) {
+            if let Some(first) = self.suspect_fail {
+                self.imu_failures = Some([first, fail]);
                 return self.close(RunClose::Imu);
             }
             self.suspect_end_ns = Some(newest);
+            self.suspect_fail = Some(fail);
             return None;
         }
         let span_s = (newest - from) as f64 * 1e-9;
         self.gyro_dt_sum += stats.mean_gyro * span_s;
         self.covered_s += span_s;
         self.suspect_end_ns = None;
+        self.suspect_fail = None;
         self.imu_end_ns = newest;
         None
     }
@@ -686,7 +697,7 @@ mod tests {
     ///
     /// Mutations (each turned this red): accumulating the chunk mean without its span
     /// (`covered_s += 1`), the covered-time assert; closing on the first failing chunk, the
-    /// knock.
+    /// knock; recording the second failure twice, the spin's gates.
     #[test]
     fn the_imu_side_closes_on_each_kind_of_motion_and_on_a_hole() {
         let mut run = StationaryRun::new(1, T0);
@@ -710,15 +721,15 @@ mod tests {
         // One second of motion: two chunks of it, whatever the phase.
         let at = |k0: u64| move |k: u64| k >= k0 && k < k0 + 200;
         let spin = at(1000);
-        for (extra, why) in [
+        for (extra, gate) in [
             (
                 Box::new(move |k| ([0.0; 3], [0.0, 0.0, if spin(k) { 0.2 } else { 0.0 }]))
                     as Box<dyn Fn(u64) -> ([f64; 3], [f64; 3])>,
-                RunClose::Imu,
+                ["GyroSpread", "Turning"],
             ),
             (
                 Box::new(|k| ([0.0; 3], [0.0, if k >= 1000 { 0.03 } else { 0.0 }, 0.0])),
-                RunClose::Imu,
+                ["Turning", "Turning"],
             ),
             (
                 Box::new(move |k| {
@@ -727,12 +738,22 @@ mod tests {
                         [0.0; 3],
                     )
                 }),
-                RunClose::Imu,
+                ["AccelSpread", "AccelSpread"],
             ),
         ] {
             let mut run = StationaryRun::new(1, T0);
-            assert_eq!(run_imu(&mut run, imu(0, 10_005, extra)), Some(why));
+            assert_eq!(
+                run_imu(&mut run, imu(0, 10_005, extra)),
+                Some(RunClose::Imu)
+            );
             assert!(!run.is_open());
+            // The failed checks are kept for the log, each with its value: the spin's onset
+            // chunk fails on the spread, the steady spin on the rate.
+            let fails = run.imu_failures.expect("recorded");
+            assert!(
+                (0..2).all(|i| format!("{:?}", fails[i]).starts_with(gate[i])),
+                "{gate:?}: {fails:?}"
+            );
             // The IMU side alone (no wheels here): `end_ns` is the sooner of the two.
             let end = run.imu_end_ns;
             // The 4.6-5.1 s chunk holds the motion's first 95 ms, which passes unless it is

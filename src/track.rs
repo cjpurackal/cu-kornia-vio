@@ -128,8 +128,8 @@ use crate::imu::{
     preintegration_is_finite, ts_sec, window_excitation,
 };
 use crate::parked::{
-    EdgeAnchor, MAX_STATIONARY_FACTORS, PARKED_REFRESH_NS, PRUNE_MARGIN_NS, StationaryEdgeConfig,
-    StationaryRun, StationaryStats, edge_anchor,
+    EdgeAnchor, MAX_STATIONARY_FACTORS, PARKED_REFRESH_NS, PRUNE_MARGIN_NS, RunClose,
+    StationaryEdgeConfig, StationaryRun, StationaryStats, edge_anchor,
 };
 use crate::stationary::{NotStill, StaticInitConfig, check_camera, check_imu, check_wheels};
 use crate::wheel::{WheelOdomConfig, WheelSample, WheelState, WheelStats, WheelWindowError};
@@ -2123,11 +2123,26 @@ impl Tracker {
         let still = inert.cfg.static_init.unwrap_or_else(|| {
             StaticInitConfig::from_noise(&inert.cfg.calib, inert.cfg.gates.nominal_rate)
         });
-        if run
-            .advance_imu(&inert.buffer, &inert.cfg.gates, &still, epoch)
-            .is_some()
-        {
-            self.stationary.runs_closed_imu += 1;
+        match run.advance_imu(&inert.buffer, &inert.cfg.gates, &still, epoch) {
+            Some(RunClose::ImuHole) => {
+                self.stationary.runs_closed_imu_hole += 1;
+                info!(
+                    "vio parked: still run from keyframe {} closed by a hole in the IMU samples",
+                    run.kf_idx
+                );
+            }
+            Some(_) => {
+                self.stationary.runs_closed_imu += 1;
+                if let Some([older, newer]) = run.imu_failures {
+                    info!(
+                        "vio parked: still run from keyframe {} closed by the IMU: {}, then {}",
+                        run.kf_idx,
+                        older.to_string(),
+                        newer.to_string()
+                    );
+                }
+            }
+            None => {}
         }
         if run.advance_wheels(w).is_some() {
             self.stationary.runs_closed_wheels += 1;
@@ -12209,6 +12224,7 @@ mod tests {
                 (st.runs_closed_wheels, st.runs_closed_imu),
                 if creep { (1, 0) } else { (0, 1) }
             );
+            assert_eq!(st.runs_closed_imu_hole, 0, "a shake is no hole");
             assert_eq!(st.tail_edges, 1);
             assert_eq!(st.edges_added, 0);
             assert_eq!(imu_edges(&t), edges0 + 1, "the tail edge was refused");
@@ -12279,8 +12295,12 @@ mod tests {
         }
         let st = t.stationary_stats().unwrap();
         assert_eq!(
-            (st.runs_closed_wheels, st.runs_closed_imu),
-            (0, 0),
+            (
+                st.runs_closed_wheels,
+                st.runs_closed_imu,
+                st.runs_closed_imu_hole
+            ),
+            (0, 0, 0),
             "{st:?}"
         );
         assert_eq!(st.tail_edges, 0, "{st:?}");

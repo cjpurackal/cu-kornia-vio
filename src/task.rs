@@ -850,7 +850,7 @@ impl CuTask for StereoVio {
             info!(
                 "vio parked: {} stationary edges ({} merged by culling, {} held), {} boundary \
                  keyframes culled, {} tail edges, {} time-bound keyframes withheld; still runs \
-                 closed by the IMU {} / the wheels {}",
+                 closed by the IMU checks {} / IMU holes {} / the wheels {}",
                 s.edges_added,
                 s.edges_merged,
                 s.factors,
@@ -858,6 +858,7 @@ impl CuTask for StereoVio {
                 s.tail_edges,
                 s.keyframes_withheld,
                 s.runs_closed_imu,
+                s.runs_closed_imu_hole,
                 s.runs_closed_wheels
             );
         }

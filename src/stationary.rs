@@ -177,8 +177,10 @@ pub(crate) fn check_imu(
 }
 
 /// The per-statistic part of [`check_imu`], without the span: accelerometer and gyroscope
-/// spread and the mean rate. The parked keyframe run ([`crate::parked`]) applies it chunk by
-/// chunk, where the span is whatever arrived since the last frame.
+/// spread and the mean rate. The parked keyframe run ([`crate::parked`]) applies it to chunks of
+/// at least `RUN_CHUNK_NS` (500 ms), with the spread ceilings raised to at least
+/// `RUN_ACCEL_RMS_MAX` and `RUN_GYRO_RMS_MAX` for the robot's own vibration; the initialization
+/// uses these thresholds as they are.
 pub(crate) fn check_imu_stats(
     stats: &ImuWindowStats,
     cfg: &StaticInitConfig,

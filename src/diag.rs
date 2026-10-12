@@ -132,7 +132,8 @@ fn stationary_check(tracker: &Tracker) -> StationaryCheck {
             keyframes_withheld: s.keyframes_withheld,
             factors: u32::try_from(s.factors).unwrap_or(u32::MAX),
             parked: s.parked,
-            runs_closed_imu: s.runs_closed_imu,
+            // The payload counts holes with the gate closures; the log line splits them.
+            runs_closed_imu: s.runs_closed_imu + s.runs_closed_imu_hole,
             runs_closed_wheels: s.runs_closed_wheels,
             boundaries_removed: s.boundaries_removed,
         })
