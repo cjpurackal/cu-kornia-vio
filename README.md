@@ -384,11 +384,10 @@ It applies in three directions:
   exact requirement kornia-slam uses. A git spelling of kornia-rs is a different
   source even at identical code (v0.1.15 at `c9f9fd7` is the same code as 0.2.0), and splits
   `Image` in two. `kornia-slam` AND `kornia-sensors` (the latter is a workspace member of the
-  kornia-slam repo, not of kornia-rs) are on one git `rev =`: the head of kornia-slam's
-  `feat/wheel-odom-factor` PR branch (kornia/kornia-slam#158), which carries the wheel-odometry
-  factor, stationary IMU init, parallax keyframes and culling this crate uses. They move to a
-  `main` rev once it merges, then to crates.io at the first release that carries it, and every
-  consumer must move with them.
+  kornia-slam repo, not of kornia-rs) are on one git `rev =`: kornia-slam `main` at `bda9631`,
+  the squash merge of kornia/kornia-slam#158, which carries the wheel-odometry factor, stationary
+  IMU init, parallax keyframes and culling this crate uses. They move to crates.io at the first
+  release that carries it, and every consumer must move with them.
 - **this repo's own two crates**: a consumer naming both `cu-kornia-vio` and `cu-stereo-payloads`
   must give them the identical URL and the identical `branch = "main"`. `cu-kornia-vio` reaches the
   payload crate by path, so it inherits the git source it was itself pulled from; pinning the
