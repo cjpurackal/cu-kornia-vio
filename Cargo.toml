@@ -63,12 +63,11 @@ cu-stereo-payloads = { path = "crates/cu-stereo-payloads" }
 # - the kornia-rs crates come from crates.io at `version = "0.2.0"`, the exact requirement
 #   kornia-slam uses. A git spelling of kornia-rs (even at the same code) is a DIFFERENT source
 #   and a second `Image` type;
-# - the two kornia-slam repo crates are on a git `rev`, not crates.io. That rev is the head of
-#   kornia-slam's `feat/wheel-odom-factor` PR branch (kornia/kornia-slam#158: wheel-odometry VI-BA
-#   factor, stationary IMU init, parallax keyframes, keyframe culling), which this crate needs and
-#   which is not on `main` yet. Pinned to that rev until the PR merges, then to a `main` rev, then
-#   to crates.io at the first release that carries it (v0.1.0 lacks all of it).
-kornia-slam = { git = "https://github.com/kornia/kornia-slam", rev = "483000313ee229500928dadba4ace569c50ef44c" }
+# - the two kornia-slam repo crates are on a git `rev`, not crates.io. That rev is kornia-slam `main`
+#   at bda9631, the squash merge of kornia/kornia-slam#158 (wheel-odometry VI-BA factor,
+#   stationary IMU init, parallax keyframes, keyframe culling), which this crate needs. Pinned to
+#   that `main` rev until a crates.io release carries it (v0.1.0 lacks all of it).
+kornia-slam = { git = "https://github.com/kornia/kornia-slam", rev = "bda9631f53027f636e8c4405cc755bc76ef2f84e" }
 # The IMU types (`ImuMeasurement`, `ImuBias`, `ImuCalib`, `PreintegratedImu`) are NOT re-exported
 # by kornia-slam — `ImuFactor::{preintegrated, raw_samples}` (inserted via `Map::apply_insertion`)
 # and `ImuInitializer::{try_initialize, apply_initialization}` name them from this crate, so naming
@@ -76,7 +75,7 @@ kornia-slam = { git = "https://github.com/kornia/kornia-slam", rev = "483000313e
 # so the spec string MUST be spelled exactly as the line above: a different spelling is a
 # different cargo source, which would make `ImuBias` here a DIFFERENT type from the `ImuBias` in
 # `ImuFactor`, with a type error that names the same path twice.
-kornia-sensors = { git = "https://github.com/kornia/kornia-slam", rev = "483000313ee229500928dadba4ace569c50ef44c" }
+kornia-sensors = { git = "https://github.com/kornia/kornia-slam", rev = "bda9631f53027f636e8c4405cc755bc76ef2f84e" }
 kornia-image = "0.2.0"
 kornia-3d = "0.2.0"
 kornia-algebra = "0.2.0"

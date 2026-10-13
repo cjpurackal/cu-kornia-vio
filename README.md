@@ -399,7 +399,7 @@ It applies in three directions:
   `https://github.com/kornia/cu-kornia-vio` everywhere.
 
 `Cargo.lock` is tracked so that a clean clone builds: it holds a kornia-rs / kornia-slam pair
-known to compile together (kornia-rs 0.2.0 from crates.io, kornia-slam at `4830003`). A
+known to compile together (kornia-rs 0.2.0 from crates.io, kornia-slam `main` at `bda9631`). A
 consumer's own lock still wins, but a kornia-slam from before its move to crates.io kornia-rs
 (`6820744`) names git kornia-rs and splits the graph, and one from before its map-API rework
 does not compile against this crate.
