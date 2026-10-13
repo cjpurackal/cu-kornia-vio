@@ -160,6 +160,73 @@ pub enum VioError {
         value: f64,
     },
 
+    /// Wheel odometry was handed to a tracker whose wheel path is not configured.
+    #[error(
+        "wheel odometry is not configured (TrackerConfig::wheel_odom is None); \
+         add a `wheel_odom` block with `enabled: true`"
+    )]
+    WheelOdomDisabled,
+
+    /// The configured or published camera mount rotation is not a rotation.
+    #[error(
+        "camera mount rotation is not a rigid rotation: max|R^T R - I| = \
+         {orthonormality_error:e}, det = {determinant} (want 0 and +1)"
+    )]
+    WheelMountNotRigid {
+        /// Largest absolute entry of `R^T R - I`.
+        orthonormality_error: f64,
+        /// Determinant of `R`.
+        determinant: f64,
+    },
+
+    /// A wheel-odometry noise figure is not a usable positive number. A zero sigma is an
+    /// infinite information matrix: the wheels would then outweigh every visual constraint.
+    #[error("wheel_odom parameter `{field}` must be finite and > 0, got {value}")]
+    WheelParamInvalid {
+        /// Which parameter.
+        field: &'static str,
+        /// The offending value.
+        value: f64,
+    },
+
+    /// A `motion_veto` parameter is out of range.
+    #[error("motion_veto parameter `{field}` is out of range, got {value}")]
+    VetoParamInvalid {
+        /// Which parameter.
+        field: &'static str,
+        /// The offending value (radians for the angle bounds).
+        value: f64,
+    },
+
+    /// A `per_frame_fusion` parameter is not a usable positive number.
+    #[error("per_frame_fusion parameter `{field}` must be finite and > 0, got {value}")]
+    FusionParamInvalid {
+        /// Which parameter.
+        field: &'static str,
+        /// The offending value.
+        value: f64,
+    },
+
+    /// A `stationary_edges` parameter is not a usable positive number, or `min_span_s` is
+    /// shorter than the IMU tail every stationary anchor keeps
+    /// ([`crate::parked::STATIONARY_TAIL_MIN_S`]).
+    #[error("stationary_edges parameter `{field}` is out of range, got {value}")]
+    StationaryParamInvalid {
+        /// Which parameter.
+        field: &'static str,
+        /// The offending value.
+        value: f64,
+    },
+
+    /// Stationary edges are configured without what they act through: the wheels (which vouch
+    /// that the base stood still), the inertial path, and its visual-inertial BA (the only solve
+    /// that reads them).
+    #[error("stationary_edges need {what}")]
+    StationaryEdgesNeed {
+        /// What is missing.
+        what: &'static str,
+    },
+
     /// ORB detection or a pyramid resize failed inside kornia-imgproc.
     #[error("image operation failed: {0}")]
     Image(#[from] ImageError),

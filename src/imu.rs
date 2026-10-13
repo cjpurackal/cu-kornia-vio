@@ -49,9 +49,10 @@ use cu29::units::si::time::second;
 use kornia_3d::pose::Pose3d;
 use kornia_algebra::{Mat3F64, Vec3F64};
 use kornia_sensors::imu::{ImuBias, ImuCalib, ImuMeasurement, PreintegratedImu};
-use kornia_slam::initialization::ImuInitConfig;
+use kornia_slam::inertial::ImuInitConfig;
 
 use crate::error::VioError;
+use crate::stationary::StaticInitConfig;
 
 /// One raw IMU sample, in the units and the clock the driver publishes.
 ///
@@ -110,15 +111,16 @@ impl From<cu_stereo_payloads::ImuSample> for RawImuSample {
 /// Samples held by a ring — `ImuBuffer` and [`crate::ImuQueue`] alike.
 ///
 /// 2048 = 10.2 s at 200 Hz, ~115 kB. Sized against the LONGEST interval that can be asked for,
-/// not the frame interval: a keyframe edge spans back to the previous keyframe, which on a
-/// parked robot has been measured 600-670 ms back, and the channel has to hold what arrives while
-/// the tracker is mid-solve and not draining (a frame that inserts a keyframe: p50 ~93 ms /
-/// p99 ~200 ms tuned, with multi-second outliers). 10.2 s is margin over both, not a bound: an
-/// edge whose start the tracker's ring evicted is refused as a leading gap, and samples the
-/// channel evicted during a longer stall are folded into the drop count and refused as dropped
-/// samples (`refused_dropped`); either way that keyframe pair stays visual-only, never
-/// integrated over a hole. One constant for both rings so they cannot drift apart in size with
-/// nothing noticing.
+/// not the frame interval: a keyframe edge spans back to the previous keyframe, and the channel
+/// has to hold what arrives while the tracker is mid-solve and not draining (a frame that inserts
+/// a keyframe: p50 ~93 ms / p99 ~200 ms tuned, with multi-second outliers). A parked keyframe
+/// interval can push the edge past this, so the tracker grows its own ring to span that interval
+/// plus a margin (`track::imu_ring_capacity`); the channel is drained every frame and keeps this
+/// size. The size is margin, not a bound: an edge whose start the tracker's ring evicted is
+/// refused as a leading gap, and samples the channel evicted during a longer stall are folded
+/// into the drop count and refused as dropped samples (`refused_dropped`); either way that
+/// keyframe pair stays visual-only, never integrated over a hole. One constant is the floor for
+/// both rings, so neither can shrink below the other with nothing noticing.
 pub const DEFAULT_BUFFER_CAPACITY: usize = 2048;
 
 /// Appends to a capacity-bounded ring, evicting the oldest sample and counting the eviction.
@@ -282,8 +284,9 @@ pub struct ImuBufferStats {
     pub evicted: u64,
     /// Samples refused at ingest for a non-finite gyro or accel component. Each one leaves a
     /// drop mark, so an interval straddling it is refused rather than integrated across the
-    /// hole: a NaN admitted into a factor would make kornia-slam refuse
-    /// every later BA write-back (`Map::apply_ba_update` validates every factor in the map).
+    /// hole: a NaN admitted into a factor would make kornia-slam refuse every BA write-back
+    /// whose window holds both its endpoints (`Map::apply_ba_update` validates the captured
+    /// factors).
     pub non_finite: u64,
     /// Times the source's cumulative drop counter increased.
     pub drop_reports: u64,
@@ -427,11 +430,9 @@ impl ImuBuffer {
         self.forget_marks_before(stamp_ns);
     }
 
-    /// Empties the buffer and every drop mark, keeping the lifetime counters.
-    pub fn clear(&mut self) {
-        self.samples.clear();
-        self.drop_marks.clear();
-        self.pending_drop_mark = false;
+    /// Stamp of the newest buffered sample.
+    pub fn newest_stamp_ns(&self) -> Option<u64> {
+        self.samples.back().map(|s| s.stamp_ns)
     }
 
     /// Counters, plus the current occupancy.
@@ -591,6 +592,54 @@ pub struct InertialConfig {
     /// are estimated and observable) while leaving the optimizer on the visual-only path — the
     /// setting to run first on hardware, because it cannot move a pose.
     pub enable_inertial_ba: bool,
+    /// Initialize from a still window instead of waiting for motion; see [`crate::stationary`].
+    /// `None` (what [`InertialConfig::new`] sets) leaves the motion-based initializer as the
+    /// only one. With it on, the motion path still runs whenever no still window is found.
+    pub static_init: Option<StaticInitConfig>,
+    /// The largest IMU bias the tracker will believe; see [`BiasLimit`]. [`InertialConfig::new`]
+    /// sets [`BiasLimit::default`].
+    pub bias_limit: BiasLimit,
+}
+
+/// The physically plausible IMU bias range. A bias outside it is a solver artefact, never a
+/// sensor property, and the tracker treats it as one: it is not taken from local BA (the whole
+/// update is refused) or from an initialization — the only two writers of the bias the next
+/// edge is linearized at — and not carried across a map drop.
+///
+/// Why it exists: VI-BA has no absolute prior on the gyro bias, only random-walk edges between
+/// consecutive keyframes, so whatever lands in it stays (2e-6 rad/s^2/sqrt(Hz) pins it) and a
+/// map drop used to carry it into every later map. 2026-10-09 loop test: 0.0030 rad/s at one
+/// drop, 0.2845 rad/s at the next three — the commanded turn rate — and from then on the gyro
+/// prior cancelled every turn and the raw pose jumped 270-350 mm in the turns.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BiasLimit {
+    /// Largest gyro bias norm, rad/s.
+    pub gyro_rad_s: f64,
+    /// Largest accelerometer bias norm, m/s^2.
+    pub accel_m_s2: f64,
+}
+
+impl BiasLimit {
+    /// 0.05 rad/s: ~17x the 0.0031 rad/s measured parked on the BNO086 and above its datasheet
+    /// zero-rate offset; a MEMS gyro of the class does not reach it.
+    pub const DEFAULT_GYRO_RAD_S: f64 = 0.05;
+    /// 0.5 m/s^2: above the ~0.23 m/s^2 the static initialization measured on the same chip.
+    pub const DEFAULT_ACCEL_M_S2: f64 = 0.5;
+
+    /// Whether `bias` is finite and inside both norms.
+    pub fn admits(&self, bias: &ImuBias) -> bool {
+        let (g, a) = (bias.gyro.length(), bias.accel.length());
+        g.is_finite() && a.is_finite() && g <= self.gyro_rad_s && a <= self.accel_m_s2
+    }
+}
+
+impl Default for BiasLimit {
+    fn default() -> Self {
+        Self {
+            gyro_rad_s: Self::DEFAULT_GYRO_RAD_S,
+            accel_m_s2: Self::DEFAULT_ACCEL_M_S2,
+        }
+    }
 }
 
 impl InertialConfig {
@@ -643,8 +692,24 @@ impl InertialConfig {
             },
             init_retry: Time::new::<second>(5.0),
             enable_inertial_ba: true,
+            static_init: None,
+            bias_limit: BiasLimit::default(),
         })
     }
+}
+
+/// `Some((max|R^T R - I|, det R))` when `r` is not a proper rotation, `None` when it is.
+pub(crate) fn rotation_residual(r: &Mat3F64) -> Option<(f64, f64)> {
+    let residual = r.transpose() * *r - Mat3F64::IDENTITY;
+    let orthonormality_error = residual
+        .to_cols_array()
+        .iter()
+        .fold(0.0f64, |acc, v| acc.max(v.abs()));
+    let determinant = r.determinant();
+    let rigid = orthonormality_error.is_finite()
+        && orthonormality_error <= 1e-6
+        && (determinant - 1.0).abs() <= 1e-6;
+    (!rigid).then_some((orthonormality_error, determinant))
 }
 
 /// Rejects a matrix that is not a proper rotation.
@@ -654,22 +719,13 @@ impl InertialConfig {
 /// the one that matters — a reflection (det = -1) mirrors the body frame, and a mirrored
 /// gravity direction is what `apply_initialization` would then rotate the whole map onto.
 fn validate_rotation(r: &Mat3F64) -> Result<(), VioError> {
-    let residual = r.transpose() * *r - Mat3F64::IDENTITY;
-    let orthonormality_error = residual
-        .to_cols_array()
-        .iter()
-        .fold(0.0f64, |acc, v| acc.max(v.abs()));
-    let determinant = r.determinant();
-    if !orthonormality_error.is_finite()
-        || orthonormality_error > 1e-6
-        || (determinant - 1.0).abs() > 1e-6
-    {
-        return Err(VioError::InertialExtrinsicNotRigid {
+    match rotation_residual(r) {
+        Some((orthonormality_error, determinant)) => Err(VioError::InertialExtrinsicNotRigid {
             orthonormality_error,
             determinant,
-        });
+        }),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// What the inertial path has done and refused. Diagnostics only.
@@ -700,7 +756,8 @@ pub struct InertialStats {
     pub refused_zero_dt: u64,
     /// Intervals whose preintegration came back with a non-finite term. Should be unreachable
     /// behind [`ImuBufferStats::non_finite`]; checked because the map admits such a factor and
-    /// then refuses every later `Map::apply_ba_update`, visual BA included, until the map drops.
+    /// then refuses every `Map::apply_ba_update` whose window holds both its endpoints, visual BA
+    /// included.
     pub refused_non_finite: u64,
     /// Intervals that passed every gate here but that `Map::apply_insertion` refused (an
     /// endpoint keyframe the map does not hold, a duplicate edge, a non-increasing interval).
@@ -717,6 +774,20 @@ pub struct InertialStats {
     /// and is retried after `init_retry`; a refused refinement leaves it on the previous
     /// initialization, and that refinement is not retried.
     pub init_apply_refused: u64,
+    /// Initializations taken from a still window ([`crate::stationary`]), applied or dry. Also
+    /// counted in `init_accepted` when applied. A window found but then refused (the bias
+    /// limit, the map) counts in `static_refused` instead.
+    pub static_accepted: u64,
+    /// Keyframes on which a still window was looked for and not found, or found and then refused
+    /// by the bias limit or the map.
+    pub static_refused: u64,
+    /// Carried alignments given up at the re-bootstrap because no wheel velocity was available
+    /// for the new anchor; each one is followed by a fresh initialization.
+    pub carry_dropped: u64,
+    /// Bias estimates refused for leaving [`BiasLimit`]: local BA updates refused whole,
+    /// initializations refused, and carries given up at a map drop. Each one is also a
+    /// `warning!` saying which.
+    pub bias_rejected: u64,
     /// Whether visual-inertial initialization has succeeded.
     pub initialized: bool,
     /// Whether the first inertial refinement pass (after ~5 s of initialized tracking) has run.
@@ -751,8 +822,9 @@ impl InertialStats {
 /// caller's stricter `dt > 0` gate already covers.
 ///
 /// Mirrored because `Map::apply_insertion` does not run it and `Map::apply_ba_update` runs it
-/// over EVERY factor in the map: an admitted non-finite factor would not fail its own insertion
-/// but every later BA write-back, visual included, until the map drops.
+/// over the captured factors: an admitted non-finite factor would not fail its own insertion but
+/// every BA write-back whose window holds both its endpoints (the newest three keyframes and
+/// their IMU neighbours), visual included.
 pub(crate) fn preintegration_is_finite(p: &PreintegratedImu) -> bool {
     let vec = |v: Vec3F64| v.to_array().iter().all(|c| c.is_finite());
     p.dt.is_finite()
