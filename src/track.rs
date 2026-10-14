@@ -808,28 +808,65 @@ const BA_DIAG_MIN_SAMPLES: usize = 8;
 const BA_DIAG_SPIKE_FACTOR: f64 = 100.0;
 /// The `local BA` line speaks at least this often, seconds, when nothing is notable.
 const BA_DIAG_PERIOD_SEC: f64 = 60.0;
+/// The `local BA` `warning!` speaks at most this often, seconds. Parked with kornia/kornia-slam#161
+/// nearly every solve after the first cull has a non-zero count (230 of 245 in the three-hour
+/// test), and moving, local BA runs at keyframe rate; unthrottled, the warning would be most
+/// solves and carry no signal.
+const BA_DIAG_NOTABLE_RETRY_SEC: f64 = 30.0;
 
-/// When the `local BA` diagnostic line speaks: every solve with a notable figure (a depth row
-/// gated, a landmark re-seeded, a cheirality rejection or hold, a landmark refused at
-/// write-back, or an initial cost past [`BA_DIAG_SPIKE_FACTOR`] times its running median),
-/// otherwise once per [`BA_DIAG_PERIOD_SEC`]. Log-only: nothing reads it back.
+/// When the `local BA` diagnostic line speaks, and what it adds up in between. A solve is
+/// notable when it has a non-zero count (a depth row gated, a landmark re-seeded, a cheirality
+/// rejection or hold, a landmark refused at write-back) or an initial cost past
+/// [`BA_DIAG_SPIKE_FACTOR`] times its running median. A notable solve, or a quiet one after
+/// notable solves were held back, speaks as a `warning!` at most once per
+/// [`BA_DIAG_NOTABLE_RETRY_SEC`]; otherwise the `info!` line speaks once per
+/// [`BA_DIAG_PERIOD_SEC`]. Every line carries [`BaSolveTotals`] of all the solves since the line
+/// before it, so a solve the throttle held back still has its counts printed. Spikes go through
+/// the same throttle (after a cost regime change they can repeat for up to
+/// [`BA_DIAG_COST_WINDOW`] / 2 solves, until the median catches up) and are counted as
+/// `spikes`. Log-only: nothing reads it back.
 #[derive(Debug, Default)]
 struct BaSolveLog {
     /// The last [`BA_DIAG_COST_WINDOW`] finite initial costs, oldest first.
     costs: std::collections::VecDeque<f64>,
     /// When the line last spoke, seconds.
     last_sec: Option<f64>,
+    /// The solves since the line last spoke, this one included once observed.
+    totals: BaSolveTotals,
+}
+
+/// The counts of every local BA solve since the `local BA` line last spoke, the solve that makes
+/// it speak included.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct BaSolveTotals {
+    solves: usize,
+    /// Solves among them that were notable.
+    notable: usize,
+    spikes: usize,
+    depth_rows_gated: usize,
+    reseeded: usize,
+    cheirality_rejections: usize,
+    cheirality_held: usize,
+    write_back_refused: usize,
 }
 
 /// What [`BaSolveLog::observe`] decided for one solve.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum BaSolveVerdict {
-    /// Not logged.
+    /// Not logged; its counts wait in the totals for the next line.
     Quiet,
-    /// The periodic line.
-    Periodic { median_cost: f64 },
-    /// A notable solve; `spike` when the initial cost tripped it.
-    Notable { median_cost: f64, spike: bool },
+    /// The periodic line: no solve since the last line was notable.
+    Periodic {
+        median_cost: f64,
+        totals: BaSolveTotals,
+    },
+    /// The throttled warning: a solve since the last line was notable. `spike` when THIS
+    /// solve's initial cost tripped it.
+    Notable {
+        median_cost: f64,
+        spike: bool,
+        totals: BaSolveTotals,
+    },
 }
 
 impl BaSolveLog {
@@ -855,18 +892,47 @@ impl BaSolveLog {
             + s.cheirality_points_held
             + s.points_rejected
             > 0;
-        let verdict = if counted || spike {
-            BaSolveVerdict::Notable { median_cost, spike }
+        let t = &mut self.totals;
+        t.solves += 1;
+        t.notable += usize::from(counted || spike);
+        t.spikes += usize::from(spike);
+        t.depth_rows_gated += s.depth_rows_gated;
+        t.reseeded += s.points_reseeded;
+        t.cheirality_rejections += s.cheirality_rejections;
+        t.cheirality_held += s.cheirality_points_held;
+        t.write_back_refused += s.points_rejected;
+        let totals = *t;
+        // A plain time throttle with a constant verdict: passing `notable` instead would make
+        // every notable/quiet alternation a "flip" that always speaks.
+        let verdict = if totals.notable > 0 {
+            if should_log_throttled(
+                self.last_sec.map(|then| (then, true)),
+                now_sec,
+                true,
+                BA_DIAG_NOTABLE_RETRY_SEC,
+            ) {
+                BaSolveVerdict::Notable {
+                    median_cost,
+                    spike,
+                    totals,
+                }
+            } else {
+                BaSolveVerdict::Quiet
+            }
         } else if self
             .last_sec
             .is_none_or(|then| now_sec - then >= BA_DIAG_PERIOD_SEC)
         {
-            BaSolveVerdict::Periodic { median_cost }
+            BaSolveVerdict::Periodic {
+                median_cost,
+                totals,
+            }
         } else {
             BaSolveVerdict::Quiet
         };
         if verdict != BaSolveVerdict::Quiet {
             self.last_sec = Some(now_sec);
+            self.totals = BaSolveTotals::default();
         }
         verdict
     }
@@ -6184,18 +6250,24 @@ impl Tracker {
     }
 
     /// The `local BA` line: what one local inertial solve did (kornia-slam's
-    /// [`LocalBaStats`]), throttled by [`BaSolveLog`]. `warning!` on a notable solve, as the
-    /// motion-veto lines the same parked failure ends in (2026-10-13: a parked BA flung landmarks
-    /// out along their rays, a later window refused at 80 deg); `info!` for the periodic line.
-    /// Log-only.
+    /// [`LocalBaStats`]), and the summed counts of every solve since the line last spoke
+    /// (`since_last:`), throttled by [`BaSolveLog`]. `warning!` when a solve since the last line
+    /// was notable, at most once per [`BA_DIAG_NOTABLE_RETRY_SEC`], as the motion-veto lines the
+    /// same parked failure ends in (2026-10-13: a parked BA flung landmarks out along their rays,
+    /// a later window refused at 80 deg); `info!` for the periodic line. Log-only.
     fn log_ba_solve(&mut self, s: &LocalBaStats, frame_idx: usize, timestamp_sec: f64) {
         let keyframes = self.map.keyframes().len();
         match self.ba_solve_log.observe(s, timestamp_sec) {
             BaSolveVerdict::Quiet => {}
-            BaSolveVerdict::Periodic { median_cost } => info!(
+            BaSolveVerdict::Periodic {
+                median_cost,
+                totals: t,
+            } => info!(
                 "local BA: frame={} keyframes={} initial_cost={} final_cost={} median_initial_cost={} \
                  iterations={} converged={} depth_rows_gated={} reseeded={} cheirality_rejections={} \
-                 cheirality_held={} write_back_refused={}",
+                 cheirality_held={} write_back_refused={} since_last: solves={} notable={} spikes={} \
+                 depth_rows_gated={} reseeded={} cheirality_rejections={} cheirality_held={} \
+                 write_back_refused={}",
                 frame_idx,
                 keyframes,
                 s.initial_cost,
@@ -6207,11 +6279,25 @@ impl Tracker {
                 s.points_reseeded,
                 s.cheirality_rejections,
                 s.cheirality_points_held,
-                s.points_rejected
+                s.points_rejected,
+                t.solves,
+                t.notable,
+                t.spikes,
+                t.depth_rows_gated,
+                t.reseeded,
+                t.cheirality_rejections,
+                t.cheirality_held,
+                t.write_back_refused
             ),
-            BaSolveVerdict::Notable { median_cost, spike } => warning!(
+            BaSolveVerdict::Notable {
+                median_cost,
+                spike,
+                totals: t,
+            } => warning!(
                 "local BA: frame={} keyframes={} initial_cost={} final_cost={} median_initial_cost={} \
                  cost_spike={} iterations={} converged={} depth_rows_gated={} reseeded={} \
+                 cheirality_rejections={} cheirality_held={} write_back_refused={} since_last: \
+                 solves={} notable={} spikes={} depth_rows_gated={} reseeded={} \
                  cheirality_rejections={} cheirality_held={} write_back_refused={}",
                 frame_idx,
                 keyframes,
@@ -6225,7 +6311,15 @@ impl Tracker {
                 s.points_reseeded,
                 s.cheirality_rejections,
                 s.cheirality_points_held,
-                s.points_rejected
+                s.points_rejected,
+                t.solves,
+                t.notable,
+                t.spikes,
+                t.depth_rows_gated,
+                t.reseeded,
+                t.cheirality_rejections,
+                t.cheirality_held,
+                t.write_back_refused
             ),
         }
     }
@@ -8332,10 +8426,20 @@ mod tests {
         s
     }
 
-    /// A quiet solve speaks once per period; any count, or a spike, speaks every time and resets
-    /// the period.
+    fn totals(v: BaSolveVerdict) -> BaSolveTotals {
+        match v {
+            BaSolveVerdict::Quiet => panic!("quiet verdict has no totals"),
+            BaSolveVerdict::Periodic { totals, .. } | BaSolveVerdict::Notable { totals, .. } => {
+                totals
+            }
+        }
+    }
+
+    /// A quiet solve speaks once per period. Each count on its own makes a solve notable, and the
+    /// notable warning speaks at most once per retry interval, however many solves are notable;
+    /// the solves it held back reach the next line's totals.
     #[test]
-    fn the_local_ba_line_speaks_on_every_notable_solve_and_once_a_minute_otherwise() {
+    fn the_local_ba_line_throttles_notable_solves_and_carries_their_counts() {
         let mut log = BaSolveLog::default();
         assert!(matches!(
             log.observe(&solve(10.0), 0.0),
@@ -8343,11 +8447,16 @@ mod tests {
         ));
         assert_eq!(log.observe(&solve(10.0), 1.0), BaSolveVerdict::Quiet);
         assert_eq!(log.observe(&solve(10.0), 59.9), BaSolveVerdict::Quiet);
-        assert!(matches!(
-            log.observe(&solve(10.0), 60.0),
-            BaSolveVerdict::Periodic { .. }
-        ));
-        // Each count on its own makes a solve notable, however recently the line spoke.
+        let v = log.observe(&solve(10.0), 60.0);
+        assert!(matches!(v, BaSolveVerdict::Periodic { .. }), "{v:?}");
+        assert_eq!(
+            totals(v),
+            BaSolveTotals {
+                solves: 3,
+                ..Default::default()
+            }
+        );
+
         let counts: [fn(&mut LocalBaStats); 5] = [
             |s| s.depth_rows_gated = 1,
             |s| s.points_reseeded = 1,
@@ -8355,19 +8464,70 @@ mod tests {
             |s| s.cheirality_points_held = 1,
             |s| s.points_rejected = 1,
         ];
-        for (i, set) in counts.iter().enumerate() {
+        // Notable at keyframe rate (10 Hz) for a whole minute: at most one warning per retry
+        // interval, never one per solve.
+        let mut warnings = 0;
+        let mut summed = BaSolveTotals::default();
+        for k in 0..600 {
             let mut s = solve(10.0);
-            set(&mut s);
-            assert!(
-                matches!(
-                    log.observe(&s, 60.5 + i as f64 * 0.1),
-                    BaSolveVerdict::Notable { spike: false, .. }
-                ),
-                "count {i}"
-            );
+            counts[k % counts.len()](&mut s);
+            let v = log.observe(&s, 60.0 + BA_DIAG_NOTABLE_RETRY_SEC + k as f64 * 0.1);
+            if v != BaSolveVerdict::Quiet {
+                assert!(
+                    matches!(v, BaSolveVerdict::Notable { spike: false, .. }),
+                    "{k}: {v:?}"
+                );
+                warnings += 1;
+                let t = totals(v);
+                summed.solves += t.solves;
+                summed.notable += t.notable;
+                summed.depth_rows_gated += t.depth_rows_gated;
+                summed.reseeded += t.reseeded;
+                summed.cheirality_rejections += t.cheirality_rejections;
+                summed.cheirality_held += t.cheirality_held;
+                summed.write_back_refused += t.write_back_refused;
+            }
         }
-        // A notable line resets the period.
-        assert_eq!(log.observe(&solve(10.0), 61.0), BaSolveVerdict::Quiet);
+        let budget = (60.0 / BA_DIAG_NOTABLE_RETRY_SEC) as usize + 1;
+        assert!(
+            (1..=budget).contains(&warnings),
+            "{warnings} warnings in a minute"
+        );
+        // Each count, on its own solve, reached a line: nothing the throttle held is lost
+        // (the last few solves wait in the totals for the next line).
+        let pending = log.totals;
+        assert_eq!(summed.solves + pending.solves, 600);
+        assert_eq!(summed.notable + pending.notable, 600);
+        for (name, got) in [
+            ("gated", summed.depth_rows_gated + pending.depth_rows_gated),
+            ("reseeded", summed.reseeded + pending.reseeded),
+            (
+                "rejections",
+                summed.cheirality_rejections + pending.cheirality_rejections,
+            ),
+            ("held", summed.cheirality_held + pending.cheirality_held),
+            (
+                "refused",
+                summed.write_back_refused + pending.write_back_refused,
+            ),
+        ] {
+            assert_eq!(got, 120, "{name}");
+        }
+
+        // Held-back notable counts make even a quiet solve speak as a warning once the retry
+        // interval is up, not as the periodic info line.
+        let mut log = BaSolveLog::default();
+        log.observe(&solve(10.0), 0.0);
+        let mut s = solve(10.0);
+        s.points_rejected = 3;
+        assert_eq!(log.observe(&s, 1.0), BaSolveVerdict::Quiet);
+        let v = log.observe(&solve(10.0), BA_DIAG_NOTABLE_RETRY_SEC);
+        assert!(
+            matches!(v, BaSolveVerdict::Notable { spike: false, .. }),
+            "{v:?}"
+        );
+        assert_eq!(totals(v).write_back_refused, 3);
+        assert_eq!(totals(v).solves, 2);
     }
 
     /// The spike is against the median of the solves before it, needs the minimum history, and
@@ -8383,17 +8543,25 @@ mod tests {
         log.observe(&solve(f64::MAX), 7.0);
         assert_eq!(log.costs.len(), BA_DIAG_MIN_SAMPLES - 1);
         log.observe(&solve(10.0), 8.0);
-        assert_eq!(log.observe(&solve(1000.0), 9.0), BaSolveVerdict::Quiet);
-        assert_eq!(
-            log.observe(&solve(1000.1), 10.0),
-            BaSolveVerdict::Notable {
-                median_cost: 10.0,
-                spike: true
-            }
+        // Past the retry interval since the first line, so only the spike test decides.
+        let t0 = BA_DIAG_NOTABLE_RETRY_SEC;
+        assert_eq!(log.observe(&solve(1000.0), t0), BaSolveVerdict::Quiet);
+        let v = log.observe(&solve(1000.1), t0 + 1.0);
+        assert!(
+            matches!(
+                v,
+                BaSolveVerdict::Notable {
+                    median_cost: 10.0,
+                    spike: true,
+                    ..
+                }
+            ),
+            "{v:?}"
         );
+        assert_eq!(totals(v).spikes, 1);
         // The window is bounded.
         for i in 0..2 * BA_DIAG_COST_WINDOW {
-            log.observe(&solve(10.0), 11.0 + i as f64);
+            log.observe(&solve(10.0), t0 + 2.0 + i as f64);
         }
         assert_eq!(log.costs.len(), BA_DIAG_COST_WINDOW);
     }

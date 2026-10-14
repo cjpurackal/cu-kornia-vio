@@ -368,13 +368,17 @@ solves), `iterations`, `converged`, `depth_rows_gated` (stereo depth rows the so
 because the landmark's depth disagreed with them), `reseeded` (landmarks moved back along their
 ray to the measured depth), `cheirality_rejections` and `cheirality_held` (steps refused, or
 landmark steps held, for moving a landmark behind an observing camera) and `write_back_refused`
-(landmarks the solve left behind a camera or flung far, kept at their old position). It is a
-`warning!` whenever any of those counts is non-zero or the initial cost is past 100 times the
-running median (`cost_spike=true`), and otherwise an `info!` at most once a minute. It is logged
-even when the update is refused afterwards. Log-only: no `vio_diag` key carries it. Expect the
-`warning!` on most parked solves after the first keyframe cull: in a three-hour run of the test
-below, 230 of the 245 solves after it gated a few depth rows, held a landmark step or refused a
-few write-backs (one line per keyframe, about every 30 s parked); none tripped the cost spike.
+(landmarks the solve left behind a camera or flung far, kept at their old position), then
+`since_last:` and the same counts summed over every solve since the line last spoke, with
+`solves`, `notable` and `spikes`. A solve is notable when any of those counts is non-zero or its
+initial cost is past 100 times the running median (`cost_spike=true`). When a solve since the last
+line was notable the line is a `warning!`, at most once every 30 s; otherwise it is an `info!` at
+most once a minute. Nothing the throttle holds back is lost: its counts are in the next line's
+`since_last:` totals. It is logged even when the update is refused afterwards. Log-only: no
+`vio_diag` key carries it. The throttle is there because nearly every parked solve after the first
+keyframe cull is notable: in a three-hour run of the test below, 230 of the 245 solves after it
+gated a few depth rows, held a landmark step or refused a few write-backs (one solve per keyframe,
+about every 30 s parked, and at keyframe rate when moving); none tripped the cost spike.
 
 These are the figures of the parked failure kornia/kornia-slam#161 fixes: parked for an hour, a
 local BA after a keyframe cull flung landmarks out along their rays, and a later window solved
