@@ -98,8 +98,8 @@ use kornia_slam::mapping::culling::{
 };
 use kornia_slam::mapping::growth::accepted_pair_claims;
 use kornia_slam::mapping::map::{
-    ImuFactor, Keyframe, LandmarkSeed, Map, MapInsertion, ORB_N_LEVELS, ORB_SCALE_FACTOR,
-    ObservationKey,
+    ImuFactor, Keyframe, LandmarkSeed, LocalBaStats, Map, MapInsertion, ORB_N_LEVELS,
+    ORB_SCALE_FACTOR, ObservationKey,
 };
 use kornia_slam::mapping::stationary::StationaryFactor;
 use kornia_slam::mapping::wheel_odom::WheelOdomFactor;
@@ -800,6 +800,87 @@ fn should_log_throttled(
     }
 }
 
+/// Local inertial BA solves whose initial cost the spike test takes its median over.
+const BA_DIAG_COST_WINDOW: usize = 64;
+/// Solves recorded before an initial cost can be called a spike.
+const BA_DIAG_MIN_SAMPLES: usize = 8;
+/// An initial cost past this multiple of the running median is a spike.
+const BA_DIAG_SPIKE_FACTOR: f64 = 100.0;
+/// The `local BA` line speaks at least this often, seconds, when nothing is notable.
+const BA_DIAG_PERIOD_SEC: f64 = 60.0;
+
+/// When the `local BA` diagnostic line speaks: every solve with a notable figure (a depth row
+/// gated, a landmark re-seeded, a cheirality rejection or hold, a landmark refused at
+/// write-back, or an initial cost past [`BA_DIAG_SPIKE_FACTOR`] times its running median),
+/// otherwise once per [`BA_DIAG_PERIOD_SEC`]. Log-only: nothing reads it back.
+#[derive(Debug, Default)]
+struct BaSolveLog {
+    /// The last [`BA_DIAG_COST_WINDOW`] finite initial costs, oldest first.
+    costs: std::collections::VecDeque<f64>,
+    /// When the line last spoke, seconds.
+    last_sec: Option<f64>,
+}
+
+/// What [`BaSolveLog::observe`] decided for one solve.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum BaSolveVerdict {
+    /// Not logged.
+    Quiet,
+    /// The periodic line.
+    Periodic { median_cost: f64 },
+    /// A notable solve; `spike` when the initial cost tripped it.
+    Notable { median_cost: f64, spike: bool },
+}
+
+impl BaSolveLog {
+    /// Records one solve at `now_sec` and says whether, and why, to log it. The cost is
+    /// compared against the median of the solves BEFORE it, so a spike does not dilute its
+    /// own test.
+    fn observe(&mut self, s: &LocalBaStats, now_sec: f64) -> BaSolveVerdict {
+        let median_cost = self.median().unwrap_or(f64::NAN);
+        let spike = self.costs.len() >= BA_DIAG_MIN_SAMPLES
+            && median_cost > 0.0
+            && s.initial_cost.is_finite()
+            && s.initial_cost > BA_DIAG_SPIKE_FACTOR * median_cost;
+        // `f64::MAX` is the solver's "no iteration ran", not a cost.
+        if s.initial_cost.is_finite() && s.initial_cost < f64::MAX {
+            if self.costs.len() == BA_DIAG_COST_WINDOW {
+                self.costs.pop_front();
+            }
+            self.costs.push_back(s.initial_cost);
+        }
+        let counted = s.depth_rows_gated
+            + s.points_reseeded
+            + s.cheirality_rejections
+            + s.cheirality_points_held
+            + s.points_rejected
+            > 0;
+        let verdict = if counted || spike {
+            BaSolveVerdict::Notable { median_cost, spike }
+        } else if self
+            .last_sec
+            .is_none_or(|then| now_sec - then >= BA_DIAG_PERIOD_SEC)
+        {
+            BaSolveVerdict::Periodic { median_cost }
+        } else {
+            BaSolveVerdict::Quiet
+        };
+        if verdict != BaSolveVerdict::Quiet {
+            self.last_sec = Some(now_sec);
+        }
+        verdict
+    }
+
+    fn median(&self) -> Option<f64> {
+        if self.costs.is_empty() {
+            return None;
+        }
+        let mut sorted: Vec<f64> = self.costs.iter().copied().collect();
+        sorted.sort_by(f64::total_cmp);
+        Some(sorted[sorted.len() / 2])
+    }
+}
+
 /// The stages of the staged inertial initialization: the initial solve, then the refinements
 /// scheduled at 5 s and 15 s into the window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -982,6 +1063,8 @@ pub struct Tracker {
     /// When the BA-refusal line last spoke; see [`should_log_throttled`]. The lifetime count
     /// it prints carries the volume the throttle drops.
     last_ba_refusal_log: Option<(f64, bool)>,
+    /// The `local BA` diagnostic line's throttle and its running median of initial costs.
+    ba_solve_log: BaSolveLog,
     /// Monotonic count of frames received; stamped onto `Frame::idx`.
     next_frame_idx: usize,
     /// First timestamp seen; all internal times are seconds relative to it, so
@@ -1606,6 +1689,7 @@ impl Tracker {
             map_writes_refused: 0,
             ba_updates_refused: 0,
             last_ba_refusal_log: None,
+            ba_solve_log: BaSolveLog::default(),
             next_frame_idx: 0,
             epoch_ns: None,
             last_keyframe_timestamp_sec: None,
@@ -4849,6 +4933,12 @@ impl Tracker {
                 }
                 None => run_local_ba(snapshot, &self.camera),
             };
+            // What the inertial solve did (`run_local_ba` reports nothing). Read here, before
+            // the update is consumed, and logged whatever becomes of it below: a refused solve
+            // is the one whose figures matter most.
+            if let Some(s) = update.solve_stats().copied() {
+                self.log_ba_solve(&s, frame.idx, timestamp_sec);
+            }
             // Refused wholesale (a non-finite estimate or IMU factor, or a world frame that moved
             // since the snapshot, which cannot happen on this synchronous path): the map keeps
             // its pre-BA state, exactly what a solver failure has always left. Counted, because
@@ -6079,6 +6169,53 @@ impl Tracker {
             inert.stats.first_refinement_done = true;
         } else {
             inert.stats.second_refinement_done = true;
+        }
+    }
+
+    /// The `local BA` line: what one local inertial solve did (kornia-slam's
+    /// [`LocalBaStats`]), throttled by [`BaSolveLog`]. `warning!` on a notable solve, as the
+    /// motion-veto lines the same parked failure ends in (2026-10-13: a parked BA flung landmarks
+    /// out along their rays, a later window refused at 80 deg); `info!` for the periodic line.
+    /// Log-only.
+    fn log_ba_solve(&mut self, s: &LocalBaStats, frame_idx: usize, timestamp_sec: f64) {
+        let keyframes = self.map.keyframes().len();
+        match self.ba_solve_log.observe(s, timestamp_sec) {
+            BaSolveVerdict::Quiet => {}
+            BaSolveVerdict::Periodic { median_cost } => info!(
+                "local BA: frame={} keyframes={} initial_cost={} final_cost={} median_initial_cost={} \
+                 iterations={} converged={} depth_rows_gated={} reseeded={} cheirality_rejections={} \
+                 cheirality_held={} write_back_refused={}",
+                frame_idx,
+                keyframes,
+                s.initial_cost,
+                s.final_cost,
+                median_cost,
+                s.iterations,
+                s.converged,
+                s.depth_rows_gated,
+                s.points_reseeded,
+                s.cheirality_rejections,
+                s.cheirality_points_held,
+                s.points_rejected
+            ),
+            BaSolveVerdict::Notable { median_cost, spike } => warning!(
+                "local BA: frame={} keyframes={} initial_cost={} final_cost={} median_initial_cost={} \
+                 cost_spike={} iterations={} converged={} depth_rows_gated={} reseeded={} \
+                 cheirality_rejections={} cheirality_held={} write_back_refused={}",
+                frame_idx,
+                keyframes,
+                s.initial_cost,
+                s.final_cost,
+                median_cost,
+                spike,
+                s.iterations,
+                s.converged,
+                s.depth_rows_gated,
+                s.points_reseeded,
+                s.cheirality_rejections,
+                s.cheirality_points_held,
+                s.points_rejected
+            ),
         }
     }
 
@@ -8174,6 +8311,80 @@ mod tests {
         // plain time throttle would swallow, and it is the only line anyone actually waits for.
         assert!(due(Some((100.0, false)), 100.01, true));
         assert!(due(Some((100.0, true)), 100.01, false));
+    }
+
+    fn solve(initial_cost: f64) -> LocalBaStats {
+        let mut s = LocalBaStats::default();
+        s.initial_cost = initial_cost;
+        s.final_cost = initial_cost / 2.0;
+        s.iterations = 5;
+        s
+    }
+
+    /// A quiet solve speaks once per period; any count, or a spike, speaks every time and resets
+    /// the period.
+    #[test]
+    fn the_local_ba_line_speaks_on_every_notable_solve_and_once_a_minute_otherwise() {
+        let mut log = BaSolveLog::default();
+        assert!(matches!(
+            log.observe(&solve(10.0), 0.0),
+            BaSolveVerdict::Periodic { .. }
+        ));
+        assert_eq!(log.observe(&solve(10.0), 1.0), BaSolveVerdict::Quiet);
+        assert_eq!(log.observe(&solve(10.0), 59.9), BaSolveVerdict::Quiet);
+        assert!(matches!(
+            log.observe(&solve(10.0), 60.0),
+            BaSolveVerdict::Periodic { .. }
+        ));
+        // Each count on its own makes a solve notable, however recently the line spoke.
+        let counts: [fn(&mut LocalBaStats); 5] = [
+            |s| s.depth_rows_gated = 1,
+            |s| s.points_reseeded = 1,
+            |s| s.cheirality_rejections = 1,
+            |s| s.cheirality_points_held = 1,
+            |s| s.points_rejected = 1,
+        ];
+        for (i, set) in counts.iter().enumerate() {
+            let mut s = solve(10.0);
+            set(&mut s);
+            assert!(
+                matches!(
+                    log.observe(&s, 60.5 + i as f64 * 0.1),
+                    BaSolveVerdict::Notable { spike: false, .. }
+                ),
+                "count {i}"
+            );
+        }
+        // A notable line resets the period.
+        assert_eq!(log.observe(&solve(10.0), 61.0), BaSolveVerdict::Quiet);
+    }
+
+    /// The spike is against the median of the solves before it, needs the minimum history, and
+    /// ignores the solver's `f64::MAX` "no iteration ran".
+    #[test]
+    fn the_local_ba_line_calls_a_spike_past_100x_the_running_median() {
+        let mut log = BaSolveLog::default();
+        for i in 0..BA_DIAG_MIN_SAMPLES - 1 {
+            // Too little history: never a spike.
+            let v = log.observe(&solve(if i == 3 { 1e9 } else { 10.0 }), i as f64);
+            assert!(!matches!(v, BaSolveVerdict::Notable { .. }), "{i}: {v:?}");
+        }
+        log.observe(&solve(f64::MAX), 7.0);
+        assert_eq!(log.costs.len(), BA_DIAG_MIN_SAMPLES - 1);
+        log.observe(&solve(10.0), 8.0);
+        assert_eq!(log.observe(&solve(1000.0), 9.0), BaSolveVerdict::Quiet);
+        assert_eq!(
+            log.observe(&solve(1000.1), 10.0),
+            BaSolveVerdict::Notable {
+                median_cost: 10.0,
+                spike: true
+            }
+        );
+        // The window is bounded.
+        for i in 0..2 * BA_DIAG_COST_WINDOW {
+            log.observe(&solve(10.0), 11.0 + i as f64);
+        }
+        assert_eq!(log.costs.len(), BA_DIAG_COST_WINDOW);
     }
 
     /// The truth table above is the whole of `should_log_throttled`, so the loss caller needs no
