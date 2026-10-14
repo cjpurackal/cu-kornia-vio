@@ -1240,16 +1240,15 @@ mod tests {
     fn wheel_factor_at(pose: &Pose3d, sigma_m: f64, sigma_rad: f64) -> MotionFactor {
         // Base == camera, keyframe at identity, a zero-length interval measured at `pose`.
         let t_cb = Pose3d::IDENTITY;
-        let m = WheelOdomMeasurement {
-            delta: [0.0; 3],
-            covariance: [
+        let m = WheelOdomMeasurement::new(
+            [0.0; 3],
+            [
                 [sigma_m * sigma_m, 0.0, 0.0],
                 [0.0, sigma_m * sigma_m, 0.0],
                 [0.0, 0.0, sigma_rad * sigma_rad],
             ],
-            z_sigma: sigma_m,
-            tilt_sigma: sigma_rad,
-        };
+        )
+        .with_out_of_plane_sigmas(sigma_m, sigma_rad);
         // The keyframe placed so that the measurement's prediction is `pose`.
         MotionFactor::wheel(&m, t_cb, t_cb, pose, [0.0; 2]).expect("positive definite")
     }
@@ -1672,12 +1671,11 @@ mod tests {
         // 11 mm of translation sigma at the default 3 cm over the live run's 0.37 rad.
         assert!((c[0].sqrt() - 0.011).abs() < 5e-4, "{}", c[0].sqrt());
         // ...and the wheel factor carries it.
-        let m = WheelOdomMeasurement {
-            delta: [0.0, 0.0, theta],
-            covariance: [[1e-6, 0.0, 0.0], [0.0, 1e-6, 0.0], [0.0, 0.0, 1e-4]],
-            z_sigma: 0.01,
-            tilt_sigma: 0.01,
-        };
+        let m = WheelOdomMeasurement::new(
+            [0.0, 0.0, theta],
+            [[1e-6, 0.0, 0.0], [0.0, 1e-6, 0.0], [0.0, 0.0, 1e-4]],
+        )
+        .with_out_of_plane_sigmas(0.01, 0.01);
         let bare =
             MotionFactor::wheel(&m, Pose3d::IDENTITY, Pose3d::IDENTITY, &turn, [0.0; 2]).unwrap();
         let with =

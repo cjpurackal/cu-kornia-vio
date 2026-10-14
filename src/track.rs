@@ -2458,9 +2458,10 @@ impl Tracker {
             .position(|kf| keep.contains(&kf.frame.idx))
             .unwrap_or(keyframes.len());
         let before = keyframes.len();
-        let cfg = KeyframeCullingConfig {
-            protect_newest: cfg.protect_newest.max(before - oldest_kept),
-            ..cfg.clone()
+        let cfg = {
+            let mut c = cfg.clone();
+            c.protect_newest = cfg.protect_newest.max(before - oldest_kept);
+            c
         };
         let report = cull_redundant_keyframes(
             &mut self.map,
@@ -4466,13 +4467,13 @@ impl Tracker {
                     &self.camera,
                 )
             });
-        let evidence = KeyframeEvidence {
-            curr_idx: frame.idx,
-            last_keyframe_idx: self.state.last_keyframe_idx,
+        let evidence = KeyframeEvidence::new(
+            frame.idx,
+            self.state.last_keyframe_idx,
             tracked_inliers,
             n_ref_map_points,
-            median_parallax_px,
-        };
+        )
+        .with_median_parallax_px(median_parallax_px);
         let quality = KeyframePolicy {
             max_frames_between: usize::MAX,
             ..*policy
@@ -11816,10 +11817,9 @@ mod tests {
     const CULL_TEST_CAP: usize = 14;
 
     fn cull_test_config() -> KeyframeCullingConfig {
-        KeyframeCullingConfig {
-            min_keyframes: 4,
-            ..KeyframeCullingConfig::default()
-        }
+        let mut cfg = KeyframeCullingConfig::default();
+        cfg.min_keyframes = 4;
+        cfg
     }
 
     /// What one long run did.
@@ -12127,10 +12127,9 @@ mod tests {
         let mut tracker = parked_map(None, 100);
         let (before, culled) = (tracker.map().keyframes().len(), tracker.culled_keyframes());
         tracker.config.max_keyframes = Some(before + 1);
-        tracker.config.keyframe_culling = Some(KeyframeCullingConfig {
-            max_removals: 1,
-            ..cull_test_config()
-        });
+        let mut cull = cull_test_config();
+        cull.max_removals = 1;
+        tracker.config.keyframe_culling = Some(cull);
         let mut slot = 100;
         while tracker.culled_keyframes() == culled {
             assert!(slot < 120, "no insertion culled");
@@ -12965,10 +12964,9 @@ mod tests {
         const CAP: usize = 42;
         let mut t = stationary_tracker(|c| {
             c.max_keyframes = Some(CAP);
-            c.keyframe_culling = Some(KeyframeCullingConfig {
-                max_merged_imu_span_sec: 11.0,
-                ..KeyframeCullingConfig::default()
-            });
+            let mut cull = KeyframeCullingConfig::default();
+            cull.max_merged_imu_span_sec = 11.0;
+            c.keyframe_culling = Some(cull);
         });
         let (s0, _) = park_still_until_initialized(&mut t);
         let frame = view_frame(&t, &Pose3d::IDENTITY, None);
