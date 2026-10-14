@@ -1250,6 +1250,11 @@ pub struct Tracker {
     /// Test-only: which keyframes [`Self::inject_ba_move`] moves.
     #[cfg(test)]
     inject_ba_scope: BaMoveScope,
+    /// Test-only: the last local BA's largest keyframe move as the BA gate measured it,
+    /// (degrees, millimetres), the worst over the keyframes against their pre-BA poses and the
+    /// newest against the dead reckoning. Set only with the motion veto on.
+    #[cfg(test)]
+    last_ba_move: Option<(f64, f64)>,
     /// Test-only: replaces the next tracked frame's PnP pose (vision that tracked to garbage).
     #[cfg(test)]
     inject_vision_pose: Option<Pose3d>,
@@ -1751,6 +1756,8 @@ impl Tracker {
             inject_ba_move: None,
             #[cfg(test)]
             inject_ba_scope: BaMoveScope::Newest,
+            #[cfg(test)]
+            last_ba_move: None,
             #[cfg(test)]
             inject_vision_pose: None,
             #[cfg(test)]
@@ -5078,6 +5085,10 @@ impl Tracker {
                     )
                 {
                     consider(newest.frame.idx, d, true);
+                }
+                #[cfg(test)]
+                if let Some((_, d, _)) = worst {
+                    self.last_ba_move = Some((d.rotation_rad.to_degrees(), d.translation_m * 1e3));
                 }
                 if let Some((kf, d, dead_reckoned)) = worst
                     && d.vetoed()
@@ -14168,4 +14179,141 @@ mod tests {
         feed_moving(&mut t, seq, &|_t| Pose3d::IDENTITY, 0.0, &Pose3d::IDENTITY);
         assert_eq!(t.map_drops(), drops0 + 1, "the moved map was kept");
     }
+
+    /// Sensor noise on a rendered image: xorshift per pixel, +-`amp` grey levels.
+    fn noisy(img: &Image<u8, 1>, seed: u64, amp: i32) -> Image<u8, 1> {
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let px: Vec<u8> = img
+            .as_slice()
+            .iter()
+            .map(|&v| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                let n = (s % (2 * amp as u64 + 1)) as i32 - amp;
+                (i32::from(v) + n).clamp(0, 255) as u8
+            })
+            .collect();
+        Image::new(img.size(), px).expect("sized")
+    }
+
+    /// What [`park_for`] saw.
+    struct ParkedRun {
+        /// Seconds into the park of each culling pass.
+        culls_s: Vec<f64>,
+        /// Local BAs the gate measured.
+        bas: usize,
+        /// The largest keyframe move any of them made, (degrees, millimetres), and when.
+        worst: (f64, f64, f64),
+        /// When the BA gate first refused a solve, seconds into the park.
+        first_refusal_s: Option<f64>,
+        tracker: Tracker,
+    }
+
+    /// Parks the full pipeline (inertial, wheels, stationary edges, 120-keyframe cap with
+    /// culling, motion veto) in front of the rendered scene at 1 fps for `secs`, every pair with
+    /// +-12 grey levels of fresh noise, the IMU and the wheels still.
+    fn park_for(secs: u64) -> ParkedRun {
+        const SEC: u64 = 1_000_000_000;
+        const WHEEL_PERIOD_NS: u64 = 250_000_000;
+        let mut t = stationary_tracker(|c| {
+            c.max_keyframes = Some(120);
+            let mut cull = KeyframeCullingConfig::default();
+            cull.max_merged_imu_span_sec = 11.0;
+            c.keyframe_culling = Some(cull);
+            c.keyframe_policy.min_frames_between = 3;
+            c.keyframe_policy.max_frames_between = 8;
+            c.keyframe_policy.ref_ratio = 0.6;
+        });
+        assert!(
+            t.config.motion_veto.is_some(),
+            "the BA gate measures the moves"
+        );
+        let (s0, _) = park_still_until_initialized(&mut t);
+        let (l0, r0) = render_pair(&Pose3d::IDENTITY);
+        let t0 = stamp_of(s0 - 1);
+        let (mut imu_to, mut wheel_to) = (t0, t0);
+        let mut culled = t.culled_keyframes();
+        let mut run = ParkedRun {
+            culls_s: Vec::new(),
+            bas: 0,
+            worst: (0.0, 0.0, 0.0),
+            first_refusal_s: None,
+            tracker: t,
+        };
+        let t = &mut run.tracker;
+        for i in 1..=secs {
+            let stamp = t0 + i * SEC;
+            let samples = parked_imu(t, Some(imu_to), stamp, no_extra);
+            imu_to = stamp;
+            t.push_raw_imu(samples, 0, false).unwrap();
+            while wheel_to + WHEEL_PERIOD_NS <= stamp {
+                wheel_to += WHEEL_PERIOD_NS;
+                t.push_wheel([WheelSample {
+                    stamp_ns: wheel_to,
+                    x: 0.0,
+                    y: 0.0,
+                    theta: 0.0,
+                }])
+                .unwrap();
+            }
+            let (l, r) = (noisy(&l0, 2 * i, 12), noisy(&r0, 2 * i + 1, 12));
+            t.process_stereo(&l, &r, CuTime::from_nanos(stamp))
+                .expect("a valid pair");
+            let ts = i as f64;
+            if t.culled_keyframes() != culled {
+                culled = t.culled_keyframes();
+                run.culls_s.push(ts);
+            }
+            if let Some((deg, mm)) = t.last_ba_move.take() {
+                run.bas += 1;
+                if deg > run.worst.0 {
+                    (run.worst.0, run.worst.2) = (deg, ts);
+                }
+                run.worst.1 = run.worst.1.max(mm);
+            }
+            if run.first_refusal_s.is_none() && t.veto.stats.ba_refused > 0 {
+                run.first_refusal_s = Some(ts);
+            }
+        }
+        run
+    }
+
+    /// Mutation (core rule): stock kornia-slam bda9631 (before kornia/kornia-slam#161) turned
+    /// this red. 2026-10-13: parked for an hour, a local BA after a keyframe cull flung landmarks
+    /// out along their rays (no window could observe their depth), and a later window solved
+    /// against them moved a keyframe 80 deg / 2.2 m; the BA gate refused it and dropped the map.
+    /// Parked, every local BA must move every keyframe by well under a degree, across at least
+    /// two culling passes, and the gate must never refuse one.
+    ///
+    /// Two simulated hours, about 20 minutes on the Orin in release, so ignored by default. Run:
+    ///
+    /// `cargo test --release --lib parked_hours_with_sensor_noise -- --ignored --nocapture`
+    #[test]
+    #[ignore = "two simulated hours: ~20 min in release; run with --ignored"]
+    fn parked_hours_with_sensor_noise_never_refuses_a_local_ba() {
+        let run = park_for(PARKED_HOURS_SECS);
+        let t = &run.tracker;
+        let summary = format!(
+            "bas={} worst_deg={:.3} worst_mm={:.1} at {:.0} s, first_refusal_s={:?} \
+             ba_refused={} culls_s={:?} drops={} keyframes={}",
+            run.bas,
+            run.worst.0,
+            run.worst.1,
+            run.worst.2,
+            run.first_refusal_s,
+            t.veto.stats.ba_refused,
+            run.culls_s,
+            t.map_drops(),
+            t.map.keyframes().len()
+        );
+        eprintln!("parked hours: {summary}");
+        assert!(run.bas > 0, "the gate measured no BA: {summary}");
+        assert_eq!(t.veto.stats.ba_refused, 0, "{summary}");
+        assert!(run.worst.0 < 1.0, "{summary}");
+        assert!(run.culls_s.len() >= 2, "must cross two culls: {summary}");
+    }
+
+    /// Seconds [`parked_hours_with_sensor_noise_never_refuses_a_local_ba`] parks for.
+    const PARKED_HOURS_SECS: u64 = 2 * 3600;
 }
