@@ -1695,7 +1695,7 @@ dependencies = [
 [[package]]
 name = "kornia-sensors"
 version = "0.2.0"
-source = "git+https://github.com/kornia/kornia-slam?rev=6eccc164e42d40f2eece682e61aba42568254f5e#6eccc164e42d40f2eece682e61aba42568254f5e"
+source = "git+https://github.com/kornia/kornia-slam?rev=2cc71f3358b5e0e238a4949b1abc6a2061d9d6b5#2cc71f3358b5e0e238a4949b1abc6a2061d9d6b5"
 dependencies = [
  "glam 0.33.7",
  "kornia-3d",
@@ -1706,7 +1706,7 @@ dependencies = [
 [[package]]
 name = "kornia-slam"
 version = "0.2.0"
-source = "git+https://github.com/kornia/kornia-slam?rev=6eccc164e42d40f2eece682e61aba42568254f5e#6eccc164e42d40f2eece682e61aba42568254f5e"
+source = "git+https://github.com/kornia/kornia-slam?rev=2cc71f3358b5e0e238a4949b1abc6a2061d9d6b5#2cc71f3358b5e0e238a4949b1abc6a2061d9d6b5"
 dependencies = [
  "faer 0.22.6",
  "kornia-3d",

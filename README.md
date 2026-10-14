@@ -416,7 +416,7 @@ It applies in three directions:
   source even at identical code (v0.1.15 at `c9f9fd7` is the same code as 0.2.0), and splits
   `Image` in two. `kornia-slam` AND `kornia-sensors` (the latter is a workspace member of the
   kornia-slam repo, not of kornia-rs) are on one git `rev =`: the head of kornia/kornia-slam#161
-  (`6eccc16`: the parked-BA depth gate, landmark re-seed and write-back refusal, and constructors
+  (`2cc71f3`: the parked-BA depth gate, landmark re-seed and write-back refusal, and constructors
   for the `#[non_exhaustive]` factor types), on top of kornia-slam `main` at `bda9631` (the squash
   merge of #158: the wheel-odometry factor, stationary IMU init, parallax keyframes and culling).
   It is repinned to the squash merge of #161 on `main` once it lands. They move to crates.io at
@@ -432,7 +432,7 @@ It applies in three directions:
 
 `Cargo.lock` is tracked so that a clean clone builds: it holds a kornia-rs / kornia-slam pair
 known to compile together (kornia-rs 0.2.0 from crates.io, kornia-slam at the #161 head
-`6eccc16`). A consumer's own lock still wins, but a kornia-slam from before its move to crates.io kornia-rs
+`2cc71f3`). A consumer's own lock still wins, but a kornia-slam from before its move to crates.io kornia-rs
 (`6820744`) names git kornia-rs and splits the graph, and one from before its map-API rework
 does not compile against this crate.
 
