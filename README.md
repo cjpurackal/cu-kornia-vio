@@ -415,11 +415,11 @@ It applies in three directions:
   exact requirement kornia-slam uses. A git spelling of kornia-rs is a different
   source even at identical code (v0.1.15 at `c9f9fd7` is the same code as 0.2.0), and splits
   `Image` in two. `kornia-slam` AND `kornia-sensors` (the latter is a workspace member of the
-  kornia-slam repo, not of kornia-rs) are on one git `rev =`: the head of kornia/kornia-slam#161
-  (`2cc71f3`: the parked-BA depth gate, landmark re-seed and write-back refusal, and constructors
-  for the `#[non_exhaustive]` factor types), on top of kornia-slam `main` at `bda9631` (the squash
-  merge of #158: the wheel-odometry factor, stationary IMU init, parallax keyframes and culling).
-  It is repinned to the squash merge of #161 on `main` once it lands. They move to crates.io at
+  kornia-slam repo, not of kornia-rs) are on one git `rev =`: kornia-slam `main` at `539e4f1`,
+  the squash merge of kornia/kornia-slam#161 (the parked-BA depth gate, landmark re-seed and
+  write-back refusal, and constructors for the `#[non_exhaustive]` factor types), on top of
+  `bda9631` (the squash merge of #158: the wheel-odometry factor, stationary IMU init, parallax
+  keyframes and culling). They move to crates.io at
   the first release that carries it, and every consumer must move with them.
 - **this repo's own two crates**: a consumer naming both `cu-kornia-vio` and `cu-stereo-payloads`
   must give them the identical URL and the identical `branch = "main"`. `cu-kornia-vio` reaches the
@@ -431,8 +431,8 @@ It applies in three directions:
   `https://github.com/kornia/cu-kornia-vio` everywhere.
 
 `Cargo.lock` is tracked so that a clean clone builds: it holds a kornia-rs / kornia-slam pair
-known to compile together (kornia-rs 0.2.0 from crates.io, kornia-slam at the #161 head
-`2cc71f3`). A consumer's own lock still wins, but a kornia-slam from before its move to crates.io kornia-rs
+known to compile together (kornia-rs 0.2.0 from crates.io, kornia-slam `main` at
+`539e4f1`). A consumer's own lock still wins, but a kornia-slam from before its move to crates.io kornia-rs
 (`6820744`) names git kornia-rs and splits the graph, and one from before its map-API rework
 does not compile against this crate.
 
