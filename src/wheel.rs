@@ -296,12 +296,8 @@ impl WheelOdomConfig {
         cov[0][0] = cov[0][0].max(self.min_translation_sigma_m.powi(2));
         cov[1][1] = cov[1][1].max(self.min_translation_sigma_m.powi(2));
         cov[2][2] = cov[2][2].max(self.min_heading_sigma_rad.powi(2));
-        WheelOdomMeasurement {
-            delta: d.delta,
-            covariance: cov,
-            z_sigma: self.z_sigma.hypot(self.z_slope * d.path_m),
-            tilt_sigma: self.tilt_sigma,
-        }
+        WheelOdomMeasurement::new(d.delta, cov)
+            .with_out_of_plane_sigmas(self.z_sigma.hypot(self.z_slope * d.path_m), self.tilt_sigma)
     }
 }
 
@@ -780,14 +776,14 @@ impl WheelState {
             match self.delta(e.from_ns, e.to_ns, 0) {
                 Ok(d) => {
                     self.stats.edges_added += 1;
-                    let factor = WheelOdomFactor {
-                        from_idx: e.from_idx,
-                        to_idx: e.to_idx,
-                        measurement: self.cfg.measurement(&d),
-                        t_cb_from: self.t_cb_at(e.from_ns),
-                        t_cb_to: self.t_cb_at(e.to_ns),
-                        huber_chi2: self.cfg.huber_chi2,
-                    };
+                    let factor = WheelOdomFactor::new(
+                        e.from_idx,
+                        e.to_idx,
+                        self.cfg.measurement(&d),
+                        self.t_cb_at(e.from_ns),
+                        self.t_cb_at(e.to_ns),
+                        self.cfg.huber_chi2,
+                    );
                     self.factors.push(factor);
                     added.push((factor, d.path_m));
                 }

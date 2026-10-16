@@ -202,14 +202,13 @@ impl StationaryEdgeConfig {
         gyro: Option<StationaryGyro>,
         calib: kornia_sensors::imu::ImuCalib,
     ) -> StationaryFactor {
-        StationaryFactor {
-            gyro,
-            translation_sigma_m: self.translation_sigma_m,
-            rotation_sigma_rad: self.rotation_sigma_rad,
-            velocity_sigma_m_s: self.velocity_sigma_m_s,
-            huber_chi2: self.huber_chi2,
-            ..StationaryFactor::new(from_idx, to_idx, span_s, calib)
-        }
+        let mut factor = StationaryFactor::new(from_idx, to_idx, span_s, calib);
+        factor.gyro = gyro;
+        factor.translation_sigma_m = self.translation_sigma_m;
+        factor.rotation_sigma_rad = self.rotation_sigma_rad;
+        factor.velocity_sigma_m_s = self.velocity_sigma_m_s;
+        factor.huber_chi2 = self.huber_chi2;
+        factor
     }
 }
 
@@ -366,10 +365,8 @@ impl StationaryRun {
 
     /// The mean raw gyro rate over the still chunks, if any were checked.
     pub fn gyro(&self) -> Option<StationaryGyro> {
-        (self.covered_s > 0.0).then(|| StationaryGyro {
-            mean: self.gyro_dt_sum / self.covered_s,
-            covered_s: self.covered_s,
-        })
+        (self.covered_s > 0.0)
+            .then(|| StationaryGyro::new(self.gyro_dt_sum / self.covered_s, self.covered_s))
     }
 
     fn close(&mut self, why: RunClose) -> Option<RunClose> {

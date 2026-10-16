@@ -98,8 +98,8 @@ use kornia_slam::mapping::culling::{
 };
 use kornia_slam::mapping::growth::accepted_pair_claims;
 use kornia_slam::mapping::map::{
-    ImuFactor, Keyframe, LandmarkSeed, Map, MapInsertion, ORB_N_LEVELS, ORB_SCALE_FACTOR,
-    ObservationKey,
+    ImuFactor, Keyframe, LandmarkSeed, LocalBaStats, Map, MapInsertion, ORB_N_LEVELS,
+    ORB_SCALE_FACTOR, ObservationKey,
 };
 use kornia_slam::mapping::stationary::StationaryFactor;
 use kornia_slam::mapping::wheel_odom::WheelOdomFactor;
@@ -800,6 +800,153 @@ fn should_log_throttled(
     }
 }
 
+/// Local inertial BA solves whose initial cost the spike test takes its median over.
+const BA_DIAG_COST_WINDOW: usize = 64;
+/// Solves recorded before an initial cost can be called a spike.
+const BA_DIAG_MIN_SAMPLES: usize = 8;
+/// An initial cost past this multiple of the running median is a spike.
+const BA_DIAG_SPIKE_FACTOR: f64 = 100.0;
+/// The `local BA` line speaks at least this often, seconds, when nothing is notable.
+const BA_DIAG_PERIOD_SEC: f64 = 60.0;
+/// The `local BA` `warning!` speaks at most this often, seconds. Parked with kornia/kornia-slam#161
+/// nearly every solve after the first cull has a non-zero count (230 of 245 in the three-hour
+/// test), and moving, local BA runs at keyframe rate; unthrottled, the warning would be most
+/// solves and carry no signal.
+const BA_DIAG_NOTABLE_RETRY_SEC: f64 = 30.0;
+
+/// When the `local BA` diagnostic line speaks, and what it adds up in between. A solve is
+/// notable when it has a non-zero count (a depth row gated, a landmark re-seeded, a cheirality
+/// rejection or hold, a landmark refused at write-back) or an initial cost past
+/// [`BA_DIAG_SPIKE_FACTOR`] times its running median. A notable solve, or a quiet one after
+/// notable solves were held back, speaks as a `warning!` at most once per
+/// [`BA_DIAG_NOTABLE_RETRY_SEC`]; otherwise the `info!` line speaks once per
+/// [`BA_DIAG_PERIOD_SEC`]. Every line carries [`BaSolveTotals`] of all the solves since the line
+/// before it, so a solve the throttle held back still has its counts printed. Spikes go through
+/// the same throttle (after a cost regime change they can repeat for up to
+/// [`BA_DIAG_COST_WINDOW`] / 2 solves, until the median catches up) and are counted as
+/// `spikes`. Log-only: nothing reads it back.
+#[derive(Debug, Default)]
+struct BaSolveLog {
+    /// The last [`BA_DIAG_COST_WINDOW`] finite initial costs, oldest first.
+    costs: std::collections::VecDeque<f64>,
+    /// When the line last spoke, seconds.
+    last_sec: Option<f64>,
+    /// The solves since the line last spoke, this one included once observed.
+    totals: BaSolveTotals,
+}
+
+/// The counts of every local BA solve since the `local BA` line last spoke, the solve that makes
+/// it speak included.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct BaSolveTotals {
+    solves: usize,
+    /// Solves among them that were notable.
+    notable: usize,
+    spikes: usize,
+    depth_rows_gated: usize,
+    reseeded: usize,
+    cheirality_rejections: usize,
+    cheirality_held: usize,
+    write_back_refused: usize,
+}
+
+/// What [`BaSolveLog::observe`] decided for one solve.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum BaSolveVerdict {
+    /// Not logged; its counts wait in the totals for the next line.
+    Quiet,
+    /// The periodic line: no solve since the last line was notable.
+    Periodic {
+        median_cost: f64,
+        totals: BaSolveTotals,
+    },
+    /// The throttled warning: a solve since the last line was notable. `spike` when THIS
+    /// solve's initial cost tripped it.
+    Notable {
+        median_cost: f64,
+        spike: bool,
+        totals: BaSolveTotals,
+    },
+}
+
+impl BaSolveLog {
+    /// Records one solve at `now_sec` and says whether, and why, to log it. The cost is
+    /// compared against the median of the solves BEFORE it, so a spike does not dilute its
+    /// own test.
+    fn observe(&mut self, s: &LocalBaStats, now_sec: f64) -> BaSolveVerdict {
+        let median_cost = self.median().unwrap_or(f64::NAN);
+        let spike = self.costs.len() >= BA_DIAG_MIN_SAMPLES
+            && median_cost > 0.0
+            && s.initial_cost.is_finite()
+            && s.initial_cost > BA_DIAG_SPIKE_FACTOR * median_cost;
+        // `f64::MAX` is the solver's "no iteration ran", not a cost.
+        if s.initial_cost.is_finite() && s.initial_cost < f64::MAX {
+            if self.costs.len() == BA_DIAG_COST_WINDOW {
+                self.costs.pop_front();
+            }
+            self.costs.push_back(s.initial_cost);
+        }
+        let counted = s.depth_rows_gated
+            + s.points_reseeded
+            + s.cheirality_rejections
+            + s.cheirality_points_held
+            + s.points_rejected
+            > 0;
+        let t = &mut self.totals;
+        t.solves += 1;
+        t.notable += usize::from(counted || spike);
+        t.spikes += usize::from(spike);
+        t.depth_rows_gated += s.depth_rows_gated;
+        t.reseeded += s.points_reseeded;
+        t.cheirality_rejections += s.cheirality_rejections;
+        t.cheirality_held += s.cheirality_points_held;
+        t.write_back_refused += s.points_rejected;
+        let totals = *t;
+        // A plain time throttle with a constant verdict: passing `notable` instead would make
+        // every notable/quiet alternation a "flip" that always speaks.
+        let verdict = if totals.notable > 0 {
+            if should_log_throttled(
+                self.last_sec.map(|then| (then, true)),
+                now_sec,
+                true,
+                BA_DIAG_NOTABLE_RETRY_SEC,
+            ) {
+                BaSolveVerdict::Notable {
+                    median_cost,
+                    spike,
+                    totals,
+                }
+            } else {
+                BaSolveVerdict::Quiet
+            }
+        } else if self
+            .last_sec
+            .is_none_or(|then| now_sec - then >= BA_DIAG_PERIOD_SEC)
+        {
+            BaSolveVerdict::Periodic {
+                median_cost,
+                totals,
+            }
+        } else {
+            BaSolveVerdict::Quiet
+        };
+        if verdict != BaSolveVerdict::Quiet {
+            self.last_sec = Some(now_sec);
+            self.totals = BaSolveTotals::default();
+        }
+        verdict
+    }
+
+    fn median(&self) -> Option<f64> {
+        if self.costs.is_empty() {
+            return None;
+        }
+        let mut sorted: Vec<f64> = self.costs.iter().copied().collect();
+        sorted.sort_by(f64::total_cmp);
+        Some(sorted[sorted.len() / 2])
+    }
+}
+
 /// The stages of the staged inertial initialization: the initial solve, then the refinements
 /// scheduled at 5 s and 15 s into the window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -982,6 +1129,8 @@ pub struct Tracker {
     /// When the BA-refusal line last spoke; see [`should_log_throttled`]. The lifetime count
     /// it prints carries the volume the throttle drops.
     last_ba_refusal_log: Option<(f64, bool)>,
+    /// The `local BA` diagnostic line's throttle and its running median of initial costs.
+    ba_solve_log: BaSolveLog,
     /// Monotonic count of frames received; stamped onto `Frame::idx`.
     next_frame_idx: usize,
     /// First timestamp seen; all internal times are seconds relative to it, so
@@ -1167,6 +1316,11 @@ pub struct Tracker {
     /// Test-only: which keyframes [`Self::inject_ba_move`] moves.
     #[cfg(test)]
     inject_ba_scope: BaMoveScope,
+    /// Test-only: the last local BA's largest keyframe move as the BA gate measured it,
+    /// (degrees, millimetres), the worst over the keyframes against their pre-BA poses and the
+    /// newest against the dead reckoning. Set only with the motion veto on.
+    #[cfg(test)]
+    last_ba_move: Option<(f64, f64)>,
     /// Test-only: replaces the next tracked frame's PnP pose (vision that tracked to garbage).
     #[cfg(test)]
     inject_vision_pose: Option<Pose3d>,
@@ -1606,6 +1760,7 @@ impl Tracker {
             map_writes_refused: 0,
             ba_updates_refused: 0,
             last_ba_refusal_log: None,
+            ba_solve_log: BaSolveLog::default(),
             next_frame_idx: 0,
             epoch_ns: None,
             last_keyframe_timestamp_sec: None,
@@ -1667,6 +1822,8 @@ impl Tracker {
             inject_ba_move: None,
             #[cfg(test)]
             inject_ba_scope: BaMoveScope::Newest,
+            #[cfg(test)]
+            last_ba_move: None,
             #[cfg(test)]
             inject_vision_pose: None,
             #[cfg(test)]
@@ -2458,9 +2615,10 @@ impl Tracker {
             .position(|kf| keep.contains(&kf.frame.idx))
             .unwrap_or(keyframes.len());
         let before = keyframes.len();
-        let cfg = KeyframeCullingConfig {
-            protect_newest: cfg.protect_newest.max(before - oldest_kept),
-            ..cfg.clone()
+        let cfg = {
+            let mut c = cfg.clone();
+            c.protect_newest = cfg.protect_newest.max(before - oldest_kept);
+            c
         };
         let report = cull_redundant_keyframes(
             &mut self.map,
@@ -4466,13 +4624,13 @@ impl Tracker {
                     &self.camera,
                 )
             });
-        let evidence = KeyframeEvidence {
-            curr_idx: frame.idx,
-            last_keyframe_idx: self.state.last_keyframe_idx,
+        let evidence = KeyframeEvidence::new(
+            frame.idx,
+            self.state.last_keyframe_idx,
             tracked_inliers,
             n_ref_map_points,
-            median_parallax_px,
-        };
+        )
+        .with_median_parallax_px(median_parallax_px);
         let quality = KeyframePolicy {
             max_frames_between: usize::MAX,
             ..*policy
@@ -4848,6 +5006,12 @@ impl Tracker {
                 }
                 None => run_local_ba(snapshot, &self.camera),
             };
+            // What the inertial solve did (`run_local_ba` reports nothing). Read here, before
+            // the update is consumed, and logged whatever becomes of it below: a refused solve
+            // is the one whose figures matter most.
+            if let Some(s) = update.solve_stats().copied() {
+                self.log_ba_solve(&s, frame.idx, timestamp_sec);
+            }
             // Refused wholesale (a non-finite estimate or IMU factor, or a world frame that moved
             // since the snapshot, which cannot happen on this synchronous path): the map keeps
             // its pre-BA state, exactly what a solver failure has always left. Counted, because
@@ -4987,6 +5151,10 @@ impl Tracker {
                     )
                 {
                     consider(newest.frame.idx, d, true);
+                }
+                #[cfg(test)]
+                if let Some((_, d, _)) = worst {
+                    self.last_ba_move = Some((d.rotation_rad.to_degrees(), d.translation_m * 1e3));
                 }
                 if let Some((kf, d, dead_reckoned)) = worst
                     && d.vetoed()
@@ -6078,6 +6246,81 @@ impl Tracker {
             inert.stats.first_refinement_done = true;
         } else {
             inert.stats.second_refinement_done = true;
+        }
+    }
+
+    /// The `local BA` line: what one local inertial solve did (kornia-slam's
+    /// [`LocalBaStats`]), and the summed counts of every solve since the line last spoke
+    /// (`since_last:`), throttled by [`BaSolveLog`]. `warning!` when a solve since the last line
+    /// was notable, at most once per [`BA_DIAG_NOTABLE_RETRY_SEC`], as the motion-veto lines the
+    /// same parked failure ends in (2026-10-13: a parked BA flung landmarks out along their rays,
+    /// a later window refused at 80 deg); `info!` for the periodic line. Log-only.
+    fn log_ba_solve(&mut self, s: &LocalBaStats, frame_idx: usize, timestamp_sec: f64) {
+        let keyframes = self.map.keyframes().len();
+        match self.ba_solve_log.observe(s, timestamp_sec) {
+            BaSolveVerdict::Quiet => {}
+            BaSolveVerdict::Periodic {
+                median_cost,
+                totals: t,
+            } => info!(
+                "local BA: frame={} keyframes={} initial_cost={} final_cost={} median_initial_cost={} \
+                 iterations={} converged={} depth_rows_gated={} reseeded={} cheirality_rejections={} \
+                 cheirality_held={} write_back_refused={} since_last: solves={} notable={} spikes={} \
+                 depth_rows_gated={} reseeded={} cheirality_rejections={} cheirality_held={} \
+                 write_back_refused={}",
+                frame_idx,
+                keyframes,
+                s.initial_cost,
+                s.final_cost,
+                median_cost,
+                s.iterations,
+                s.converged,
+                s.depth_rows_gated,
+                s.points_reseeded,
+                s.cheirality_rejections,
+                s.cheirality_points_held,
+                s.points_rejected,
+                t.solves,
+                t.notable,
+                t.spikes,
+                t.depth_rows_gated,
+                t.reseeded,
+                t.cheirality_rejections,
+                t.cheirality_held,
+                t.write_back_refused
+            ),
+            BaSolveVerdict::Notable {
+                median_cost,
+                spike,
+                totals: t,
+            } => warning!(
+                "local BA: frame={} keyframes={} initial_cost={} final_cost={} median_initial_cost={} \
+                 cost_spike={} iterations={} converged={} depth_rows_gated={} reseeded={} \
+                 cheirality_rejections={} cheirality_held={} write_back_refused={} since_last: \
+                 solves={} notable={} spikes={} depth_rows_gated={} reseeded={} \
+                 cheirality_rejections={} cheirality_held={} write_back_refused={}",
+                frame_idx,
+                keyframes,
+                s.initial_cost,
+                s.final_cost,
+                median_cost,
+                spike,
+                s.iterations,
+                s.converged,
+                s.depth_rows_gated,
+                s.points_reseeded,
+                s.cheirality_rejections,
+                s.cheirality_points_held,
+                s.points_rejected,
+                t.solves,
+                t.notable,
+                t.spikes,
+                t.depth_rows_gated,
+                t.reseeded,
+                t.cheirality_rejections,
+                t.cheirality_held,
+                t.write_back_refused
+            ),
         }
     }
 
@@ -8173,6 +8416,154 @@ mod tests {
         // plain time throttle would swallow, and it is the only line anyone actually waits for.
         assert!(due(Some((100.0, false)), 100.01, true));
         assert!(due(Some((100.0, true)), 100.01, false));
+    }
+
+    fn solve(initial_cost: f64) -> LocalBaStats {
+        let mut s = LocalBaStats::default();
+        s.initial_cost = initial_cost;
+        s.final_cost = initial_cost / 2.0;
+        s.iterations = 5;
+        s
+    }
+
+    fn totals(v: BaSolveVerdict) -> BaSolveTotals {
+        match v {
+            BaSolveVerdict::Quiet => panic!("quiet verdict has no totals"),
+            BaSolveVerdict::Periodic { totals, .. } | BaSolveVerdict::Notable { totals, .. } => {
+                totals
+            }
+        }
+    }
+
+    /// A quiet solve speaks once per period. Each count on its own makes a solve notable, and the
+    /// notable warning speaks at most once per retry interval, however many solves are notable;
+    /// the solves it held back reach the next line's totals.
+    #[test]
+    fn the_local_ba_line_throttles_notable_solves_and_carries_their_counts() {
+        let mut log = BaSolveLog::default();
+        assert!(matches!(
+            log.observe(&solve(10.0), 0.0),
+            BaSolveVerdict::Periodic { .. }
+        ));
+        assert_eq!(log.observe(&solve(10.0), 1.0), BaSolveVerdict::Quiet);
+        assert_eq!(log.observe(&solve(10.0), 59.9), BaSolveVerdict::Quiet);
+        let v = log.observe(&solve(10.0), 60.0);
+        assert!(matches!(v, BaSolveVerdict::Periodic { .. }), "{v:?}");
+        assert_eq!(
+            totals(v),
+            BaSolveTotals {
+                solves: 3,
+                ..Default::default()
+            }
+        );
+
+        let counts: [fn(&mut LocalBaStats); 5] = [
+            |s| s.depth_rows_gated = 1,
+            |s| s.points_reseeded = 1,
+            |s| s.cheirality_rejections = 1,
+            |s| s.cheirality_points_held = 1,
+            |s| s.points_rejected = 1,
+        ];
+        // Notable at keyframe rate (10 Hz) for a whole minute: at most one warning per retry
+        // interval, never one per solve.
+        let mut warnings = 0;
+        let mut summed = BaSolveTotals::default();
+        for k in 0..600 {
+            let mut s = solve(10.0);
+            counts[k % counts.len()](&mut s);
+            let v = log.observe(&s, 60.0 + BA_DIAG_NOTABLE_RETRY_SEC + k as f64 * 0.1);
+            if v != BaSolveVerdict::Quiet {
+                assert!(
+                    matches!(v, BaSolveVerdict::Notable { spike: false, .. }),
+                    "{k}: {v:?}"
+                );
+                warnings += 1;
+                let t = totals(v);
+                summed.solves += t.solves;
+                summed.notable += t.notable;
+                summed.depth_rows_gated += t.depth_rows_gated;
+                summed.reseeded += t.reseeded;
+                summed.cheirality_rejections += t.cheirality_rejections;
+                summed.cheirality_held += t.cheirality_held;
+                summed.write_back_refused += t.write_back_refused;
+            }
+        }
+        let budget = (60.0 / BA_DIAG_NOTABLE_RETRY_SEC) as usize + 1;
+        assert!(
+            (1..=budget).contains(&warnings),
+            "{warnings} warnings in a minute"
+        );
+        // Each count, on its own solve, reached a line: nothing the throttle held is lost
+        // (the last few solves wait in the totals for the next line).
+        let pending = log.totals;
+        assert_eq!(summed.solves + pending.solves, 600);
+        assert_eq!(summed.notable + pending.notable, 600);
+        for (name, got) in [
+            ("gated", summed.depth_rows_gated + pending.depth_rows_gated),
+            ("reseeded", summed.reseeded + pending.reseeded),
+            (
+                "rejections",
+                summed.cheirality_rejections + pending.cheirality_rejections,
+            ),
+            ("held", summed.cheirality_held + pending.cheirality_held),
+            (
+                "refused",
+                summed.write_back_refused + pending.write_back_refused,
+            ),
+        ] {
+            assert_eq!(got, 120, "{name}");
+        }
+
+        // Held-back notable counts make even a quiet solve speak as a warning once the retry
+        // interval is up, not as the periodic info line.
+        let mut log = BaSolveLog::default();
+        log.observe(&solve(10.0), 0.0);
+        let mut s = solve(10.0);
+        s.points_rejected = 3;
+        assert_eq!(log.observe(&s, 1.0), BaSolveVerdict::Quiet);
+        let v = log.observe(&solve(10.0), BA_DIAG_NOTABLE_RETRY_SEC);
+        assert!(
+            matches!(v, BaSolveVerdict::Notable { spike: false, .. }),
+            "{v:?}"
+        );
+        assert_eq!(totals(v).write_back_refused, 3);
+        assert_eq!(totals(v).solves, 2);
+    }
+
+    /// The spike is against the median of the solves before it, needs the minimum history, and
+    /// ignores the solver's `f64::MAX` "no iteration ran".
+    #[test]
+    fn the_local_ba_line_calls_a_spike_past_100x_the_running_median() {
+        let mut log = BaSolveLog::default();
+        for i in 0..BA_DIAG_MIN_SAMPLES - 1 {
+            // Too little history: never a spike.
+            let v = log.observe(&solve(if i == 3 { 1e9 } else { 10.0 }), i as f64);
+            assert!(!matches!(v, BaSolveVerdict::Notable { .. }), "{i}: {v:?}");
+        }
+        log.observe(&solve(f64::MAX), 7.0);
+        assert_eq!(log.costs.len(), BA_DIAG_MIN_SAMPLES - 1);
+        log.observe(&solve(10.0), 8.0);
+        // Past the retry interval since the first line, so only the spike test decides.
+        let t0 = BA_DIAG_NOTABLE_RETRY_SEC;
+        assert_eq!(log.observe(&solve(1000.0), t0), BaSolveVerdict::Quiet);
+        let v = log.observe(&solve(1000.1), t0 + 1.0);
+        assert!(
+            matches!(
+                v,
+                BaSolveVerdict::Notable {
+                    median_cost: 10.0,
+                    spike: true,
+                    ..
+                }
+            ),
+            "{v:?}"
+        );
+        assert_eq!(totals(v).spikes, 1);
+        // The window is bounded.
+        for i in 0..2 * BA_DIAG_COST_WINDOW {
+            log.observe(&solve(10.0), t0 + 2.0 + i as f64);
+        }
+        assert_eq!(log.costs.len(), BA_DIAG_COST_WINDOW);
     }
 
     /// The truth table above is the whole of `should_log_throttled`, so the loss caller needs no
@@ -11816,10 +12207,9 @@ mod tests {
     const CULL_TEST_CAP: usize = 14;
 
     fn cull_test_config() -> KeyframeCullingConfig {
-        KeyframeCullingConfig {
-            min_keyframes: 4,
-            ..KeyframeCullingConfig::default()
-        }
+        let mut cfg = KeyframeCullingConfig::default();
+        cfg.min_keyframes = 4;
+        cfg
     }
 
     /// What one long run did.
@@ -12127,10 +12517,9 @@ mod tests {
         let mut tracker = parked_map(None, 100);
         let (before, culled) = (tracker.map().keyframes().len(), tracker.culled_keyframes());
         tracker.config.max_keyframes = Some(before + 1);
-        tracker.config.keyframe_culling = Some(KeyframeCullingConfig {
-            max_removals: 1,
-            ..cull_test_config()
-        });
+        let mut cull = cull_test_config();
+        cull.max_removals = 1;
+        tracker.config.keyframe_culling = Some(cull);
         let mut slot = 100;
         while tracker.culled_keyframes() == culled {
             assert!(slot < 120, "no insertion culled");
@@ -12965,10 +13354,9 @@ mod tests {
         const CAP: usize = 42;
         let mut t = stationary_tracker(|c| {
             c.max_keyframes = Some(CAP);
-            c.keyframe_culling = Some(KeyframeCullingConfig {
-                max_merged_imu_span_sec: 11.0,
-                ..KeyframeCullingConfig::default()
-            });
+            let mut cull = KeyframeCullingConfig::default();
+            cull.max_merged_imu_span_sec = 11.0;
+            c.keyframe_culling = Some(cull);
         });
         let (s0, _) = park_still_until_initialized(&mut t);
         let frame = view_frame(&t, &Pose3d::IDENTITY, None);
@@ -13959,4 +14347,141 @@ mod tests {
         feed_moving(&mut t, seq, &|_t| Pose3d::IDENTITY, 0.0, &Pose3d::IDENTITY);
         assert_eq!(t.map_drops(), drops0 + 1, "the moved map was kept");
     }
+
+    /// Sensor noise on a rendered image: xorshift per pixel, +-`amp` grey levels.
+    fn noisy(img: &Image<u8, 1>, seed: u64, amp: i32) -> Image<u8, 1> {
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let px: Vec<u8> = img
+            .as_slice()
+            .iter()
+            .map(|&v| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                let n = (s % (2 * amp as u64 + 1)) as i32 - amp;
+                (i32::from(v) + n).clamp(0, 255) as u8
+            })
+            .collect();
+        Image::new(img.size(), px).expect("sized")
+    }
+
+    /// What [`park_for`] saw.
+    struct ParkedRun {
+        /// Seconds into the park of each culling pass.
+        culls_s: Vec<f64>,
+        /// Local BAs the gate measured.
+        bas: usize,
+        /// The largest keyframe move any of them made, (degrees, millimetres), and when.
+        worst: (f64, f64, f64),
+        /// When the BA gate first refused a solve, seconds into the park.
+        first_refusal_s: Option<f64>,
+        tracker: Tracker,
+    }
+
+    /// Parks the full pipeline (inertial, wheels, stationary edges, 120-keyframe cap with
+    /// culling, motion veto) in front of the rendered scene at 1 fps for `secs`, every pair with
+    /// +-12 grey levels of fresh noise, the IMU and the wheels still.
+    fn park_for(secs: u64) -> ParkedRun {
+        const SEC: u64 = 1_000_000_000;
+        const WHEEL_PERIOD_NS: u64 = 250_000_000;
+        let mut t = stationary_tracker(|c| {
+            c.max_keyframes = Some(120);
+            let mut cull = KeyframeCullingConfig::default();
+            cull.max_merged_imu_span_sec = 11.0;
+            c.keyframe_culling = Some(cull);
+            c.keyframe_policy.min_frames_between = 3;
+            c.keyframe_policy.max_frames_between = 8;
+            c.keyframe_policy.ref_ratio = 0.6;
+        });
+        assert!(
+            t.config.motion_veto.is_some(),
+            "the BA gate measures the moves"
+        );
+        let (s0, _) = park_still_until_initialized(&mut t);
+        let (l0, r0) = render_pair(&Pose3d::IDENTITY);
+        let t0 = stamp_of(s0 - 1);
+        let (mut imu_to, mut wheel_to) = (t0, t0);
+        let mut culled = t.culled_keyframes();
+        let mut run = ParkedRun {
+            culls_s: Vec::new(),
+            bas: 0,
+            worst: (0.0, 0.0, 0.0),
+            first_refusal_s: None,
+            tracker: t,
+        };
+        let t = &mut run.tracker;
+        for i in 1..=secs {
+            let stamp = t0 + i * SEC;
+            let samples = parked_imu(t, Some(imu_to), stamp, no_extra);
+            imu_to = stamp;
+            t.push_raw_imu(samples, 0, false).unwrap();
+            while wheel_to + WHEEL_PERIOD_NS <= stamp {
+                wheel_to += WHEEL_PERIOD_NS;
+                t.push_wheel([WheelSample {
+                    stamp_ns: wheel_to,
+                    x: 0.0,
+                    y: 0.0,
+                    theta: 0.0,
+                }])
+                .unwrap();
+            }
+            let (l, r) = (noisy(&l0, 2 * i, 12), noisy(&r0, 2 * i + 1, 12));
+            t.process_stereo(&l, &r, CuTime::from_nanos(stamp))
+                .expect("a valid pair");
+            let ts = i as f64;
+            if t.culled_keyframes() != culled {
+                culled = t.culled_keyframes();
+                run.culls_s.push(ts);
+            }
+            if let Some((deg, mm)) = t.last_ba_move.take() {
+                run.bas += 1;
+                if deg > run.worst.0 {
+                    (run.worst.0, run.worst.2) = (deg, ts);
+                }
+                run.worst.1 = run.worst.1.max(mm);
+            }
+            if run.first_refusal_s.is_none() && t.veto.stats.ba_refused > 0 {
+                run.first_refusal_s = Some(ts);
+            }
+        }
+        run
+    }
+
+    /// Mutation (core rule): stock kornia-slam bda9631 (before kornia/kornia-slam#161) turned
+    /// this red. 2026-10-13: parked for an hour, a local BA after a keyframe cull flung landmarks
+    /// out along their rays (no window could observe their depth), and a later window solved
+    /// against them moved a keyframe 80 deg / 2.2 m; the BA gate refused it and dropped the map.
+    /// Parked, every local BA must move every keyframe by well under a degree, across at least
+    /// two culling passes, and the gate must never refuse one.
+    ///
+    /// Two simulated hours, about 20 minutes on the Orin in release, so ignored by default. Run:
+    ///
+    /// `cargo test --release --lib parked_hours_with_sensor_noise -- --ignored --nocapture`
+    #[test]
+    #[ignore = "two simulated hours: ~20 min in release; run with --ignored"]
+    fn parked_hours_with_sensor_noise_never_refuses_a_local_ba() {
+        let run = park_for(PARKED_HOURS_SECS);
+        let t = &run.tracker;
+        let summary = format!(
+            "bas={} worst_deg={:.3} worst_mm={:.1} at {:.0} s, first_refusal_s={:?} \
+             ba_refused={} culls_s={:?} drops={} keyframes={}",
+            run.bas,
+            run.worst.0,
+            run.worst.1,
+            run.worst.2,
+            run.first_refusal_s,
+            t.veto.stats.ba_refused,
+            run.culls_s,
+            t.map_drops(),
+            t.map.keyframes().len()
+        );
+        eprintln!("parked hours: {summary}");
+        assert!(run.bas > 0, "the gate measured no BA: {summary}");
+        assert_eq!(t.veto.stats.ba_refused, 0, "{summary}");
+        assert!(run.worst.0 < 1.0, "{summary}");
+        assert!(run.culls_s.len() >= 2, "must cross two culls: {summary}");
+    }
+
+    /// Seconds [`parked_hours_with_sensor_noise_never_refuses_a_local_ba`] parks for.
+    const PARKED_HOURS_SECS: u64 = 2 * 3600;
 }

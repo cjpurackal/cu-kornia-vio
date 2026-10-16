@@ -360,6 +360,37 @@ Each sensor is checked only when it measured the interval, so with neither nothi
 `vio_diag`'s `veto` record counts vetoes, dead-reckoned frames, recoveries, timeout re-anchors and
 refused BA solves.
 
+### The `local BA` line
+
+After each local inertial BA the tracker logs what the solve did, from kornia-slam's
+`BaUpdate::solve_stats`: `initial_cost`, `final_cost`, `median_initial_cost` (of the previous 64
+solves), `iterations`, `converged`, `depth_rows_gated` (stereo depth rows the solver left out
+because the landmark's depth disagreed with them), `reseeded` (landmarks moved back along their
+ray to the measured depth), `cheirality_rejections` and `cheirality_held` (steps refused, or
+landmark steps held, for moving a landmark behind an observing camera) and `write_back_refused`
+(landmarks the solve left behind a camera or flung far, kept at their old position), then
+`since_last:` and the same counts summed over every solve since the line last spoke, with
+`solves`, `notable` and `spikes`. A solve is notable when any of those counts is non-zero or its
+initial cost is past 100 times the running median (`cost_spike=true`). When a solve since the last
+line was notable the line is a `warning!`, at most once every 30 s; otherwise it is an `info!` at
+most once a minute. Nothing the throttle holds back is lost: its counts are in the next line's
+`since_last:` totals. It is logged even when the update is refused afterwards. Log-only: no
+`vio_diag` key carries it. The throttle is there because nearly every parked solve after the first
+keyframe cull is notable: in a three-hour run of the test below, 230 of the 245 solves after it
+gated a few depth rows, held a landmark step or refused a few write-backs (one solve per keyframe,
+about every 30 s parked, and at keyframe rate when moving); none tripped the cost spike.
+
+These are the figures of the parked failure kornia/kornia-slam#161 fixes: parked for an hour, a
+local BA after a keyframe cull flung landmarks out along their rays, and a later window solved
+against them moved a keyframe 80 deg / 2.2 m (a `motion veto: local BA refused` line and a map
+drop). The regression test parks the full pipeline for two simulated hours with sensor noise and
+requires no refused BA and every BA move under 1 deg across at least two culls. It takes
+about 20 minutes in release on the Orin, so it is ignored by default:
+
+```sh
+cargo test --release --lib parked_hours_with_sensor_noise -- --ignored --nocapture
+```
+
 ## Documentation and development
 
 ```sh
@@ -384,10 +415,12 @@ It applies in three directions:
   exact requirement kornia-slam uses. A git spelling of kornia-rs is a different
   source even at identical code (v0.1.15 at `c9f9fd7` is the same code as 0.2.0), and splits
   `Image` in two. `kornia-slam` AND `kornia-sensors` (the latter is a workspace member of the
-  kornia-slam repo, not of kornia-rs) are on one git `rev =`: kornia-slam `main` at `bda9631`,
-  the squash merge of kornia/kornia-slam#158, which carries the wheel-odometry factor, stationary
-  IMU init, parallax keyframes and culling this crate uses. They move to crates.io at the first
-  release that carries it, and every consumer must move with them.
+  kornia-slam repo, not of kornia-rs) are on one git `rev =`: kornia-slam `main` at `539e4f1`,
+  the squash merge of kornia/kornia-slam#161 (the parked-BA depth gate, landmark re-seed and
+  write-back refusal, and constructors for the `#[non_exhaustive]` factor types), on top of
+  `bda9631` (the squash merge of #158: the wheel-odometry factor, stationary IMU init, parallax
+  keyframes and culling). They move to crates.io at
+  the first release that carries it, and every consumer must move with them.
 - **this repo's own two crates**: a consumer naming both `cu-kornia-vio` and `cu-stereo-payloads`
   must give them the identical URL and the identical `branch = "main"`. `cu-kornia-vio` reaches the
   payload crate by path, so it inherits the git source it was itself pulled from; pinning the
@@ -398,8 +431,8 @@ It applies in three directions:
   `https://github.com/kornia/cu-kornia-vio` everywhere.
 
 `Cargo.lock` is tracked so that a clean clone builds: it holds a kornia-rs / kornia-slam pair
-known to compile together (kornia-rs 0.2.0 from crates.io, kornia-slam `main` at `bda9631`). A
-consumer's own lock still wins, but a kornia-slam from before its move to crates.io kornia-rs
+known to compile together (kornia-rs 0.2.0 from crates.io, kornia-slam `main` at
+`539e4f1`). A consumer's own lock still wins, but a kornia-slam from before its move to crates.io kornia-rs
 (`6820744`) names git kornia-rs and splits the graph, and one from before its map-API rework
 does not compile against this crate.
 

@@ -355,14 +355,7 @@ mod tests {
             Vec3F64::new(0.0, 0.0, 0.005),
         ));
         let vision = t_cb.compose(&truth).compose(&t_cb.inverse());
-        let factor = WheelOdomFactor {
-            from_idx: 0,
-            to_idx: 1,
-            measurement: wheels,
-            t_cb_from: t_cb,
-            t_cb_to: t_cb,
-            huber_chi2: None,
-        };
+        let factor = WheelOdomFactor::new(0, 1, wheels, t_cb, t_cb, None);
         let o = OutOfPlane::of(&factor, &vision);
         assert!((o.z_m - 0.005).abs() < 1e-12, "{o:?}");
         assert!((o.pitch_rad - 0.01).abs() < 1e-12, "{o:?}");
