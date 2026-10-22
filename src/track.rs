@@ -296,7 +296,8 @@ pub struct TrackerConfig {
     pub max_keyframes: Option<usize>,
     /// At [`Self::max_keyframes`], once culling (if on) cannot make room, evict the oldest
     /// keyframes instead of dropping the map; see [`Tracker::evict_for_room`]. `false` — what
-    /// [`TrackerConfig::new`] sets — drops the map, as it always did.
+    /// [`TrackerConfig::new`] sets — drops the map, as it always did. Evicted keyframes'
+    /// landmarks keep their slots, so the map still drops at [`Tracker::landmark_slot_cap`].
     pub evict_oldest_at_bound: bool,
     /// Neighbour window for grow/fuse; see [`DEFAULT_MAX_COVISIBLE_KEYFRAMES`].
     pub max_covisible_keyframes: usize,
@@ -2691,8 +2692,10 @@ impl Tracker {
     /// Refused under the gates culling has (the inertial initialization and refinements read
     /// their window's keyframes as they are) and when that would reach a kept keyframe.
     fn evict_for_room(&mut self, cap: usize) -> usize {
+        // `info!`, not `debug!`: every refusal here drops the map, and release builds compile
+        // `debug!` out, so the drop's warning would be the only trace.
         if self.inertial_unsettled() || self.refinement_pending() {
-            debug!(
+            info!(
                 "keyframe eviction: the inertial path is not settled, nothing evicted keyframes={}",
                 self.map.keyframes().len()
             );
@@ -2701,9 +2704,10 @@ impl Tracker {
         let keep = cap.saturating_sub(1);
         let before = self.map.keyframes().len();
         if before.saturating_sub(keep) > self.oldest_kept_slot() {
-            debug!(
-                "keyframe eviction: would reach a kept keyframe keyframes={}",
-                before
+            info!(
+                "keyframe eviction: would reach a kept keyframe keyframes={} oldest_kept_slot={}",
+                before,
+                self.oldest_kept_slot()
             );
             return 0;
         }
@@ -2716,6 +2720,9 @@ impl Tracker {
                 .is_some()
                 .then_some(&mut self.stationary_factors),
         );
+        debug_assert!(self.stationary_factors.iter().all(|f| {
+            self.map.get_keyframe(f.from_idx).is_some() && self.map.get_keyframe(f.to_idx).is_some()
+        }));
         let evicted: HashSet<usize> = report.evicted.iter().copied().collect();
         self.kf_tracked_poses
             .retain(|(idx, _, _)| !evicted.contains(idx));
@@ -2734,6 +2741,14 @@ impl Tracker {
             report.landmarks_retired,
             self.evicted_keyframes
         );
+        if self.map.keyframes().len() > keep {
+            info!(
+                "keyframe eviction: stopped short of the target, the map will drop keyframes={} \
+                 target={}",
+                self.map.keyframes().len(),
+                keep
+            );
+        }
         evicted.len()
     }
 

@@ -853,9 +853,10 @@ impl CuTask for StereoVio {
         );
         if let Some(t) = self.tracker.as_ref() {
             info!(
-                "vio map: {} maps dropped, {} keyframes culled",
+                "vio map: {} maps dropped, {} keyframes culled, {} evicted",
                 t.map_drops(),
-                t.culled_keyframes()
+                t.culled_keyframes(),
+                t.evicted_keyframes()
             );
         }
         if let Some(s) = self.tracker.as_ref().and_then(|t| t.stationary_stats()) {

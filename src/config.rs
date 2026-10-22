@@ -49,7 +49,8 @@ pub enum OnTrackingLoss {
 ///
 /// Culling removes only redundant keyframes, and a robot driving through new space makes few:
 /// its keyframes stay under ORB-SLAM's 90 % coverage, so the bound used to drop the map mid-drive.
-/// `evict_oldest` keeps the map as a sliding window instead.
+/// `evict_oldest` keeps the map as a sliding window instead, until its landmark slots reach
+/// `max_keyframes * orb_keypoints`: evicted landmarks keep their slots, so that bound still drops.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AtKeyframeBound {
